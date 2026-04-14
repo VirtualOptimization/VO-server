@@ -4,4 +4,4 @@ WORKDIR /app
 
 COPY . /app
 
-CMD ["python", "-m", "api.main"]
+CMD ["python", "-m", "server.main"]
