@@ -11,12 +11,12 @@ CATEGORY_MAPPING = {
 }
 
 
-DEFAULT_FRONT_VECTOR_BY_TYPE = {
-    "bed": [0, 0, 1],
-    "desk": [0, -1, 0],
-    "chair": [0, -1, 0],
-    "closet": [0, -1, 0],
-    "shelf": [0, -1, 0],
+DEFAULT_FRONT_VECTOR_2D_BY_TYPE = {
+    "bed": [1.0, 0.0],
+    "desk": [0.0, -1.0],
+    "chair": [0.0, 1.0],
+    "closet": [0.0, -1.0],
+    "shelf": [0.0, -1.0],
 }
 
 
@@ -26,16 +26,28 @@ def map_roomplan_category(category: str) -> str:
 
 
 def build_optimizer_metadata(category: str) -> dict[str, Any]:
-    front_vector = DEFAULT_FRONT_VECTOR_BY_TYPE.get(category, [0, -1, 0])
+    front_vector_2d = DEFAULT_FRONT_VECTOR_2D_BY_TYPE.get(category, [0.0, -1.0])
     metadata: dict[str, Any] = {
         "label": f"Scanned {category.capitalize()}",
-        "front_vector": front_vector,
+        "front_vector_2d": front_vector_2d,
     }
 
     if category == "bed":
-        metadata["tags"] = ["wall_cling_required", "corner_preferred"]
+        metadata["anchor_preferences"] = {
+            "wall_cling_required": True,
+            "corner_preferred": True,
+            "back_to_wall": True,
+        }
         metadata["head_side"] = "back"
     elif category in {"desk", "closet"}:
-        metadata["tags"] = ["wall_cling_required"]
+        metadata["anchor_preferences"] = {
+            "wall_cling_required": True,
+            "back_to_wall": category == "closet",
+        }
+    elif category == "shelf":
+        metadata["anchor_preferences"] = {
+            "wall_cling_required": True,
+            "back_to_wall": True,
+        }
 
     return metadata

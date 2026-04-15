@@ -1,0 +1,102 @@
+{
+  "room_metadata": {
+    "room_id": "user_studio_01",
+    "dimensions": {
+      "width": 5.0,
+      "depth": 4.0,
+      "height": 2.4
+    },
+    "floor_axis": "xy"
+  },
+  "fixed_elements": [
+    {
+      "id": "main_door",
+      "type": "door",
+      "wall": "west",
+      "span": {
+        "start": 0.05,
+        "end": 0.95
+      },
+      "clearance_depth": 0.9,
+      "is_main_entry": true
+    },
+    {
+      "id": "window_01",
+      "type": "window",
+      "wall": "north",
+      "span": {
+        "start": 1.9,
+        "end": 3.1
+      },
+      "sill_height": 0.9,
+      "height": 1.2,
+      "keep_visual_open": true
+    }
+  ],
+  "furnitures": [
+    {
+      "id": "f_bed_01",
+      "type": "bed",
+      "label": "Single Bed",
+      "extent": [1.1, 2.1, 0.55],
+      "pos": [1.35, 1.35, 0.275],
+      "rotation_y_deg": 90.0,
+      "front_vector_2d": [1.0, 0.0],
+      "anchor_preferences": {
+        "wall_cling_required": true,
+        "corner_preferred": true,
+        "back_to_wall": true
+      },
+      "head_side": "west"
+    },
+    {
+      "id": "f_desk_01",
+      "type": "desk",
+      "label": "Work Desk",
+      "extent": [1.2, 0.6, 0.75],
+      "pos": [3.4, 2.8, 0.375],
+      "rotation_y_deg": 180.0,
+      "front_vector_2d": [0.0, -1.0],
+      "anchor_preferences": {
+        "wall_cling_required": false,
+        "back_to_wall": false
+      }
+    },
+    {
+      "id": "f_chair_01",
+      "type": "chair",
+      "label": "Office Chair",
+      "extent": [0.6, 0.6, 1.1],
+      "pos": [3.4, 2.05, 0.55],
+      "rotation_y_deg": 0.0,
+      "front_vector_2d": [0.0, 1.0],
+      "pair_with": "f_desk_01"
+    },
+    {
+      "id": "f_closet_01",
+      "type": "closet",
+      "label": "Wardrobe",
+      "extent": [0.9, 0.6, 2.0],
+      "pos": [0.75, 3.1, 1.0],
+      "rotation_y_deg": 0.0,
+      "front_vector_2d": [0.0, -1.0],
+      "anchor_preferences": {
+        "wall_cling_required": true,
+        "back_to_wall": true
+      }
+    },
+    {
+      "id": "f_shelf_01",
+      "type": "shelf",
+      "label": "Storage",
+      "extent": [0.8, 0.4, 1.6],
+      "pos": [2.5, 0.4, 0.8],
+      "rotation_y_deg": 180.0,
+      "front_vector_2d": [0.0, -1.0],
+      "anchor_preferences": {
+        "wall_cling_required": true,
+        "back_to_wall": true
+      }
+    }
+  ]
+}
