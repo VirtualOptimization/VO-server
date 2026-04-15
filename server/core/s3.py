@@ -1,3 +1,6 @@
+import asyncio
+import json
+
 import boto3
 
 from server.core.config import settings
@@ -6,8 +9,18 @@ s3_client = boto3.client("s3", region_name=settings.aws_region)
 
 
 async def upload_json(key: str, data: dict) -> str:
-    """S3에 JSON 데이터 업로드 (다음주 실제 구현 예정)"""
-    # TODO: 실제 S3 업로드 구현
-    # s3_client.put_object(Bucket=settings.s3_bucket_name, Key=key, Body=json.dumps(data))
-    print(f"[S3 stub] upload_json key={key}")
+    """JSON 데이터를 S3에 업로드하고 s3 URI를 반환한다."""
+    if not settings.s3_bucket_name:
+        raise ValueError("S3_BUCKET_NAME is not configured")
+
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+    await asyncio.to_thread(
+        s3_client.put_object,
+        Bucket=settings.s3_bucket_name,
+        Key=key,
+        Body=body,
+        ContentType="application/json",
+    )
+
     return f"s3://{settings.s3_bucket_name}/{key}"
