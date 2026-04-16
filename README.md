@@ -81,6 +81,15 @@ vo-server/
 
 ---
 
+## 🗄️ RDS 준비
+
+- `infra/` 아래에 AWS CDK 기반 RDS 스택 골격이 있습니다.
+- 기본값은 개발용 PostgreSQL 인스턴스입니다.
+- 실제 배포 절차와 운영용 설정값은 내부 배포 문서에서 관리합니다.
+- 현재 저장소 기준 내부 가이드는 [docs/internal/rds-deploy.md](/Users/kwon-yewon/Desktop/Duksung/2026/AJA/VO-server/docs/internal/rds-deploy.md:1)에 정리되어 있습니다.
+
+---
+
 ## 🌿 협업 가이드
 
 ### 🔀 브랜치 전략
