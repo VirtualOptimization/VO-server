@@ -1,5 +1,3 @@
-from typing import Any
-
 from pydantic import BaseModel
 
 
@@ -54,4 +52,4 @@ class ScanUploadResponse(BaseModel):
     message: str
     confirm_code: str
     object_count: int
-    s3_url: str
+    uploaded_files: list[str]
