@@ -27,6 +27,8 @@ export VO_RDS_DB_NAME=vo_db
 export VO_RDS_DB_USERNAME=vo_admin
 export VO_RDS_PUBLICLY_ACCESSIBLE=true
 export VO_RDS_ALLOWED_IPV4=0.0.0.0/0
+export VO_RDS_ALLOCATED_STORAGE_GB=20
+export VO_RDS_MAX_ALLOCATED_STORAGE_GB=20
 ```
 
 주의:
@@ -34,6 +36,9 @@ export VO_RDS_ALLOWED_IPV4=0.0.0.0/0
 - 개발 단계에서 로컬에서 바로 Alembic을 붙이려면 `VO_RDS_PUBLICLY_ACCESSIBLE=true`와
   접속을 허용할 IP CIDR(`VO_RDS_ALLOWED_IPV4`)이 필요합니다.
 - 예시는 `0.0.0.0/0`로 열어두었지만, 실제로는 본인 공인 IP/32로 좁히는 것을 권장합니다.
+- 테스트 비용을 낮추려면 `VO_RDS_PUBLICLY_ACCESSIBLE=true` 상태에서 배포하세요.
+  이 경우 스택이 public subnet만 만들고 NAT Gateway를 생성하지 않아 비용이 크게 줄어듭니다.
+- 테스트용 스토리지 상한은 `VO_RDS_MAX_ALLOCATED_STORAGE_GB=20`처럼 기본값과 동일하게 두는 편이 단순합니다.
 
 ## 스택 배포
 
