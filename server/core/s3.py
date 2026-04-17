@@ -45,3 +45,14 @@ async def upload_bytes(key: str, data: bytes, content_type: str = "application/o
     )
 
     return f"s3://{settings.s3_bucket_name}/{key}"
+
+
+async def get_json(key: str) -> dict:
+    """S3에서 JSON 파일을 읽어 dict로 반환한다."""
+    response = await asyncio.to_thread(
+        s3_client.get_object,
+        Bucket=settings.s3_bucket_name,
+        Key=key,
+    )
+    body = await asyncio.to_thread(response["Body"].read)
+    return json.loads(body.decode("utf-8"))
