@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     s3_bucket_name: str = ""
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
+    s3_presigned_expiration_seconds: int = 3600
+    step_functions_state_machine_arn: str = ""
 
     # DB (A가 스키마 확정 후 채울 예정)
     database_url: str = ""

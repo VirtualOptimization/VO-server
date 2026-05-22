@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import boto3
+from botocore.exceptions import ClientError
 
 from server.core.config import settings
 
@@ -11,6 +12,10 @@ s3_client = boto3.client(
     aws_access_key_id=settings.aws_access_key_id,
     aws_secret_access_key=settings.aws_secret_access_key,
 )
+
+
+def build_s3_uri(key: str) -> str:
+    return f"s3://{settings.s3_bucket_name}/{key}"
 
 
 async def upload_json(key: str, data: dict) -> str:
@@ -28,7 +33,7 @@ async def upload_json(key: str, data: dict) -> str:
         ContentType="application/json",
     )
 
-    return f"s3://{settings.s3_bucket_name}/{key}"
+    return build_s3_uri(key)
 
 
 async def upload_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
@@ -44,7 +49,7 @@ async def upload_bytes(key: str, data: bytes, content_type: str = "application/o
         ContentType=content_type,
     )
 
-    return f"s3://{settings.s3_bucket_name}/{key}"
+    return build_s3_uri(key)
 
 
 async def get_json(key: str) -> dict:
@@ -56,3 +61,37 @@ async def get_json(key: str) -> dict:
     )
     body = await asyncio.to_thread(response["Body"].read)
     return json.loads(body.decode("utf-8"))
+
+
+async def generate_presigned_put_url(key: str, content_type: str) -> str:
+    if not settings.s3_bucket_name:
+        raise ValueError("S3_BUCKET_NAME is not configured")
+
+    return await asyncio.to_thread(
+        s3_client.generate_presigned_url,
+        "put_object",
+        Params={
+            "Bucket": settings.s3_bucket_name,
+            "Key": key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=settings.s3_presigned_expiration_seconds,
+    )
+
+
+async def object_exists(key: str) -> bool:
+    if not settings.s3_bucket_name:
+        raise ValueError("S3_BUCKET_NAME is not configured")
+
+    try:
+        await asyncio.to_thread(
+            s3_client.head_object,
+            Bucket=settings.s3_bucket_name,
+            Key=key,
+        )
+        return True
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise

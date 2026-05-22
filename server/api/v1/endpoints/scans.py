@@ -6,10 +6,27 @@ import uuid
 import zipfile
 from typing import Any
 
+import boto3
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
-from server.core.s3 import upload_bytes, upload_json, get_json
-from server.schemas.scan import IOSRoomScanData, ScanUploadResponse
+from server.core.config import settings
+from server.core.s3 import (
+    build_s3_uri,
+    generate_presigned_put_url,
+    get_json,
+    object_exists,
+    upload_bytes,
+    upload_json,
+)
+from server.schemas.scan import (
+    IOSRoomScanData,
+    PresignedUploadTarget,
+    ScanUploadCompleteRequest,
+    ScanUploadCompleteResponse,
+    ScanUploadResponse,
+    ScanUploadStartRequest,
+    ScanUploadStartResponse,
+)
 from server.services.transform.problem import build_layout_problem
 from server.services.transform.roomplan import convert_roomplan_to_optimizer_payload
 from server.services.transform.roomplan_export import export_optimized_layout_to_roomplan
@@ -21,6 +38,151 @@ from workers.optimizer.layout import CanonicalLayoutOptimizer
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+RAW_ROOT_PREFIX = "scans"
+MODEL_CONTENT_TYPE = "application/octet-stream"
+USDZ_CONTENT_TYPE = "model/vnd.usdz+zip"
+
+stepfunctions_client = boto3.client(
+    "stepfunctions",
+    region_name=settings.aws_region,
+    aws_access_key_id=settings.aws_access_key_id,
+    aws_secret_access_key=settings.aws_secret_access_key,
+)
+
+
+def _raw_prefix(confirm_code: str) -> str:
+    return f"{RAW_ROOT_PREFIX}/{confirm_code}/raw"
+
+
+def _generated_prefix(confirm_code: str) -> str:
+    return f"{RAW_ROOT_PREFIX}/{confirm_code}/generated"
+
+
+def _build_generated_outputs(confirm_code: str) -> dict[str, str]:
+    generated_prefix = _generated_prefix(confirm_code)
+    return {
+        "normalized_json": f"{generated_prefix}/room_data.normalized.json",
+        "problem_json": f"{generated_prefix}/room_data.problem.json",
+        "optimized_json": f"{generated_prefix}/room_data.optimized.json",
+        "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
+        "fbx": f"{generated_prefix}/output.fbx",
+    }
+
+
+def _generate_unique_confirm_code(db) -> str:
+    while True:
+        confirm_code = uuid.uuid4().hex[:6].upper()
+        existing = db.query(Room.id).filter(Room.confirm_code == confirm_code).first()
+        if existing is None:
+            return confirm_code
+
+
+def _create_upload_session(
+    include_room_usdz: bool,
+    include_room_empty_usdz: bool,
+) -> tuple[int, str]:
+    db = SessionLocal()
+    try:
+        confirm_code = _generate_unique_confirm_code(db)
+        room_shell_key = f"{_raw_prefix(confirm_code)}/Room.usdz" if include_room_usdz else None
+        room = Room(
+            confirm_code=confirm_code,
+            status="UPLOADING",
+            room_shell_usdc_url=build_s3_uri(room_shell_key) if room_shell_key else None,
+        )
+        db.add(room)
+        db.commit()
+        db.refresh(room)
+        return room.id, confirm_code
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _build_upload_targets(
+    confirm_code: str,
+    request: ScanUploadStartRequest,
+) -> list[tuple[str, str, str]]:
+    raw_prefix = _raw_prefix(confirm_code)
+    targets: list[tuple[str, str, str]] = [
+        ("room_data_json", f"{raw_prefix}/room_data.json", "application/json"),
+    ]
+    if request.include_room_usdz:
+        targets.append(("room_usdz", f"{raw_prefix}/Room.usdz", USDZ_CONTENT_TYPE))
+    if request.include_room_empty_usdz:
+        targets.append(("room_empty_usdz", f"{raw_prefix}/Room_empty.usdz", USDZ_CONTENT_TYPE))
+    for filename in request.model_filenames:
+        safe_name = filename.split("/")[-1]
+        targets.append((f"model:{safe_name}", f"{raw_prefix}/Models/{safe_name}", MODEL_CONTENT_TYPE))
+    return targets
+
+
+def _mark_upload_completed(
+    confirm_code: str,
+    uploaded_keys: list[str],
+    pipeline_started: bool,
+) -> int:
+    db = SessionLocal()
+    try:
+        room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
+        if room is None:
+            raise ValueError(f"Room not found: {confirm_code}")
+        room.status = "PROCESSING" if pipeline_started else "UPLOADED"
+        room_usdz_key = next((key for key in uploaded_keys if key.endswith("/Room.usdz")), None)
+        if room_usdz_key:
+            room.room_shell_usdc_url = build_s3_uri(room_usdz_key)
+        db.commit()
+        return room.id
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+async def _start_pipeline_execution(pipeline_input: dict[str, Any]) -> str | None:
+    if not settings.step_functions_state_machine_arn:
+        return None
+
+    response = await asyncio.to_thread(
+        stepfunctions_client.start_execution,
+        stateMachineArn=settings.step_functions_state_machine_arn,
+        name=f"scan-{pipeline_input['confirm_code']}-{uuid.uuid4().hex[:8]}",
+        input=json.dumps(pipeline_input),
+    )
+    return response["executionArn"]
+
+
+def _build_pipeline_input(
+    room_id: int,
+    confirm_code: str,
+    uploaded_keys: list[str],
+) -> dict[str, Any]:
+    raw_prefix = _raw_prefix(confirm_code)
+    generated_prefix = _generated_prefix(confirm_code)
+
+    room_usdz_key = next((key for key in uploaded_keys if key.endswith("/Room.usdz")), None)
+    room_empty_usdz_key = next((key for key in uploaded_keys if key.endswith("/Room_empty.usdz")), None)
+    model_keys = sorted(key for key in uploaded_keys if "/Models/" in key)
+
+    return {
+        "room_id": room_id,
+        "confirm_code": confirm_code,
+        "source": "ios_upload",
+        "pipeline_version": "v1",
+        "raw_prefix": raw_prefix,
+        "generated_prefix": generated_prefix,
+        "inputs": {
+            "room_data_json": f"{raw_prefix}/room_data.json",
+            "room_usdz": room_usdz_key,
+            "room_empty_usdz": room_empty_usdz_key,
+            "models": model_keys,
+        },
+        "outputs": _build_generated_outputs(confirm_code),
+    }
 
 
 def _save_original_to_db(confirm_code: str, s3_url: str, layout_problem: dict[str, Any]) -> None:
@@ -96,6 +258,108 @@ def _save_optimized_to_db(
         raise
     finally:
         db.close()
+
+
+@router.post("/start", response_model=ScanUploadStartResponse)
+async def start_scan_upload(payload: ScanUploadStartRequest):
+    room_id, confirm_code = await asyncio.to_thread(
+        _create_upload_session,
+        payload.include_room_usdz,
+        payload.include_room_empty_usdz,
+    )
+    raw_prefix = _raw_prefix(confirm_code)
+    generated_prefix = _generated_prefix(confirm_code)
+
+    uploads: list[PresignedUploadTarget] = []
+    for logical_name, s3_key, content_type in _build_upload_targets(confirm_code, payload):
+        presigned_url = await generate_presigned_put_url(s3_key, content_type)
+        uploads.append(
+            PresignedUploadTarget(
+                logical_name=logical_name,
+                s3_key=s3_key,
+                presigned_url=presigned_url,
+                content_type=content_type,
+            )
+        )
+
+    return ScanUploadStartResponse(
+        message="scan upload session created",
+        room_id=room_id,
+        confirm_code=confirm_code,
+        raw_prefix=raw_prefix,
+        generated_prefix=generated_prefix,
+        expires_in_seconds=settings.s3_presigned_expiration_seconds,
+        uploads=uploads,
+    )
+
+
+@router.post("/{confirm_code}/complete", response_model=ScanUploadCompleteResponse)
+async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteRequest):
+    if not payload.uploaded_keys:
+        raise HTTPException(status_code=422, detail="uploaded_keys는 비어 있을 수 없습니다.")
+
+    raw_prefix = _raw_prefix(confirm_code)
+    generated_prefix = _generated_prefix(confirm_code)
+
+    invalid_keys = [key for key in payload.uploaded_keys if not key.startswith(f"{raw_prefix}/")]
+    if invalid_keys:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "uploaded_keys 중 raw prefix에 속하지 않는 항목이 있습니다.",
+                "invalid_keys": invalid_keys,
+            },
+        )
+
+    required_json_key = f"{raw_prefix}/room_data.json"
+    if required_json_key not in payload.uploaded_keys:
+        raise HTTPException(
+            status_code=422,
+            detail=f"필수 파일이 없습니다: {required_json_key}",
+        )
+
+    missing_keys: list[str] = []
+    for key in payload.uploaded_keys:
+        if not await object_exists(key):
+            missing_keys.append(key)
+
+    if missing_keys:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "아직 업로드되지 않은 파일이 있습니다.",
+                "missing_keys": missing_keys,
+            },
+        )
+
+    room_id = await asyncio.to_thread(
+        _mark_upload_completed,
+        confirm_code,
+        payload.uploaded_keys,
+        False,
+    )
+    pipeline_input = _build_pipeline_input(room_id, confirm_code, payload.uploaded_keys)
+    execution_arn = await _start_pipeline_execution(pipeline_input)
+    pipeline_started = execution_arn is not None
+    if pipeline_started:
+        await asyncio.to_thread(
+            _mark_upload_completed,
+            confirm_code,
+            payload.uploaded_keys,
+            True,
+        )
+
+    return ScanUploadCompleteResponse(
+        message="scan upload completed",
+        room_id=room_id,
+        confirm_code=confirm_code,
+        raw_prefix=raw_prefix,
+        generated_prefix=generated_prefix,
+        uploaded_keys=payload.uploaded_keys,
+        pipeline_started=pipeline_started,
+        execution_arn=execution_arn,
+        pipeline_input=pipeline_input,
+    )
 
 
 # ── POST /scans ───────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@ import os
 
 import aws_cdk as cdk
 
-from infra.stacks import VoRdsStack
+from infra.stacks import VoPipelineStack, VoRdsStack
 
 
 app = cdk.App()
@@ -22,5 +22,13 @@ VoRdsStack(
     env=env,
     stack_name=os.getenv("VO_RDS_STACK_NAME", "vo-rds-stack"),
 )
+
+if os.getenv("VO_PIPELINE_STACK_ENABLED", "").lower() in {"1", "true", "yes", "on"}:
+    VoPipelineStack(
+        app,
+        "VoPipelineStack",
+        env=env,
+        stack_name=os.getenv("VO_PIPELINE_STACK_NAME", "vo-pipeline-stack"),
+    )
 
 app.synth()
