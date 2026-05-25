@@ -104,10 +104,11 @@ def _create_upload_session(
         db.close()
 
 
-def _build_step_functions_input(confirm_code: str) -> dict[str, Any]:
+def _build_step_functions_input(confirm_code: str, room_id: int) -> dict[str, Any]:
     raw_prefix = _raw_prefix(confirm_code)
     return {
         "confirm_code": confirm_code,
+        "room_id": room_id,
         "bucket": settings.s3_bucket_name,
         "inputs": {
             "room_usdz": f"{raw_prefix}/Room.usdz",
@@ -185,6 +186,17 @@ async def start_scan_upload(request: ScanUploadStartRequest):
     raw_prefix = _raw_prefix(confirm_code)
     targets = []
 
+    # 1. 람다가 무조건 찾아 헤매는 room_data.json 업로드 URL 추가 (필수)
+    s3_json_key = f"{raw_prefix}/room_data.json"
+    JSON_CONTENT_TYPE = "application/json"
+    targets.append(PresignedUploadTarget(
+        logical_name="room_data_json",
+        s3_key=s3_json_key,
+        presigned_url=await generate_presigned_put_url(s3_json_key, JSON_CONTENT_TYPE),
+        content_type=JSON_CONTENT_TYPE
+    ))
+
+    # 2. 기존 USDZ 룸 파일 처리
     if request.include_room_usdz:
         s3_key = f"{raw_prefix}/Room.usdz"
         targets.append(PresignedUploadTarget(
@@ -194,6 +206,7 @@ async def start_scan_upload(request: ScanUploadStartRequest):
             content_type=USDZ_CONTENT_TYPE
         ))
 
+    # 3. 비어있는 룸 파일 처리
     if request.include_room_empty_usdz:
         s3_key = f"{raw_prefix}/Room_empty.usdz"
         targets.append(PresignedUploadTarget(
@@ -203,6 +216,7 @@ async def start_scan_upload(request: ScanUploadStartRequest):
             content_type=USDZ_CONTENT_TYPE
         ))
 
+    # 4. 개별 가구 모델 파일들 처리
     for filename in request.model_filenames:
         s3_key = f"{raw_prefix}/Models/{filename}"
         targets.append(PresignedUploadTarget(
@@ -221,7 +235,6 @@ async def start_scan_upload(request: ScanUploadStartRequest):
         expires_in_seconds=URL_EXPIRATION_SECONDS,
         uploads=targets
     )
-
 
 
 
@@ -302,7 +315,7 @@ async def complete_scan_upload(confirm_code: str, request: ScanUploadCompleteReq
     finally:
         db.close()
 
-    pipeline_input = _build_step_functions_input(confirm_code)
+    pipeline_input = _build_step_functions_input(confirm_code, room_id)
     
     try:
         response = stepfunctions_client.start_execution(
