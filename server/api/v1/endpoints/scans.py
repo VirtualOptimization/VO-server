@@ -1,27 +1,23 @@
 import asyncio
-import io
 import json
 import logging
 import uuid
-import zipfile
 from typing import Any
 
 import boto3
-from fastapi import APIRouter, File, HTTPException, UploadFile, Depends
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
 
 from server.core.config import settings
 from server.core.s3 import (
     build_s3_uri,
     generate_presigned_put_url,
-    get_json,
     object_exists,
-    upload_bytes,
     upload_json,
 )
 from server.schemas.scan import (
-    IOSRoomScanData,
     PresignedUploadTarget,
+    ScanUploadCompleteRequest,
     ScanUploadCompleteResponse,
     ScanUploadStartRequest,
     ScanUploadStartResponse,
@@ -37,6 +33,7 @@ router = APIRouter()
 RAW_ROOT_PREFIX = "scans"
 MODEL_CONTENT_TYPE = "application/octet-stream"
 USDZ_CONTENT_TYPE = "model/vnd.usdz+zip"
+JSON_CONTENT_TYPE = "application/json"
 URL_EXPIRATION_SECONDS = 3600
 
 stepfunctions_client = boto3.client(
@@ -47,28 +44,12 @@ stepfunctions_client = boto3.client(
 )
 
 
-class ScanUploadCompleteRequest(BaseModel):
-    uploaded_keys: list[str] = Field(default_factory=list)
-    room_scan_data: IOSRoomScanData  
-
-
 def _raw_prefix(confirm_code: str) -> str:
     return f"{RAW_ROOT_PREFIX}/{confirm_code}/origin"
 
 
 def _generated_prefix(confirm_code: str) -> str:
     return f"{RAW_ROOT_PREFIX}/{confirm_code}/optimized"
-
-
-def _build_generated_outputs(confirm_code: str) -> dict[str, str]:
-    generated_prefix = _generated_prefix(confirm_code)
-    return {
-        "normalized_json": f"{generated_prefix}/room_data.normalized.json",
-        "problem_json": f"{generated_prefix}/room_data.problem.json",
-        "optimized_json": f"{generated_prefix}/room_data.optimized.json",
-        "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
-        "fbx": f"{generated_prefix}/output.fbx",
-    }
 
 
 def _generate_unique_confirm_code(db) -> str:
@@ -104,24 +85,78 @@ def _create_upload_session(
         db.close()
 
 
-def _build_step_functions_input(confirm_code: str, room_id: int) -> dict[str, Any]:
+def _mark_upload_completed(confirm_code: str, uploaded_keys: list[str], pipeline_started: bool) -> int:
+    db = SessionLocal()
+    try:
+        room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
+        if not room:
+            raise ValueError(f"Room with confirm_code {confirm_code} not found")
+        
+        if pipeline_started:
+            room.status = "PROCESSING"
+        else:
+            room.status = "UPLOADED"
+            
+        # Room.usdz가 업로드된 경우 URL 업데이트
+        room_shell_key = next((k for k in uploaded_keys if k.endswith("/Room.usdz")), None)
+        if room_shell_key:
+            room.room_shell_usdc_url = build_s3_uri(room_shell_key)
+            
+        db.commit()
+        return room.id
+    finally:
+        db.close()
+
+
+def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[str]) -> dict[str, Any]:
     raw_prefix = _raw_prefix(confirm_code)
+    generated_prefix = _generated_prefix(confirm_code)
+
+    room_usdz_key = next((k for k in uploaded_keys if k.endswith("/Room.usdz")), None)
+    room_empty_usdz_key = next((k for k in uploaded_keys if k.endswith("/Room_empty.usdz")), None)
+    model_keys = sorted(k for k in uploaded_keys if "/Models/" in k)
+
     return {
-        "confirm_code": confirm_code,
         "room_id": room_id,
-        "bucket": settings.s3_bucket_name,
+        "confirm_code": confirm_code,
+        "source": "ios_upload",
+        "pipeline_version": "v1",
+        "raw_prefix": raw_prefix,
+        "generated_prefix": generated_prefix,
         "inputs": {
-            "room_usdz": f"{raw_prefix}/Room.usdz",
-            "room_empty_usdz": f"{raw_prefix}/Room_empty.usdz",
-            "models_prefix": f"{raw_prefix}/Models/"
+            "room_data_json": f"{raw_prefix}/room_data.json",
+            "room_usdz": room_usdz_key,
+            "room_empty_usdz": room_empty_usdz_key,
+            "models": model_keys,
         },
-        "outputs": _build_generated_outputs(confirm_code)
+        "outputs": {
+            "normalized_json": f"{generated_prefix}/room_data.normalized.json",
+            "problem_json": f"{generated_prefix}/room_data.problem.json",
+            "optimized_json": f"{generated_prefix}/room_data.optimized.json",
+            "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
+            "fbx": f"{generated_prefix}/output.fbx",
+        },
     }
 
 
-def _save_optimized_to_db(room_id: int, optimized_data: dict[str, Any]) -> None:
+async def _start_pipeline_execution(pipeline_input: dict[str, Any]) -> str | None:
+    try:
+        confirm_code = pipeline_input["confirm_code"]
+        response = stepfunctions_client.start_execution(
+            stateMachineArn=settings.step_functions_state_machine_arn,
+            name=f"VO-Scan-{confirm_code}-{uuid.uuid4().hex[:8].upper()}",
+            input=json.dumps(pipeline_input)
+        )
+        return response["executionArn"]
+    except Exception as e:
+        logger.error(f"Step Functions start_execution failed: {str(e)}")
+        return None
+
+
+def _save_optimized_to_db(room_id: int, optimized_data: dict[str, Any], optimized_s3_url: str | None = None) -> None:
     db = SessionLocal()
     try:
+        # UPSERT logic for OPTIMIZED version
         existing_version = db.query(Version).filter(
             Version.room_id == room_id,
             Version.version_type == "OPTIMIZED",
@@ -129,18 +164,20 @@ def _save_optimized_to_db(room_id: int, optimized_data: dict[str, Any]) -> None:
         ).first()
 
         if existing_version:
-            logger.info(f"Existing OPTIMIZED v1 found for room_id {room_id}. Cleaning children and updating...")
-            # 🎯 space_id -> version_id로 변경
+            logger.info(f"Existing OPTIMIZED v1 found for room_id {room_id}. Updating...")
             db.query(FurnitureItem).filter(FurnitureItem.version_id == existing_version.id).delete()
             version = existing_version
             version.json_data = optimized_data
+            if optimized_s3_url:
+                version.s3_json_url = optimized_s3_url
         else:
             logger.info(f"Creating new OPTIMIZED v1 for room_id {room_id}.")
             version = Version(
                 room_id=room_id,
                 version_no=1,
                 version_type="OPTIMIZED",
-                json_data=optimized_data
+                json_data=optimized_data,
+                s3_json_url=optimized_s3_url
             )
             db.add(version)
             db.flush() 
@@ -150,7 +187,7 @@ def _save_optimized_to_db(room_id: int, optimized_data: dict[str, Any]) -> None:
             transform_dict = elem.get("transform_dict", {})
             
             furniture = FurnitureItem(
-                version_id=version.id,  # 🎯 space_id -> version_id로 변경
+                version_id=version.id,
                 model_id=elem.get("model_id"),
                 item_key=elem.get("item_key", f"item_{uuid.uuid4().hex[:8]}"),
                 
@@ -186,9 +223,8 @@ async def start_scan_upload(request: ScanUploadStartRequest):
     raw_prefix = _raw_prefix(confirm_code)
     targets = []
 
-    # 1. 람다가 무조건 찾아 헤매는 room_data.json 업로드 URL 추가 (필수)
+    # 1. room_data.json 업로드 URL 추가 (필수)
     s3_json_key = f"{raw_prefix}/room_data.json"
-    JSON_CONTENT_TYPE = "application/json"
     targets.append(PresignedUploadTarget(
         logical_name="room_data_json",
         s3_key=s3_json_key,
@@ -196,7 +232,7 @@ async def start_scan_upload(request: ScanUploadStartRequest):
         content_type=JSON_CONTENT_TYPE
     ))
 
-    # 2. 기존 USDZ 룸 파일 처리
+    # 2. USDZ 룸 파일 처리
     if request.include_room_usdz:
         s3_key = f"{raw_prefix}/Room.usdz"
         targets.append(PresignedUploadTarget(
@@ -237,108 +273,84 @@ async def start_scan_upload(request: ScanUploadStartRequest):
     )
 
 
-
 @router.post("/{confirm_code}/complete", response_model=ScanUploadCompleteResponse)
-async def complete_scan_upload(confirm_code: str, request: ScanUploadCompleteRequest):
+async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteRequest):
+    if not payload.uploaded_keys:
+        raise HTTPException(status_code=422, detail="uploaded_keys는 비어 있을 수 없습니다.")
+
+    raw_prefix = _raw_prefix(confirm_code)
+    required_json_key = f"{raw_prefix}/room_data.json"
+
+    # Prefix 검증
+    invalid_keys = [k for k in payload.uploaded_keys if not k.startswith(f"{raw_prefix}/")]
+    if invalid_keys:
+        raise HTTPException(
+            status_code=422, 
+            detail={"message": "uploaded_keys 중 raw prefix 외 경로가 있습니다.", "invalid_keys": invalid_keys}
+        )
+
+    # 필수 파일 검증
+    if required_json_key not in payload.uploaded_keys:
+        raise HTTPException(status_code=422, detail=f"필수 파일 누락: {required_json_key}")
+
+    # S3 실재 여부 검증
+    missing_keys = []
+    for k in payload.uploaded_keys:
+        if not await object_exists(k):
+            missing_keys.append(k)
+    if missing_keys:
+        raise HTTPException(
+            status_code=409, 
+            detail={"message": "아직 업로드되지 않은 파일이 있습니다.", "missing_keys": missing_keys}
+        )
+
+    # 상태 업데이트 및 room_id 획득
+    room_id = await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, False)
+
+    # 파이프라인 트리거
+    pipeline_input = _build_pipeline_input(room_id, confirm_code, payload.uploaded_keys)
+    execution_arn = await _start_pipeline_execution(pipeline_input)
+    pipeline_started = execution_arn is not None
+
+    if pipeline_started:
+        # 트리거 성공 시 상태를 PROCESSING으로 변경
+        await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, True)
+
+    return ScanUploadCompleteResponse(
+        message="scan upload completed",
+        room_id=room_id,
+        confirm_code=confirm_code,
+        raw_prefix=raw_prefix,
+        generated_prefix=_generated_prefix(confirm_code),
+        uploaded_keys=payload.uploaded_keys,
+        pipeline_started=pipeline_started,
+        execution_arn=execution_arn,
+        pipeline_input=pipeline_input,
+    )
+
+
+@router.post("/{confirm_code}/optimize")
+async def save_optimized_layout_endpoint(confirm_code: str, optimized_result: dict[str, Any], optimized_s3_url: str | None = None):
     db = SessionLocal()
     try:
         room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
         if not room:
-            raise HTTPException(status_code=404, detail="Room session not found.")
-
-        raw_prefix = _raw_prefix(confirm_code)
-
-        for key in request.uploaded_keys:
-            if not key.startswith(f"{raw_prefix}/"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Security/Validation Integrity Error: Uploaded key '{key}' escapes designated S3 safe boundary."
-                )
-
-        s3_json_key = f"{raw_prefix}/room_scan.json"
-        s3_json_url = await upload_json(s3_json_key, request.room_scan_data.model_dump())
-
-        existing_v0 = db.query(Version).filter(
-            Version.room_id == room.id,
-            Version.version_type == "ORIGINAL",
-            Version.version_no == 0
-        ).first()
-
-        if existing_v0:
-            db.query(FurnitureItem).filter(FurnitureItem.version_id == existing_v0.id).delete()
-            v0_version = existing_v0
-            v0_version.s3_json_url = s3_json_url
-            v0_version.json_data = request.room_scan_data.model_dump()
-        else:
-            v0_version = Version(
-                room_id=room.id,
-                version_no=0,
-                version_type="ORIGINAL",
-                s3_json_url=s3_json_url,
-                json_data=request.room_scan_data.model_dump()
-            )
-            db.add(v0_version)
-            db.flush()
-
-        for obj in request.room_scan_data.objects:
-            center = obj.center if len(obj.center) == 3 else [0.0, 0.0, 0.0]
-            dimensions = obj.dimensions if len(obj.dimensions) == 3 else [1.0, 1.0, 1.0]
-            
-            furniture = FurnitureItem(
-                version_id=v0_version.id,  
-                model_id=None,
-                item_key=obj.identifier,
-                
-                pos_x=center[0],
-                pos_y=center[1],
-                pos_z=center[2],
-                rot_x=0.0,
-                rot_y=0.0,
-                rot_z=0.0,
-                scale_x=dimensions[0],
-                scale_y=dimensions[1],
-                scale_z=dimensions[2],
-                footprint_polygon=None
-            )
-            db.add(furniture)
-
-        room.status = "PROCESSING"
-        db.commit()
+            raise HTTPException(status_code=404, detail="Room not found")
         
-        room_id = room.id
-        generated_prefix = _generated_prefix(confirm_code)
-        
+        await asyncio.to_thread(_save_optimized_to_db, room.id, optimized_result, optimized_s3_url)
+        return {"message": "Optimized layout saved"}
     except Exception as e:
-        db.rollback()
-        logger.error(f"Complete flow transaction runtime crash: {str(e)}")
-        raise
+        logger.error(f"Failed to save optimized layout: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
-    pipeline_input = _build_step_functions_input(confirm_code, room_id)
-    
-    try:
-        response = stepfunctions_client.start_execution(
-            stateMachineArn=settings.step_functions_state_machine_arn,
-            name=f"VO-Scan-{confirm_code}-{uuid.uuid4().hex[:8].upper()}",
-            input=json.dumps(pipeline_input)
-        )
-        
-        return ScanUploadCompleteResponse(
-            message="Step Functions orchestration pipeline triggered successfully. Original v0 scan layout archived.",
-            room_id=room_id,
-            confirm_code=confirm_code,
-            raw_prefix=raw_prefix,
-            generated_prefix=generated_prefix,
-            uploaded_keys=request.uploaded_keys,
-            pipeline_started=True,
-            execution_arn=response["executionArn"],
-            pipeline_input=pipeline_input
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to switch AWS Step Functions trigger pipeline: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail="Backend internal step functions trigger failed."
-        )
+
+@router.post("", include_in_schema=False)
+async def legacy_upload_zip(file: UploadFile = File(...)):
+    return {"message": "Legacy zip upload is deprecated. Use /start and /complete instead."}
+
+
+@router.post("/{confirm_code}/trigger", include_in_schema=False)
+async def legacy_trigger_pipeline(confirm_code: str):
+    return {"message": "Legacy trigger is deprecated. Use /complete instead."}
