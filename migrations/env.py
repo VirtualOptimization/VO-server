@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from logging.config import fileConfig
-import os
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+from server.core.config import settings
 
 from shared.db import Base
 import shared.models  # noqa: F401
@@ -14,7 +15,8 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = os.getenv("DATABASE_URL")
+# Pydantic Settings가 주입한 안전한 RDS 주소를 바인딩
+database_url = settings.database_url
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
 

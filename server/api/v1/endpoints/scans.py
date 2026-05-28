@@ -1,44 +1,83 @@
 import asyncio
-import io
 import json
 import logging
 import uuid
-import zipfile
 from typing import Any
 
+import boto3
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
 
-from server.core.s3 import upload_bytes, upload_json, get_json
-from server.schemas.scan import IOSRoomScanData, ScanUploadResponse
-from server.services.transform.problem import build_layout_problem
-from server.services.transform.roomplan import convert_roomplan_to_optimizer_payload
-from server.services.transform.roomplan_export import export_optimized_layout_to_roomplan
+from server.core.config import settings
+from server.core.s3 import (
+    build_s3_uri,
+    generate_presigned_put_url,
+    object_exists,
+    upload_json,
+)
+from server.schemas.scan import (
+    PresignedUploadTarget,
+    ScanUploadCompleteRequest,
+    ScanUploadCompleteResponse,
+    ScanUploadStartRequest,
+    ScanUploadStartResponse,
+)
 from shared.db import SessionLocal
 from shared.models.furniture_item import FurnitureItem
 from shared.models.room import Room
 from shared.models.version import Version
-from workers.optimizer.layout import CanonicalLayoutOptimizer
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+RAW_ROOT_PREFIX = "scans"
+MODEL_CONTENT_TYPE = "application/octet-stream"
+USDZ_CONTENT_TYPE = "model/vnd.usdz+zip"
+JSON_CONTENT_TYPE = "application/json"
+URL_EXPIRATION_SECONDS = 3600
 
-def _save_original_to_db(confirm_code: str, s3_url: str, layout_problem: dict[str, Any]) -> None:
+stepfunctions_client = boto3.client(
+    "stepfunctions",
+    region_name=settings.aws_region,
+    aws_access_key_id=settings.aws_access_key_id,
+    aws_secret_access_key=settings.aws_secret_access_key,
+)
+
+
+def _raw_prefix(confirm_code: str) -> str:
+    return f"{RAW_ROOT_PREFIX}/{confirm_code}/origin"
+
+
+def _generated_prefix(confirm_code: str) -> str:
+    return f"{RAW_ROOT_PREFIX}/{confirm_code}/optimized"
+
+
+def _generate_unique_confirm_code(db) -> str:
+    while True:
+        confirm_code = uuid.uuid4().hex[:6].upper()
+        existing = db.query(Room.id).filter(Room.confirm_code == confirm_code).first()
+        if existing is None:
+            return confirm_code
+
+
+def _create_upload_session(
+    include_room_usdz: bool,
+    include_room_empty_usdz: bool,
+) -> tuple[int, str]:
     db = SessionLocal()
     try:
-        room = Room(confirm_code=confirm_code, status="PENDING")
-        db.add(room)
-        db.flush()
-
-        version = Version(
-            room_id=room.id,
-            version_type="ORIGINAL",
-            version_no=0,
-            s3_json_url=s3_url,
-            json_data=layout_problem,
+        confirm_code = _generate_unique_confirm_code(db)
+        room_shell_key = f"{_raw_prefix(confirm_code)}/Room.usdz" if include_room_usdz else None
+        
+        room = Room(
+            confirm_code=confirm_code,
+            status="PENDING",
+            room_shell_usdc_url=build_s3_uri(room_shell_key) if room_shell_key else None,
         )
-        db.add(version)
+        db.add(room)
         db.commit()
+        db.refresh(room)
+        return room.id, confirm_code
     except Exception:
         db.rollback()
         raise
@@ -46,157 +85,272 @@ def _save_original_to_db(confirm_code: str, s3_url: str, layout_problem: dict[st
         db.close()
 
 
-def _save_optimized_to_db(
-    confirm_code: str,
-    optimized_s3_url: str,
-    optimized_result: dict[str, Any],
-) -> None:
+def _mark_upload_completed(confirm_code: str, uploaded_keys: list[str], pipeline_started: bool) -> int:
     db = SessionLocal()
     try:
         room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
         if not room:
-            raise ValueError(f"Room not found: {confirm_code}")
-
-        original_version = (
-            db.query(Version)
-            .filter(Version.room_id == room.id, Version.version_type == "ORIGINAL")
-            .first()
-        )
-
-        optimized_version = Version(
-            room_id=room.id,
-            version_type="OPTIMIZED",
-            version_no=1,
-            parent_version_id=original_version.id if original_version else None,
-            s3_json_url=optimized_s3_url,
-            json_data=optimized_result,
-        )
-        db.add(optimized_version)
-        db.flush()
-
-        for item in optimized_result.get("movable_items", []):
-            pos = item.get("optimized_pos") or item["pos"]
-            rot_y = float(item.get("optimized_rotation_y_deg", item.get("rotation_y_deg", 0.0)))
-            db.add(FurnitureItem(
-                version_id=optimized_version.id,
-                item_key=item["id"],
-                pos_x=float(pos[0]),
-                pos_y=float(pos[1]),
-                pos_z=float(pos[2]),
-                rot_x=0.0,
-                rot_y=rot_y,
-                rot_z=0.0,
-                footprint_polygon=item.get("footprint_polygon"),
-            ))
-
-        room.status = "COMPLETED"
+            raise ValueError(f"Room with confirm_code {confirm_code} not found")
+        
+        if pipeline_started:
+            room.status = "PROCESSING"
+        else:
+            room.status = "UPLOADED"
+            
+        # Room.usdz가 업로드된 경우 URL 업데이트
+        room_shell_key = next((k for k in uploaded_keys if k.endswith("/Room.usdz")), None)
+        if room_shell_key:
+            room.room_shell_usdc_url = build_s3_uri(room_shell_key)
+            
         db.commit()
-    except Exception:
+        return room.id
+    finally:
+        db.close()
+
+
+def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[str]) -> dict[str, Any]:
+    raw_prefix = _raw_prefix(confirm_code)
+    generated_prefix = _generated_prefix(confirm_code)
+
+    room_usdz_key = next((k for k in uploaded_keys if k.endswith("/Room.usdz")), None)
+    room_empty_usdz_key = next((k for k in uploaded_keys if k.endswith("/Room_empty.usdz")), None)
+    model_keys = sorted(k for k in uploaded_keys if "/Models/" in k)
+
+    return {
+        "room_id": room_id,
+        "confirm_code": confirm_code,
+        "source": "ios_upload",
+        "pipeline_version": "v1",
+        "raw_prefix": raw_prefix,
+        "generated_prefix": generated_prefix,
+        "inputs": {
+            "room_data_json": f"{raw_prefix}/room_data.json",
+            "room_usdz": room_usdz_key,
+            "room_empty_usdz": room_empty_usdz_key,
+            "models": model_keys,
+        },
+        "outputs": {
+            "normalized_json": f"{generated_prefix}/room_data.normalized.json",
+            "problem_json": f"{generated_prefix}/room_data.problem.json",
+            "optimized_json": f"{generated_prefix}/room_data.optimized.json",
+            "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
+            "fbx": f"{generated_prefix}/output.fbx",
+        },
+    }
+
+
+async def _start_pipeline_execution(pipeline_input: dict[str, Any]) -> str | None:
+    try:
+        confirm_code = pipeline_input["confirm_code"]
+        response = stepfunctions_client.start_execution(
+            stateMachineArn=settings.step_functions_state_machine_arn,
+            name=f"VO-Scan-{confirm_code}-{uuid.uuid4().hex[:8].upper()}",
+            input=json.dumps(pipeline_input)
+        )
+        return response["executionArn"]
+    except Exception as e:
+        logger.error(f"Step Functions start_execution failed: {str(e)}")
+        return None
+
+
+def _save_optimized_to_db(room_id: int, optimized_data: dict[str, Any], optimized_s3_url: str | None = None) -> None:
+    db = SessionLocal()
+    try:
+        # UPSERT logic for OPTIMIZED version
+        existing_version = db.query(Version).filter(
+            Version.room_id == room_id,
+            Version.version_type == "OPTIMIZED",
+            Version.version_no == 1
+        ).first()
+
+        if existing_version:
+            logger.info(f"Existing OPTIMIZED v1 found for room_id {room_id}. Updating...")
+            db.query(FurnitureItem).filter(FurnitureItem.version_id == existing_version.id).delete()
+            version = existing_version
+            version.json_data = optimized_data
+            if optimized_s3_url:
+                version.s3_json_url = optimized_s3_url
+        else:
+            logger.info(f"Creating new OPTIMIZED v1 for room_id {room_id}.")
+            version = Version(
+                room_id=room_id,
+                version_no=1,
+                version_type="OPTIMIZED",
+                json_data=optimized_data,
+                s3_json_url=optimized_s3_url
+            )
+            db.add(version)
+            db.flush() 
+
+        elements = optimized_data.get("elements", [])
+        for elem in elements:
+            transform_dict = elem.get("transform_dict", {})
+            
+            furniture = FurnitureItem(
+                version_id=version.id,
+                model_id=elem.get("model_id"),
+                item_key=elem.get("item_key", f"item_{uuid.uuid4().hex[:8]}"),
+                
+                pos_x=transform_dict.get("pos_x", 0.0),
+                pos_y=transform_dict.get("pos_y", 0.0),
+                pos_z=transform_dict.get("pos_z", 0.0),
+                rot_x=transform_dict.get("rot_x", 0.0),
+                rot_y=transform_dict.get("rot_y", 0.0),
+                rot_z=transform_dict.get("rot_z", 0.0),
+                scale_x=transform_dict.get("scale_x", 1.0),
+                scale_y=transform_dict.get("scale_y", 1.0),
+                scale_z=transform_dict.get("scale_z", 1.0),
+                
+                footprint_polygon=elem.get("footprint_polygon")
+            )
+            db.add(furniture)
+
+        db.commit()
+    except Exception as e:
         db.rollback()
+        logger.error(f"Failed to persist optimized layout to database: {str(e)}")
         raise
     finally:
         db.close()
 
 
-# ── POST /scans ───────────────────────────────────────────────────────────────
-# 스캔완료 버튼: zip 업로드 → S3 저장 → 확인코드 반환
+@router.post("/start", response_model=ScanUploadStartResponse)
+async def start_scan_upload(request: ScanUploadStartRequest):
+    room_id, confirm_code = _create_upload_session(
+        include_room_usdz=request.include_room_usdz,
+        include_room_empty_usdz=request.include_room_empty_usdz,
+    )
+    raw_prefix = _raw_prefix(confirm_code)
+    targets = []
 
-@router.post("", response_model=ScanUploadResponse)
-async def upload_scan(
-    scan_export: UploadFile = File(..., description="ScanExport.zip"),
-):
-    raw_zip = await scan_export.read()
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(raw_zip))
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=422, detail="유효한 zip 파일이 아닙니다.")
+    # 1. room_data.json 업로드 URL 추가 (필수)
+    s3_json_key = f"{raw_prefix}/room_data.json"
+    targets.append(PresignedUploadTarget(
+        logical_name="room_data_json",
+        s3_key=s3_json_key,
+        presigned_url=await generate_presigned_put_url(s3_json_key, JSON_CONTENT_TYPE),
+        content_type=JSON_CONTENT_TYPE
+    ))
 
-    names = zf.namelist()
+    # 2. USDZ 룸 파일 처리
+    if request.include_room_usdz:
+        s3_key = f"{raw_prefix}/Room.usdz"
+        targets.append(PresignedUploadTarget(
+            logical_name="room_usdz",
+            s3_key=s3_key,
+            presigned_url=await generate_presigned_put_url(s3_key, USDZ_CONTENT_TYPE),
+            content_type=USDZ_CONTENT_TYPE
+        ))
 
-    json_name = next((n for n in names if n.endswith("room_data.json")), None)
-    if not json_name:
-        raise HTTPException(status_code=422, detail="zip 안에 room_data.json이 없습니다.")
-    try:
-        raw_json = json.loads(zf.read(json_name))
-        scan_data = IOSRoomScanData(**raw_json)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"room_data.json 파싱 실패: {e}")
+    # 3. 비어있는 룸 파일 처리
+    if request.include_room_empty_usdz:
+        s3_key = f"{raw_prefix}/Room_empty.usdz"
+        targets.append(PresignedUploadTarget(
+            logical_name="room_empty_usdz",
+            s3_key=s3_key,
+            presigned_url=await generate_presigned_put_url(s3_key, USDZ_CONTENT_TYPE),
+            content_type=USDZ_CONTENT_TYPE
+        ))
 
-    confirm_code = uuid.uuid4().hex[:6].upper()
-    uploaded: list[str] = []
+    # 4. 개별 가구 모델 파일들 처리
+    for filename in request.model_filenames:
+        s3_key = f"{raw_prefix}/Models/{filename}"
+        targets.append(PresignedUploadTarget(
+            logical_name=f"model_{filename}",
+            s3_key=s3_key,
+            presigned_url=await generate_presigned_put_url(s3_key, MODEL_CONTENT_TYPE),
+            content_type=MODEL_CONTENT_TYPE
+        ))
 
-    # S3 origin/ 저장
-    url = await upload_json(f"{confirm_code}/origin/room_data.json", raw_json)
-    uploaded.append(url)
-
-    room_usdz = next((n for n in names if n.endswith("Room.usdz")), None)
-    if room_usdz:
-        url = await upload_bytes(f"{confirm_code}/origin/Room.usdz", zf.read(room_usdz), "model/vnd.usdz+zip")
-        uploaded.append(url)
-
-    room_empty = next((n for n in names if n.endswith("Room_empty.usdz")), None)
-    if room_empty:
-        url = await upload_bytes(f"{confirm_code}/origin/Room_empty.usdz", zf.read(room_empty), "model/vnd.usdz+zip")
-        uploaded.append(url)
-
-    for model_path in (n for n in names if n.endswith(".usdc")):
-        filename = model_path.split("/")[-1]
-        url = await upload_bytes(f"{confirm_code}/origin/models/{filename}", zf.read(model_path), "application/octet-stream")
-        uploaded.append(url)
-
-    # DB 저장 (ORIGINAL)
-    try:
-        normalized = convert_roomplan_to_optimizer_payload(raw_json)
-        layout_problem = build_layout_problem(normalized)
-        await asyncio.to_thread(_save_original_to_db, confirm_code, uploaded[0], layout_problem)
-    except Exception as e:
-        logger.warning("DB 저장 실패 (계속 진행): %s", e)
-
-    logger.info("Scan uploaded | confirm_code=%s", confirm_code)
-
-    return ScanUploadResponse(
-        message="scan uploaded",
+    return ScanUploadStartResponse(
+        message="Upload session successfully initialized.",
+        room_id=room_id,
         confirm_code=confirm_code,
-        object_count=scan_data.objectCount,
-        uploaded_files=uploaded,
+        raw_prefix=raw_prefix,
+        generated_prefix=_generated_prefix(confirm_code),
+        expires_in_seconds=URL_EXPIRATION_SECONDS,
+        uploads=targets
     )
 
 
-# ── POST /scans/{confirm_code}/optimize ──────────────────────────────────────
-# 최적화 버튼: S3에서 원본 로드 → 최적화 → iOS 포맷으로 반환
+@router.post("/{confirm_code}/complete", response_model=ScanUploadCompleteResponse)
+async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteRequest):
+    if not payload.uploaded_keys:
+        raise HTTPException(status_code=422, detail="uploaded_keys는 비어 있을 수 없습니다.")
+
+    raw_prefix = _raw_prefix(confirm_code)
+    required_json_key = f"{raw_prefix}/room_data.json"
+
+    # Prefix 검증
+    invalid_keys = [k for k in payload.uploaded_keys if not k.startswith(f"{raw_prefix}/")]
+    if invalid_keys:
+        raise HTTPException(
+            status_code=422, 
+            detail={"message": "uploaded_keys 중 raw prefix 외 경로가 있습니다.", "invalid_keys": invalid_keys}
+        )
+
+    # 필수 파일 검증
+    if required_json_key not in payload.uploaded_keys:
+        raise HTTPException(status_code=422, detail=f"필수 파일 누락: {required_json_key}")
+
+    # S3 실재 여부 검증
+    missing_keys = []
+    for k in payload.uploaded_keys:
+        if not await object_exists(k):
+            missing_keys.append(k)
+    if missing_keys:
+        raise HTTPException(
+            status_code=409, 
+            detail={"message": "아직 업로드되지 않은 파일이 있습니다.", "missing_keys": missing_keys}
+        )
+
+    # 상태 업데이트 및 room_id 획득
+    room_id = await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, False)
+
+    # 파이프라인 트리거
+    pipeline_input = _build_pipeline_input(room_id, confirm_code, payload.uploaded_keys)
+    execution_arn = await _start_pipeline_execution(pipeline_input)
+    pipeline_started = execution_arn is not None
+
+    if pipeline_started:
+        # 트리거 성공 시 상태를 PROCESSING으로 변경
+        await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, True)
+
+    return ScanUploadCompleteResponse(
+        message="scan upload completed",
+        room_id=room_id,
+        confirm_code=confirm_code,
+        raw_prefix=raw_prefix,
+        generated_prefix=_generated_prefix(confirm_code),
+        uploaded_keys=payload.uploaded_keys,
+        pipeline_started=pipeline_started,
+        execution_arn=execution_arn,
+        pipeline_input=pipeline_input,
+    )
+
 
 @router.post("/{confirm_code}/optimize")
-async def optimize_scan(confirm_code: str):
-    # S3에서 원본 JSON 로드
+async def save_optimized_layout_endpoint(confirm_code: str, optimized_result: dict[str, Any], optimized_s3_url: str | None = None):
+    db = SessionLocal()
     try:
-        raw_json = await get_json(f"{confirm_code}/origin/room_data.json")
+        room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
+        if not room:
+            raise HTTPException(status_code=404, detail="Room not found")
+        
+        await asyncio.to_thread(_save_optimized_to_db, room.id, optimized_result, optimized_s3_url)
+        return {"message": "Optimized layout saved"}
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"스캔 데이터를 찾을 수 없습니다: {e}")
+        logger.error(f"Failed to save optimized layout: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
-    # 변환 + 최적화
-    try:
-        normalized = convert_roomplan_to_optimizer_payload(raw_json)
-        layout_problem = build_layout_problem(normalized)
-        optimizer = CanonicalLayoutOptimizer(layout_problem)
-        optimized_result = await asyncio.to_thread(optimizer.optimize)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"최적화 실패: {e}")
 
-    # 역변환 → iOS 포맷 (room_data.roomplan_optimized.json)
-    try:
-        roomplan_optimized = export_optimized_layout_to_roomplan(raw_json, optimized_result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"역변환 실패: {e}")
+@router.post("", include_in_schema=False)
+async def legacy_upload_zip(file: UploadFile = File(...)):
+    return {"message": "Legacy zip upload is deprecated. Use /start and /complete instead."}
 
-    # S3 processed/ 저장
-    optimized_s3_url = await upload_json(f"{confirm_code}/processed/result.json", optimized_result)
-    await upload_json(f"{confirm_code}/processed/room_data.roomplan_optimized.json", roomplan_optimized)
 
-    # DB 저장 (OPTIMIZED)
-    try:
-        await asyncio.to_thread(_save_optimized_to_db, confirm_code, optimized_s3_url, optimized_result)
-    except Exception as e:
-        logger.warning("DB 저장 실패 (계속 진행): %s", e)
-
-    # iOS가 바로 렌더링할 수 있는 포맷으로 반환
-    return roomplan_optimized
+@router.post("/{confirm_code}/trigger", include_in_schema=False)
+async def legacy_trigger_pipeline(confirm_code: str):
+    return {"message": "Legacy trigger is deprecated. Use /complete instead."}

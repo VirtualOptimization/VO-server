@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+from typing import Any
+
+from pydantic import BaseModel, Field
 
 
 # ── iOS RoomPlan JSON 포맷 ────────────────────────────────────────────────────
@@ -53,3 +55,42 @@ class ScanUploadResponse(BaseModel):
     confirm_code: str
     object_count: int
     uploaded_files: list[str]
+
+
+class PresignedUploadTarget(BaseModel):
+    logical_name: str
+    s3_key: str
+    presigned_url: str
+    content_type: str
+
+
+class ScanUploadStartRequest(BaseModel):
+    model_filenames: list[str] = Field(default_factory=list)
+    include_room_usdz: bool = True
+    include_room_empty_usdz: bool = False
+
+
+class ScanUploadStartResponse(BaseModel):
+    message: str
+    room_id: int
+    confirm_code: str
+    raw_prefix: str
+    generated_prefix: str
+    expires_in_seconds: int
+    uploads: list[PresignedUploadTarget]
+
+
+class ScanUploadCompleteRequest(BaseModel):
+    uploaded_keys: list[str] = Field(default_factory=list)
+
+
+class ScanUploadCompleteResponse(BaseModel):
+    message: str
+    room_id: int
+    confirm_code: str
+    raw_prefix: str
+    generated_prefix: str
+    uploaded_keys: list[str]
+    pipeline_started: bool
+    execution_arn: str | None = None
+    pipeline_input: dict[str, Any]

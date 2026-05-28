@@ -1,23 +1,32 @@
-from pydantic_settings import BaseSettings
+import os
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # AWS
-    aws_region: str = "ap-northeast-2"
-    s3_bucket_name: str = ""
-    aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
+    env: str = os.getenv("ENV", "local")
 
-    # DB (A가 스키마 확정 후 채울 예정)
-    database_url: str = ""
+    database_url: str = Field(validation_alias="DATABASE_URL")
+    async_database_url: str = Field(validation_alias="ASYNC_DATABASE_URL")
 
-    @property
-    def async_database_url(self) -> str:
-        return self.database_url.replace("postgresql://", "postgresql+asyncpg://")
+    aws_region: str = Field(default="ap-northeast-2", validation_alias="AWS_REGION")
+    s3_bucket_name: str = Field(default="", validation_alias="S3_BUCKET_NAME")
+    aws_access_key_id: str = Field(default="", validation_alias="AWS_ACCESS_KEY_ID")
+    aws_secret_access_key: str = Field(default="", validation_alias="AWS_SECRET_ACCESS_KEY")
+    s3_presigned_expiration_seconds: int = Field(
+        default=3600,
+        validation_alias="S3_PRESIGNED_EXPIRATION_SECONDS",
+    )
+    step_functions_state_machine_arn: str = Field(
+        default="",
+        validation_alias="STEP_FUNCTIONS_STATE_MACHINE_ARN",
+    )
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=".env" if os.getenv("ENV", "local") == "local" else None,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 settings = Settings()

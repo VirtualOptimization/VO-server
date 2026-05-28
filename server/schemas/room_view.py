@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+from typing import Any
+from pydantic import BaseModel
+
+
+class RoomSummaryResponse(BaseModel):
+    room_id: int
+    confirm_code: str
+    status: str
+
+
+class RoomVersionItem(BaseModel):
+    version_id: int
+    version_type: str
+    version_no: int
+    created_at: str | None = None  # 현재 DB에 없어서 우선 None
+    is_latest: bool
+
+
+class RoomVersionsResponse(BaseModel):
+    room_id: int
+    confirm_code: str
+    versions: list[RoomVersionItem]
+
+
+class FurnitureItemView(BaseModel):
+    item_key: str
+    model_key: str | None = None
+    usdc_url: str | None = None
+    pos: list[float]
+    rot: list[float]
+    scale: list[float]
+
+
+class VersionDetailResponse(BaseModel):
+    version_id: int
+    room_id: int
+    confirm_code: str
+    version_type: str
+    version_no: int
+    room_shell_url: str | None = None
+    converted_fbx_url: str | None = None
+    layout_json_url: str | None = None
+    json_data: dict[str, Any] | None = None
+    furniture_items: list[FurnitureItemView]
