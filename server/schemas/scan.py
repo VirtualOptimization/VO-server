@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -57,6 +58,8 @@ class ScanUploadResponse(BaseModel):
     uploaded_files: list[str]
 
 
+# ── BE-A: Presigned 업로드 플로우 ─────────────────────────────────────────────
+
 class PresignedUploadTarget(BaseModel):
     logical_name: str
     s3_key: str
@@ -94,3 +97,22 @@ class ScanUploadCompleteResponse(BaseModel):
     pipeline_started: bool
     execution_arn: str | None = None
     pipeline_input: dict[str, Any]
+
+
+# ── BE-B: 조회 / 다운로드 ────────────────────────────────────────────────────
+
+class VersionSummary(BaseModel):
+    version_type: str          # "origin" | "optimized"
+    created_at: datetime | None
+
+
+class ScanDetailResponse(BaseModel):
+    confirm_code: str
+    created_at: datetime
+    versions: list[VersionSummary]
+
+
+class VersionAssetsResponse(BaseModel):
+    usdz_url: str              # Room_empty.usdz (방 껍데기) — 없으면 Room.usdz
+    data_url: str              # 가구 위치 JSON (origin or optimized)
+    model_urls: dict[str, str] # { "chair_01.usdc": "presigned_url", ... }
