@@ -52,6 +52,49 @@ async def upload_bytes(key: str, data: bytes, content_type: str = "application/o
     return build_s3_uri(key)
 
 
+async def head_object(key: str) -> dict | None:
+    """S3 객체 메타데이터를 반환한다. 없으면 None."""
+    try:
+        response = await asyncio.to_thread(
+            s3_client.head_object,
+            Bucket=settings.s3_bucket_name,
+            Key=key,
+        )
+        return response
+    except s3_client.exceptions.ClientError:
+        return None
+    except Exception:
+        return None
+
+
+def delete_objects(keys: list[str]) -> None:
+    """S3 객체 여러 개를 한 번에 삭제한다."""
+    if not keys:
+        return
+    s3_client.delete_objects(
+        Bucket=settings.s3_bucket_name,
+        Delete={"Objects": [{"Key": k} for k in keys]},
+    )
+
+
+def list_keys(prefix: str) -> list[str]:
+    """S3 prefix 하위의 모든 객체 key 목록을 반환한다."""
+    response = s3_client.list_objects_v2(
+        Bucket=settings.s3_bucket_name,
+        Prefix=prefix,
+    )
+    return [obj["Key"] for obj in response.get("Contents", [])]
+
+
+def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
+    """S3 객체의 Presigned URL을 반환한다."""
+    return s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.s3_bucket_name, "Key": key},
+        ExpiresIn=expires_in,
+    )
+
+
 async def get_json(key: str) -> dict:
     """S3에서 JSON 파일을 읽어 dict로 반환한다."""
     response = await asyncio.to_thread(
