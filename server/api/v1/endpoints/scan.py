@@ -92,6 +92,7 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
     raw_prefix = _raw_prefix(confirm_code)
     generated_prefix = _generated_prefix(confirm_code)
     return {
+        "bucket": settings.s3_bucket_name,
         "room_id": room_id,
         "confirm_code": confirm_code,
         "source": "ios_upload",
@@ -109,7 +110,7 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
             "problem_json": f"{generated_prefix}/room_data.problem.json",
             "optimized_json": f"{generated_prefix}/room_data.optimized.json",
             "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
-            "fbx": f"{generated_prefix}/output.fbx",
+            "glb": f"{raw_prefix}/output.glb",
         },
     }
 

@@ -45,7 +45,7 @@
 
 ### ⚙️ Processing & Realtime
 - Algorithm: Shapely (기하학 기반 최적화 계산)  
-- 3D Tool: Blender CLI (USDZ → FBX 변환)  
+- 3D Tool: usd2gltf (USDZ → GLB 변환)  
 - Communication: FastAPI WebSocket  
 
 ---
@@ -59,7 +59,7 @@
    Shapely 기반 바닥 점유율 계산 및 최적 가구 위치 산출  
 
 3. 🔄 **포맷 변환**  
-   USDZ → FBX 자동 변환 (VR 호환성 확보)  
+   USDZ → GLB 자동 변환 (유니티 호환성 확보)  
 
 4. 🔑 **VR 조회 시스템**  
    6자리 확인 코드 기반 공간 데이터 조회  
