@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text, UniqueConstraint
+from datetime import datetime
+
+from sqlalchemy import CheckConstraint, ForeignKey, String, Text, UniqueConstraint, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,6 +35,10 @@ class Version(Base):
     s3_json_url: Mapped[str | None] = mapped_column(Text)
     converted_fbx_url: Mapped[str | None] = mapped_column(Text)
     json_data: Mapped[dict | list | None] = mapped_column(JSONB)
+    version_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
     room: Mapped["Room"] = relationship(back_populates="versions")
     parent_version: Mapped["Version | None"] = relationship(

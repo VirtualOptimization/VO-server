@@ -26,7 +26,6 @@ router = APIRouter()
 # ── GET /rooms/versions/{version_id} ─────────────────────────────────────────
 # ※ /{confirm_code} 보다 먼저 등록해야 경로 충돌 없음
 
-@router.get("/versions/{version_id}", response_model=VersionDetailResponse)
 def get_version_detail(version_id: int):
     db = SessionLocal()
     try:

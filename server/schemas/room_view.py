@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from pydantic import BaseModel
 
@@ -14,7 +15,7 @@ class RoomVersionItem(BaseModel):
     version_id: int
     version_type: str
     version_no: int
-    created_at: str | None = None  # 현재 DB에 없어서 우선 None
+    created_at: datetime | None = None
     is_latest: bool
 
 

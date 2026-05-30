@@ -125,13 +125,13 @@ class VoPipelineStack(Stack):
                     container_definition=container,
                     command=[
                         "python3",
-                        "/app/workers/converter/run_fbx_conversion.py",
+                        "/app/workers/converter/run_glb_conversion.py",
                         "--bucket",
                         bucket.bucket_name,
                         "--input-s3-key",
                         sfn.JsonPath.string_at("$.inputs.room_usdz"),
                         "--output-s3-key",
-                        sfn.JsonPath.string_at("$.outputs.fbx"),
+                        sfn.JsonPath.string_at("$.outputs.glb"),
                     ],
                 )
             ],
