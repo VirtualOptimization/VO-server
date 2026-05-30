@@ -33,7 +33,7 @@ class Version(Base):
     version_type: Mapped[str] = mapped_column(String(20), nullable=False)
     version_no: Mapped[int] = mapped_column(nullable=False, server_default="0")
     s3_json_url: Mapped[str | None] = mapped_column(Text)
-    converted_fbx_url: Mapped[str | None] = mapped_column(Text)
+    converted_glb_url: Mapped[str | None] = mapped_column(Text)
     json_data: Mapped[dict | list | None] = mapped_column(JSONB)
     version_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -19,7 +19,12 @@ router = APIRouter()
 
 # ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
 
-def _save_optimized_to_db(room_id: int, optimized_data: dict[str, Any], optimized_s3_url: str | None = None) -> None:
+def _save_optimized_to_db(
+    room_id: int,
+    optimized_data: dict[str, Any],
+    optimized_s3_url: str | None = None,
+    converted_glb_url: str | None = None,
+) -> None:
     db = SessionLocal()
     try:
         existing = db.query(Version).filter(
@@ -34,10 +39,13 @@ def _save_optimized_to_db(room_id: int, optimized_data: dict[str, Any], optimize
             version.json_data = optimized_data
             if optimized_s3_url:
                 version.s3_json_url = optimized_s3_url
+            if converted_glb_url:
+                version.converted_glb_url = converted_glb_url
         else:
             version = Version(
                 room_id=room_id, version_no=1, version_type="OPTIMIZED",
                 json_data=optimized_data, s3_json_url=optimized_s3_url,
+                converted_glb_url=converted_glb_url,
             )
             db.add(version)
             db.flush()
@@ -69,13 +77,14 @@ async def save_optimized_layout(
     confirm_code: str,
     optimized_result: dict[str, Any],
     optimized_s3_url: str | None = None,
+    converted_glb_url: str | None = None,
 ):
     db = SessionLocal()
     try:
         room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
         if not room:
             raise HTTPException(status_code=404, detail="Room not found")
-        await asyncio.to_thread(_save_optimized_to_db, room.id, optimized_result, optimized_s3_url)
+        await asyncio.to_thread(_save_optimized_to_db, room.id, optimized_result, optimized_s3_url, converted_glb_url)
         room.status = "COMPLETED"
         db.commit()
         return {"message": "Optimized layout saved"}

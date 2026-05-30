@@ -41,7 +41,7 @@ class VersionDetailResponse(BaseModel):
     version_type: str
     version_no: int
     room_shell_url: str | None = None
-    converted_fbx_url: str | None = None
+    converted_glb_url: str | None = None
     layout_json_url: str | None = None
     json_data: dict[str, Any] | None = None
     furniture_items: list[FurnitureItemView]
