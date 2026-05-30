@@ -134,7 +134,7 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
             "problem_json": f"{generated_prefix}/room_data.problem.json",
             "optimized_json": f"{generated_prefix}/room_data.optimized.json",
             "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
-            "fbx": f"{generated_prefix}/output.fbx",
+            "glb": f"{generated_prefix}/output.glb",
         },
     }
 

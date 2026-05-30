@@ -50,7 +50,7 @@ def get_room_versions(confirm_code: str):
         versions = (
             db.query(Version)
             .filter(Version.room_id == room.id)
-            .order_by(Version.version_no.asc(), Version.id.asc())
+            .order_by(Version.created_at.desc(), Version.id.desc())
             .all()
         )
 
@@ -67,7 +67,7 @@ def get_room_versions(confirm_code: str):
                     version_id=v.id,
                     version_type=v.version_type,
                     version_no=v.version_no,
-                    created_at=None,  # DB에 컬럼 없어서 우선 None
+                    created_at=v.created_at,
                     is_latest=(v.version_no == latest_version_no),
                 )
                 for v in versions
