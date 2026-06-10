@@ -32,6 +32,7 @@ env/
 build/
 dist/
 *.egg-info/
+tmp/
 
 # Docker / local services
 postgres_data/

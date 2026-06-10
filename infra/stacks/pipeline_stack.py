@@ -128,6 +128,8 @@ class VoPipelineStack(Stack):
                         "/app/workers/converter/run_glb_conversion.py",
                         "--bucket",
                         bucket.bucket_name,
+                        "--room-data-s3-key",
+                        sfn.JsonPath.string_at("$.inputs.room_data_json"),
                         "--input-s3-key",
                         sfn.JsonPath.string_at("$.inputs.room_usdz"),
                         "--output-s3-key",

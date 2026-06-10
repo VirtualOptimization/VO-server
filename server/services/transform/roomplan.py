@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .mappers import build_optimizer_metadata, map_roomplan_category
+from .mappers import build_optimizer_metadata, infer_catalog_model_key, map_roomplan_category
 
 
 def _rotate_point(x: float, z: float, angle: float) -> tuple[float, float]:
@@ -161,6 +161,9 @@ def convert_roomplan_to_optimizer_payload(src: dict[str, Any]) -> dict[str, Any]
             item["back_vector_2d"] = _normalize_vector_2d(bx, by, [-item["front_vector_2d"][0], -item["front_vector_2d"][1]])
         if "modelFileName" in obj:
             item["source_model_file"] = obj["modelFileName"]
+            model_key = infer_catalog_model_key(obj["category"], obj["modelFileName"])
+            if model_key:
+                item["model_key"] = model_key
         scanned_objects.append(item)
 
     fixed_elements = []

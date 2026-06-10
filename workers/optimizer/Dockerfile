@@ -31,4 +31,4 @@ COPY workers/optimizer/ /app/workers/optimizer/
 WORKDIR /app
 
 # Default entry point
-CMD ["python"]
+CMD ["python", "/app/workers/optimizer/run_s3_optimizer.py"]

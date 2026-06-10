@@ -18,6 +18,38 @@ def build_s3_uri(key: str) -> str:
     return f"s3://{settings.s3_bucket_name}/{key}"
 
 
+def parse_s3_uri(uri: str | None) -> tuple[str, str] | None:
+    """Return (bucket, key) for s3://bucket/key values."""
+    if not uri or not uri.startswith("s3://"):
+        return None
+
+    value = uri.removeprefix("s3://")
+    if "/" not in value:
+        return None
+
+    bucket, key = value.split("/", 1)
+    if not bucket or not key:
+        return None
+    return bucket, key
+
+
+def generate_presigned_url_for_uri(uri: str | None, expires_in: int = 3600) -> str | None:
+    """Presign s3:// URIs and pass through already-public URLs."""
+    if not uri:
+        return None
+
+    parsed = parse_s3_uri(uri)
+    if parsed is None:
+        return uri
+
+    bucket, key = parsed
+    return s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_in,
+    )
+
+
 async def upload_json(key: str, data: dict) -> str:
     """JSON 데이터를 S3에 업로드하고 s3 URI를 반환한다."""
     if not settings.s3_bucket_name:

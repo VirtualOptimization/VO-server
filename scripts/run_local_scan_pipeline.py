@@ -235,7 +235,14 @@ def save_artifacts(
 
 def build_model_lookup(db) -> dict[str, int]:
     rows = db.query(FurnitureModel).all()
-    return {str(model.name): int(model.id) for model in rows if model.name}
+    lookup: dict[str, int] = {}
+    for model in rows:
+        if model.name:
+            lookup[str(model.name)] = int(model.id)
+            if str(model.name).endswith(".rooms"):
+                lookup[str(model.name).removesuffix(".rooms")] = int(model.id)
+        lookup[str(model.model_key)] = int(model.id)
+    return lookup
 
 
 def add_furniture_items(db, version_id: int, items: list[dict], model_lookup: dict[str, int], *, optimized: bool) -> None:
@@ -244,8 +251,12 @@ def add_furniture_items(db, version_id: int, items: list[dict], model_lookup: di
         rot_key = "optimized_rotation_y_deg" if optimized and "optimized_rotation_y_deg" in item else "rotation_y_deg"
 
         model_id = None
+        model_key = item.get("model_key")
+        if model_key:
+            model_id = model_lookup.get(model_key)
+
         source_model_file = item.get("source_model_file")
-        if source_model_file:
+        if model_id is None and source_model_file:
             model_name = Path(source_model_file).stem
             model_id = model_lookup.get(model_name)
 

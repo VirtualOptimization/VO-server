@@ -142,6 +142,11 @@ def export_optimized_layout_to_roomplan(
         obj.update(_build_direction_vectors(raw_theta))
         obj["obbVertices"] = _build_obb_vertices(new_center, dimensions, raw_theta)
 
+        if optimized_item.get("source_model_file"):
+            obj["modelFileName"] = optimized_item["source_model_file"]
+        if optimized_item.get("model_key"):
+            obj["model_key"] = optimized_item["model_key"]
+
     return result
 
 
