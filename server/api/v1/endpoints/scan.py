@@ -198,6 +198,20 @@ async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteReq
     if missing_keys:
         raise HTTPException(status_code=409, detail={"message": "아직 업로드되지 않은 파일이 있습니다.", "missing_keys": missing_keys})
 
+    # 이미 파이프라인이 실행 중이면 중복 실행 방지
+    db_check = SessionLocal()
+    try:
+        room_check = db_check.query(Room).filter(Room.confirm_code == confirm_code).first()
+        if room_check and room_check.status in ("PROCESSING", "COMPLETED"):
+            return ScanUploadCompleteResponse(
+                message="already processing", room_id=room_check.id, confirm_code=confirm_code,
+                raw_prefix=raw_prefix, generated_prefix=_generated_prefix(confirm_code),
+                uploaded_keys=payload.uploaded_keys, pipeline_started=True,
+                execution_arn=None, pipeline_input={},
+            )
+    finally:
+        db_check.close()
+
     room_id = await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, False)
     pipeline_input = _build_pipeline_input(room_id, confirm_code, payload.uploaded_keys)
     execution_arn = await _start_pipeline_execution(pipeline_input)
