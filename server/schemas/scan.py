@@ -113,7 +113,7 @@ class ScanDetailResponse(BaseModel):
 
 
 class VersionAssetsResponse(BaseModel):
-    usdz_url: str              # Room_empty.usdz (방 껍데기) — 없으면 Room.usdz
+    usdz_url: str | None = None # Room_empty.usdz 또는 Room.usdz — JSON 기반 GLB만 있으면 없음
     glb_url: str | None = None # 변환된 3D 쉘 (output.glb)
     data_url: str              # 가구 위치 JSON (origin or optimized)
     model_urls: dict[str, str] # { "chair_01.usdc": "presigned_url", ... }

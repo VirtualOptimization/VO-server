@@ -19,9 +19,9 @@ class FurnitureModel(Base):
     name: Mapped[str | None] = mapped_column(String(100))
     furniture_type: Mapped[str | None] = mapped_column(String(50))
     usdc_url: Mapped[str | None] = mapped_column(Text)
+    glb_url: Mapped[str | None] = mapped_column(Text)
     width: Mapped[float] = mapped_column(nullable=False)
     depth: Mapped[float] = mapped_column(nullable=False)
     height: Mapped[float] = mapped_column(nullable=False)
 
     furniture_items: Mapped[list["FurnitureItem"]] = relationship(back_populates="model")
-
