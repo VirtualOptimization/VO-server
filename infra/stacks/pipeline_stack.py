@@ -1,4 +1,4 @@
-"""CDK stack for scan upload orchestration and FBX conversion worker."""
+"""CDK stack for scan upload orchestration and GLB conversion worker."""
 
 from __future__ import annotations
 
@@ -33,10 +33,10 @@ class VoPipelineStack(Stack):
         if not bucket_name:
             raise ValueError("VO_PIPELINE_BUCKET_NAME must be set to synth/deploy VoPipelineStack")
 
-        image_uri = os.getenv("VO_FBX_CONVERTER_IMAGE_URI", "")
+        image_uri = os.getenv("VO_GLB_CONVERTER_IMAGE_URI", "")
         create_repository = env_bool("VO_PIPELINE_CREATE_ECR_REPOSITORY", True)
-        cpu = int(os.getenv("VO_FBX_CONVERTER_CPU", "1024"))
-        memory = int(os.getenv("VO_FBX_CONVERTER_MEMORY_MIB", "2048"))
+        cpu = int(os.getenv("VO_GLB_CONVERTER_CPU", "1024"))
+        memory = int(os.getenv("VO_GLB_CONVERTER_MEMORY_MIB", "2048"))
 
         vpc = ec2.Vpc(
             self,
@@ -65,13 +65,13 @@ class VoPipelineStack(Stack):
         if create_repository:
             repository = ecr.Repository(
                 self,
-                "VoFbxConverterRepository",
-                repository_name=os.getenv("VO_FBX_CONVERTER_REPOSITORY_NAME", "vo-fbx-converter"),
+                "VoGlbConverterRepository",
+                repository_name=os.getenv("VO_GLB_CONVERTER_REPOSITORY_NAME", "vo-glb-converter"),
             )
 
         task_definition = ecs.FargateTaskDefinition(
             self,
-            "VoFbxConverterTaskDefinition",
+            "VoGlbConverterTaskDefinition",
             cpu=cpu,
             memory_limit_mib=memory,
         )
@@ -90,7 +90,7 @@ class VoPipelineStack(Stack):
 
         log_group = logs.LogGroup(
             self,
-            "VoFbxConverterLogs",
+            "VoGlbConverterLogs",
             retention=logs.RetentionDays.ONE_WEEK,
         )
 
@@ -99,13 +99,13 @@ class VoPipelineStack(Stack):
         elif repository is not None:
             container_image = ecs.ContainerImage.from_ecr_repository(repository, tag="latest")
         else:
-            raise ValueError("Provide VO_FBX_CONVERTER_IMAGE_URI or enable repository creation")
+            raise ValueError("Provide VO_GLB_CONVERTER_IMAGE_URI or enable repository creation")
 
         container = task_definition.add_container(
-            "VoFbxConverterContainer",
+            "VoGlbConverterContainer",
             image=container_image,
             logging=ecs.LogDrivers.aws_logs(
-                stream_prefix="fbx-converter",
+                stream_prefix="glb-converter",
                 log_group=log_group,
             ),
         )
@@ -114,7 +114,7 @@ class VoPipelineStack(Stack):
 
         run_task = tasks.EcsRunTask(
             self,
-            "RunFbxConverterTask",
+            "RunGlbConverterTask",
             integration_pattern=sfn.IntegrationPattern.RUN_JOB,
             cluster=cluster,
             task_definition=task_definition,
@@ -125,13 +125,13 @@ class VoPipelineStack(Stack):
                     container_definition=container,
                     command=[
                         "python3",
-                        "/app/workers/converter/run_fbx_conversion.py",
+                        "/app/workers/converter/run_glb_conversion.py",
                         "--bucket",
                         bucket.bucket_name,
                         "--input-s3-key",
                         sfn.JsonPath.string_at("$.inputs.room_usdz"),
                         "--output-s3-key",
-                        sfn.JsonPath.string_at("$.outputs.fbx"),
+                        sfn.JsonPath.string_at("$.outputs.glb"),
                     ],
                 )
             ],

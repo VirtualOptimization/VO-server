@@ -92,6 +92,7 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
     raw_prefix = _raw_prefix(confirm_code)
     generated_prefix = _generated_prefix(confirm_code)
     return {
+        "bucket": settings.s3_bucket_name,
         "room_id": room_id,
         "confirm_code": confirm_code,
         "source": "ios_upload",
@@ -109,7 +110,7 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
             "problem_json": f"{generated_prefix}/room_data.problem.json",
             "optimized_json": f"{generated_prefix}/room_data.optimized.json",
             "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
-            "fbx": f"{generated_prefix}/output.fbx",
+            "glb": f"{raw_prefix}/output.glb",
         },
     }
 
@@ -196,6 +197,20 @@ async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteReq
     missing_keys = [k for k in payload.uploaded_keys if not await object_exists(k)]
     if missing_keys:
         raise HTTPException(status_code=409, detail={"message": "아직 업로드되지 않은 파일이 있습니다.", "missing_keys": missing_keys})
+
+    # 이미 파이프라인이 실행 중이면 중복 실행 방지
+    db_check = SessionLocal()
+    try:
+        room_check = db_check.query(Room).filter(Room.confirm_code == confirm_code).first()
+        if room_check and room_check.status in ("PROCESSING", "COMPLETED"):
+            return ScanUploadCompleteResponse(
+                message="already processing", room_id=room_check.id, confirm_code=confirm_code,
+                raw_prefix=raw_prefix, generated_prefix=_generated_prefix(confirm_code),
+                uploaded_keys=payload.uploaded_keys, pipeline_started=True,
+                execution_arn=None, pipeline_input={},
+            )
+    finally:
+        db_check.close()
 
     room_id = await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, False)
     pipeline_input = _build_pipeline_input(room_id, confirm_code, payload.uploaded_keys)

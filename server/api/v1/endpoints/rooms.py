@@ -6,7 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import joinedload
 
-from server.api.v1.endpoints.rooms_common import _list_model_keys, _resolve_prefixes
+from server.api.v1.endpoints.rooms_common import _list_model_keys, _resolve_prefixes, _raw_prefix
 from server.core.s3 import generate_presigned_url, head_object
 from server.schemas.room_view import (
     FurnitureItemView,
@@ -26,7 +26,6 @@ router = APIRouter()
 # ── GET /rooms/versions/{version_id} ─────────────────────────────────────────
 # ※ /{confirm_code} 보다 먼저 등록해야 경로 충돌 없음
 
-@router.get("/versions/{version_id}", response_model=VersionDetailResponse)
 def get_version_detail(version_id: int):
     db = SessionLocal()
     try:
@@ -59,7 +58,7 @@ def get_version_detail(version_id: int):
             confirm_code=version.room.confirm_code if version.room else "",
             version_type=version.version_type, version_no=version.version_no,
             room_shell_url=version.room.room_shell_usdc_url if version.room else None,
-            converted_fbx_url=version.converted_fbx_url,
+            converted_glb_url=version.converted_glb_url,
             layout_json_url=version.s3_json_url, json_data=version.json_data,
             furniture_items=furniture_items,
         )
@@ -132,8 +131,12 @@ async def get_origin_assets(confirm_code: str):
     model_keys = await _list_model_keys(raw)
     model_urls = {key.split("/")[-1]: generate_presigned_url(key) for key in model_keys}
 
+    glb_key = f"{raw}/output.glb"
+    glb_url = generate_presigned_url(glb_key) if await head_object(glb_key) else None
+
     return VersionAssetsResponse(
         usdz_url=generate_presigned_url(usdz_key),
+        glb_url=glb_url,
         data_url=generate_presigned_url(data_key),
         model_urls=model_urls,
     )
@@ -163,8 +166,13 @@ async def get_optimized_assets(confirm_code: str):
     model_keys = await _list_model_keys(raw)
     model_urls = {key.split("/")[-1]: generate_presigned_url(key) for key in model_keys}
 
+    # 🎯 하단 구문 에러 파편 완전히 청소 완료 및 origin 폴더(raw) 규칙 매핑 동기화
+    glb_key = f"{raw}/output.glb"
+    glb_url = generate_presigned_url(glb_key) if await head_object(glb_key) else None
+
     return VersionAssetsResponse(
         usdz_url=generate_presigned_url(usdz_key),
+        glb_url=glb_url,
         data_url=generate_presigned_url(data_key),
         model_urls=model_urls,
     )
