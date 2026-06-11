@@ -7,7 +7,6 @@ from typing import Any
 
 
 CATEGORY_MAPPING = {
-    "table": "desk",
     "storage": "shelf",
 }
 
@@ -19,10 +18,12 @@ DEFAULT_MODEL_VARIANT_BY_FILENAME = {
 
 DEFAULT_FRONT_VECTOR_2D_BY_TYPE = {
     "bed": [1.0, 0.0],
+    "table": [0.0, -1.0],
     "desk": [0.0, -1.0],
     "chair": [0.0, 1.0],
     "closet": [0.0, -1.0],
     "shelf": [0.0, -1.0],
+    "television": [0.0, -1.0],
 }
 
 
@@ -69,10 +70,10 @@ def build_optimizer_metadata(category: str) -> dict[str, Any]:
             "back_to_wall": True,
         }
         metadata["head_side"] = "back"
-    elif category in {"desk", "closet"}:
+    elif category in {"desk", "table", "closet", "television"}:
         metadata["anchor_preferences"] = {
             "wall_cling_required": True,
-            "back_to_wall": category == "closet",
+            "back_to_wall": category in {"closet", "television"},
         }
     elif category == "shelf":
         metadata["anchor_preferences"] = {
