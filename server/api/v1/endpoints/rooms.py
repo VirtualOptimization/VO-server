@@ -191,9 +191,11 @@ async def get_optimized_assets(confirm_code: str):
 
     raw, gen = prefixes
     data_key = f"{gen}/room_data.roomplan_optimized.json"
+    unity_data_key = f"{gen}/room_data.roomplan_optimized.unity.json"
 
     if await head_object(data_key) is None:
         raise HTTPException(status_code=404, detail="최적화 데이터가 아직 없습니다.")
+    unity_data_exists = await head_object(unity_data_key) is not None
 
     full_key  = f"{raw}/Room.usdz"
     empty_key = f"{raw}/Room_empty.usdz"
@@ -216,5 +218,6 @@ async def get_optimized_assets(confirm_code: str):
         usdz_url=generate_presigned_url(usdz_key) if usdz_key else None,
         glb_url=glb_url,
         data_url=generate_presigned_url(data_key),
+        unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
         model_urls=model_urls,
     )

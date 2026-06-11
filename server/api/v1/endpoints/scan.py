@@ -106,10 +106,10 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
             "models": sorted(k for k in uploaded_keys if "/models/" in k),
         },
         "outputs": {
-            "normalized_json": f"{generated_prefix}/room_data.normalized.json",
             "problem_json": f"{generated_prefix}/room_data.problem.json",
             "optimized_json": f"{generated_prefix}/room_data.optimized.json",
             "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
+            "unity_roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.unity.json",
             "glb": f"{raw_prefix}/output.glb",
         },
     }

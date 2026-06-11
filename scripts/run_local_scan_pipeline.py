@@ -46,6 +46,7 @@ from server.services.transform import (  # noqa: E402
     build_layout_problem,
     convert_roomplan_to_optimizer_payload,
     export_optimized_layout_to_roomplan,
+    normalize_roomplan_for_unity,
 )
 from shared.db import SessionLocal  # noqa: E402
 from shared.models import FurnitureItem, FurnitureModel, Room, Version  # noqa: E402
@@ -103,6 +104,7 @@ def build_artifact_paths(output_dir: Path, scan_name: str) -> dict[str, Path]:
         "problem": base / "room_data.problem.json",
         "optimized": base / "room_data.optimized.json",
         "roomplan_optimized": base / "room_data.roomplan_optimized.json",
+        "unity_roomplan_optimized": base / "room_data.roomplan_optimized.unity.json",
         "plot": base / "room_data.optimized.svg",
     }
 
@@ -217,6 +219,7 @@ def save_artifacts(
     problem: dict,
     optimized: dict,
     exported_roomplan: dict,
+    unity_exported_roomplan: dict,
     optimizer: CanonicalLayoutOptimizer,
 ) -> None:
     for path in paths.values():
@@ -228,6 +231,10 @@ def save_artifacts(
     paths["optimized"].write_text(json.dumps(optimized, ensure_ascii=False, indent=2), encoding="utf-8")
     paths["roomplan_optimized"].write_text(
         json.dumps(exported_roomplan, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    paths["unity_roomplan_optimized"].write_text(
+        json.dumps(unity_exported_roomplan, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     optimizer.save_comparison_svg(optimized, paths["plot"])
@@ -299,6 +306,7 @@ def main() -> None:
         local_maxiter=args.local_maxiter,
     )
     exported_roomplan = export_optimized_layout_to_roomplan(raw_payload, optimized)
+    unity_exported_roomplan = normalize_roomplan_for_unity(exported_roomplan)
 
     artifact_paths = build_artifact_paths(output_dir, scan_dir.name)
     save_artifacts(
@@ -308,6 +316,7 @@ def main() -> None:
         problem,
         optimized,
         exported_roomplan,
+        unity_exported_roomplan,
         optimizer,
     )
 

@@ -1,4 +1,4 @@
-"""Run the RoomPlan optimizer against S3 input and upload the Unity-ready result."""
+"""Run the RoomPlan optimizer against S3 input and upload RoomPlan/Unity results."""
 
 from __future__ import annotations
 
@@ -52,10 +52,19 @@ def upload_json(s3_client, bucket: str, key: str, path: Path) -> None:
     )
 
 
+def default_unity_key(roomplan_key: str) -> str:
+    if roomplan_key.endswith(".json"):
+        return roomplan_key[:-5] + ".unity.json"
+    return roomplan_key + ".unity.json"
+
+
 def main() -> int:
     bucket = require_env("S3_BUCKET_NAME")
     input_key = require_env("INPUT_S3_KEY")
     roomplan_optimized_key = require_env("ROOMPLAN_OPTIMIZED_OUT_S3_KEY")
+    unity_roomplan_optimized_key = optional_env("UNITY_ROOMPLAN_OPTIMIZED_OUT_S3_KEY") or default_unity_key(
+        roomplan_optimized_key
+    )
     upload_debug_artifacts = env_bool("UPLOAD_DEBUG_ARTIFACTS")
 
     normalized_key = optional_env("NORMALIZED_OUT_S3_KEY")
@@ -75,6 +84,7 @@ def main() -> int:
         problem_path = base / "room_data.problem.json"
         optimized_path = base / "room_data.optimized.json"
         roomplan_optimized_path = base / "room_data.roomplan_optimized.json"
+        unity_roomplan_optimized_path = base / "room_data.roomplan_optimized.unity.json"
 
         print(f"Downloading s3://{bucket}/{input_key} to {input_path}...")
         s3.download_file(bucket, input_key, str(input_path))
@@ -89,11 +99,11 @@ def main() -> int:
             global_popsize=global_popsize,
             local_maxiter=local_maxiter,
         )
-        roomplan_optimized = normalize_roomplan_for_unity(
-            export_optimized_layout_to_roomplan(raw_payload, optimized)
-        )
+        roomplan_optimized = export_optimized_layout_to_roomplan(raw_payload, optimized)
+        unity_roomplan_optimized = normalize_roomplan_for_unity(roomplan_optimized)
 
         write_json(roomplan_optimized_path, roomplan_optimized)
+        write_json(unity_roomplan_optimized_path, unity_roomplan_optimized)
 
         if upload_debug_artifacts:
             if normalized_key:
@@ -107,12 +117,14 @@ def main() -> int:
                 upload_json(s3, bucket, optimized_key, optimized_path)
 
         upload_json(s3, bucket, roomplan_optimized_key, roomplan_optimized_path)
+        upload_json(s3, bucket, unity_roomplan_optimized_key, unity_roomplan_optimized_path)
 
     result = {
         "bucket": bucket,
         "input_s3_key": input_key,
         "outputs": {
             "roomplan_optimized_json": roomplan_optimized_key,
+            "unity_roomplan_optimized_json": unity_roomplan_optimized_key,
         },
         "upload_debug_artifacts": upload_debug_artifacts,
     }
