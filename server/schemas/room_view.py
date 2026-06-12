@@ -18,11 +18,16 @@ class RoomVersionItem(BaseModel):
     version_name: str | None = None
     created_at: datetime | None = None
     is_latest: bool
+    can_delete: bool
 
 
 class RoomVersionsResponse(BaseModel):
     room_id: int
     confirm_code: str
+    current_version_count: int
+    max_version_count: int
+    can_create_user_version: bool
+    remaining_user_edit_slots: int
     versions: list[RoomVersionItem]
 
 
@@ -71,8 +76,8 @@ class UserEditedVersionCreateRequest(BaseModel):
     parent_version_id: int
     version_name: str | None = None
     json_data: dict[str, Any] | None = None
-    layout: dict[str, Any]
-    ios_layout: dict[str, Any] | None = None
+    objects: list[dict[str, Any]]
+    ios_objects: list[dict[str, Any]] | None = None
 
 
 class UserEditedVersionCreateResponse(BaseModel):

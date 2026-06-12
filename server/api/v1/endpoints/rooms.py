@@ -25,14 +25,23 @@ from shared.models.version import Version
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+MAX_VERSION_COUNT = 5
+BASE_VERSION_COUNT = 2
+
 
 def _unity_layout_uri(version: Version) -> str | None:
-    if not isinstance(version.json_data, dict):
-        return None
-    return (
-        version.json_data.get("unity_layout_json")
-        or version.json_data.get("unity_roomplan_optimized_json")
+    json_data = version.json_data if isinstance(version.json_data, dict) else {}
+    unity_uri = (
+        json_data.get("unity_layout_json")
+        or json_data.get("unity_roomplan_optimized_json")
     )
+    if unity_uri:
+        return unity_uri
+
+    if version.s3_json_url and version.s3_json_url.endswith("/room_data.json"):
+        return version.s3_json_url.removesuffix("/room_data.json") + "/room_data.unity.json"
+
+    return None
 
 
 def _to_version_detail_response(version: Version) -> VersionDetailResponse:
@@ -143,9 +152,17 @@ def get_room_versions(confirm_code: str):
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
         latest_version_no = max(version.version_no for version in versions)
+        current_version_count = len(versions)
         return RoomVersionsResponse(
             room_id=room.id,
             confirm_code=room.confirm_code,
+            current_version_count=current_version_count,
+            max_version_count=MAX_VERSION_COUNT,
+            can_create_user_version=current_version_count < MAX_VERSION_COUNT,
+            remaining_user_edit_slots=max(
+                0,
+                MAX_VERSION_COUNT - max(BASE_VERSION_COUNT, current_version_count),
+            ),
             versions=[
                 RoomVersionItem(
                     version_id=version.id,
@@ -154,6 +171,7 @@ def get_room_versions(confirm_code: str):
                     version_name=version.version_name,
                     created_at=version.created_at,
                     is_latest=version.version_no == latest_version_no,
+                    can_delete=version.version_type == "USER_EDITED",
                 )
                 for version in versions
             ],
@@ -172,6 +190,7 @@ async def get_origin_assets(confirm_code: str):
 
     raw, _ = prefixes
     data_key = f"{raw}/room_data.json"
+    unity_data_key = f"{raw}/room_data.unity.json"
     full_key  = f"{raw}/Room.usdz"
     empty_key = f"{raw}/Room_empty.usdz"
     glb_key = f"{raw}/output.glb"
@@ -179,6 +198,7 @@ async def get_origin_assets(confirm_code: str):
     full_exists = await head_object(full_key) is not None
     empty_exists = await head_object(empty_key) is not None
     glb_exists = await head_object(glb_key) is not None
+    unity_data_exists = await head_object(unity_data_key) is not None
 
     if not full_exists and not empty_exists and not glb_exists:
         raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
@@ -190,6 +210,7 @@ async def get_origin_assets(confirm_code: str):
         usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
         glb_url=generate_presigned_url(glb_key) if glb_exists else None,
         data_url=generate_presigned_url(data_key),
+        unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
         model_urls=model_urls,
     )
 
