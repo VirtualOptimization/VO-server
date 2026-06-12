@@ -6,7 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import func
 
-from server.core.s3 import upload_json
+from server.core.s3 import get_json, parse_s3_uri, upload_json
 from server.schemas.room_view import (
     UserEditedVersionCreateRequest,
     UserEditedVersionCreateResponse,
@@ -20,6 +20,76 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_VERSION_COUNT = 5
+PATCHABLE_OBJECT_FIELDS = {
+    "center",
+    "transform",
+    "obbVertices",
+    "frontVector",
+    "backVector",
+    "leftVector",
+    "rightVector",
+    "upVector",
+}
+
+
+def _unity_layout_uri(version: Version) -> str | None:
+    if not isinstance(version.json_data, dict):
+        json_data = {}
+    else:
+        json_data = version.json_data
+
+    unity_uri = (
+        json_data.get("unity_layout_json")
+        or json_data.get("unity_roomplan_optimized_json")
+    )
+    if unity_uri:
+        return unity_uri
+
+    if version.s3_json_url and version.s3_json_url.endswith("/room_data.json"):
+        return version.s3_json_url.removesuffix("/room_data.json") + "/room_data.unity.json"
+
+    return None
+
+
+async def _load_json_from_s3_uri(uri: str | None, label: str) -> dict:
+    parsed = parse_s3_uri(uri)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail=f"{label} JSON 경로가 없습니다.")
+    _, key = parsed
+    return await get_json(key)
+
+
+def _patch_objects(base_layout: dict, updates: list[dict], label: str) -> dict:
+    if not updates:
+        raise HTTPException(status_code=400, detail=f"{label} 수정 object 목록이 비어 있습니다.")
+
+    base_objects = base_layout.get("objects")
+    if not isinstance(base_objects, list):
+        raise HTTPException(status_code=400, detail=f"{label} JSON에 objects 배열이 없습니다.")
+
+    object_by_identifier = {
+        item.get("identifier"): item
+        for item in base_objects
+        if isinstance(item, dict) and item.get("identifier")
+    }
+
+    for update in updates:
+        identifier = update.get("identifier")
+        if not identifier:
+            raise HTTPException(status_code=400, detail=f"{label} 수정 object에 identifier가 필요합니다.")
+
+        target = object_by_identifier.get(identifier)
+        if target is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} JSON에서 identifier={identifier} object를 찾을 수 없습니다.",
+            )
+
+        for field in PATCHABLE_OBJECT_FIELDS:
+            if field in update:
+                target[field] = update[field]
+
+    return base_layout
 
 
 # ── POST /rooms/{confirm_code}/versions ──────────────────────────────────────
@@ -77,12 +147,20 @@ async def create_user_edited_version(
             .scalar()
         )
         version_name = payload.version_name or f"Unity Edit {next_version_no}"
-        ios_layout = payload.ios_layout or denormalize_roomplan_from_unity(payload.layout)
+        unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
+        ios_layout = await _load_json_from_s3_uri(parent_version.s3_json_url, "iOS")
+
+        unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
+        if payload.ios_objects is not None:
+            ios_layout = _patch_objects(ios_layout, payload.ios_objects, "iOS")
+        else:
+            ios_layout = denormalize_roomplan_from_unity(unity_layout)
+
         edit_prefix = f"scans/{confirm_code}/user_edits/version_{next_version_no}"
         ios_key = f"{edit_prefix}/layout.roomplan.json"
         unity_key = f"{edit_prefix}/layout.unity.json"
         ios_s3_url = await upload_json(ios_key, ios_layout)
-        unity_s3_url = await upload_json(unity_key, payload.layout)
+        unity_s3_url = await upload_json(unity_key, unity_layout)
 
         version = Version(
             room_id=room.id,

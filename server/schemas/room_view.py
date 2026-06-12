@@ -76,8 +76,8 @@ class UserEditedVersionCreateRequest(BaseModel):
     parent_version_id: int
     version_name: str | None = None
     json_data: dict[str, Any] | None = None
-    layout: dict[str, Any]
-    ios_layout: dict[str, Any] | None = None
+    objects: list[dict[str, Any]]
+    ios_objects: list[dict[str, Any]] | None = None
 
 
 class UserEditedVersionCreateResponse(BaseModel):

@@ -30,12 +30,18 @@ BASE_VERSION_COUNT = 2
 
 
 def _unity_layout_uri(version: Version) -> str | None:
-    if not isinstance(version.json_data, dict):
-        return None
-    return (
-        version.json_data.get("unity_layout_json")
-        or version.json_data.get("unity_roomplan_optimized_json")
+    json_data = version.json_data if isinstance(version.json_data, dict) else {}
+    unity_uri = (
+        json_data.get("unity_layout_json")
+        or json_data.get("unity_roomplan_optimized_json")
     )
+    if unity_uri:
+        return unity_uri
+
+    if version.s3_json_url and version.s3_json_url.endswith("/room_data.json"):
+        return version.s3_json_url.removesuffix("/room_data.json") + "/room_data.unity.json"
+
+    return None
 
 
 def _to_version_detail_response(version: Version) -> VersionDetailResponse:
@@ -184,6 +190,7 @@ async def get_origin_assets(confirm_code: str):
 
     raw, _ = prefixes
     data_key = f"{raw}/room_data.json"
+    unity_data_key = f"{raw}/room_data.unity.json"
     full_key  = f"{raw}/Room.usdz"
     empty_key = f"{raw}/Room_empty.usdz"
     glb_key = f"{raw}/output.glb"
@@ -191,6 +198,7 @@ async def get_origin_assets(confirm_code: str):
     full_exists = await head_object(full_key) is not None
     empty_exists = await head_object(empty_key) is not None
     glb_exists = await head_object(glb_key) is not None
+    unity_data_exists = await head_object(unity_data_key) is not None
 
     if not full_exists and not empty_exists and not glb_exists:
         raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
@@ -202,6 +210,7 @@ async def get_origin_assets(confirm_code: str):
         usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
         glb_url=generate_presigned_url(glb_key) if glb_exists else None,
         data_url=generate_presigned_url(data_key),
+        unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
         model_urls=model_urls,
     )
 
