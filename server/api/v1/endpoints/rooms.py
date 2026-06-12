@@ -11,13 +11,13 @@ from server.core.s3 import generate_presigned_url, generate_presigned_url_for_ur
 from server.schemas.room_view import (
     FurnitureCatalogItemResponse,
     FurnitureCatalogResponse,
-    FurnitureItemView,
     RoomSummaryResponse,
+    RoomVersionItem,
+    RoomVersionsResponse,
     VersionDetailResponse,
 )
-from server.schemas.scan import ScanDetailResponse, VersionAssetsResponse, VersionSummary
+from server.schemas.scan import VersionAssetsResponse
 from shared.db import SessionLocal
-from shared.models.furniture_item import FurnitureItem
 from shared.models.furniture_model import FurnitureModel
 from shared.models.room import Room
 from shared.models.version import Version
@@ -26,47 +26,55 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── GET /rooms/versions/{version_id} ─────────────────────────────────────────
-# ※ /{confirm_code} 보다 먼저 등록해야 경로 충돌 없음
+def _unity_layout_uri(version: Version) -> str | None:
+    if not isinstance(version.json_data, dict):
+        return None
+    return (
+        version.json_data.get("unity_layout_json")
+        or version.json_data.get("unity_roomplan_optimized_json")
+    )
 
-@router.get("/versions/{version_id}", response_model=VersionDetailResponse)
-def get_version_detail(version_id: int):
+
+def _to_version_detail_response(version: Version) -> VersionDetailResponse:
+    return VersionDetailResponse(
+        version_id=version.id,
+        room_id=version.room_id,
+        confirm_code=version.room.confirm_code if version.room else "",
+        parent_version_id=version.parent_version_id,
+        version_type=version.version_type,
+        version_no=version.version_no,
+        version_name=version.version_name,
+        created_at=version.created_at,
+        room_shell_url=version.room.room_shell_usdc_url if version.room else None,
+        converted_glb_url=version.converted_glb_url,
+        layout_json_url=generate_presigned_url_for_uri(version.s3_json_url),
+        unity_layout_json_url=generate_presigned_url_for_uri(_unity_layout_uri(version)),
+        json_data=version.json_data,
+    )
+
+
+# ── GET /rooms/{confirm_code}/versions/{version_id} ──────────────────────────
+
+@router.get("/{confirm_code}/versions/{version_id}", response_model=VersionDetailResponse)
+def get_room_version_detail(confirm_code: str, version_id: int):
     db = SessionLocal()
     try:
         version = (
             db.query(Version)
+            .join(Room)
             .options(
                 joinedload(Version.room),
-                joinedload(Version.furniture_items).joinedload(FurnitureItem.model),
             )
-            .filter(Version.id == version_id)
+            .filter(
+                Version.id == version_id,
+                Room.confirm_code == confirm_code,
+            )
             .first()
         )
         if version is None:
-            raise HTTPException(status_code=404, detail="version not found")
+            raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
-        furniture_items = [
-            FurnitureItemView(
-                item_key=item.item_key,
-                model_key=item.model.model_key if item.model else None,
-                usdc_url=generate_presigned_url_for_uri(item.model.usdc_url) if item.model else None,
-                glb_url=generate_presigned_url_for_uri(item.model.glb_url) if item.model else None,
-                pos=[float(item.pos_x), float(item.pos_y), float(item.pos_z)],
-                rot=[float(item.rot_x), float(item.rot_y), float(item.rot_z)],
-                scale=[float(item.scale_x), float(item.scale_y), float(item.scale_z)],
-            )
-            for item in version.furniture_items
-        ]
-
-        return VersionDetailResponse(
-            version_id=version.id, room_id=version.room_id,
-            confirm_code=version.room.confirm_code if version.room else "",
-            version_type=version.version_type, version_no=version.version_no,
-            room_shell_url=version.room.room_shell_usdc_url if version.room else None,
-            converted_glb_url=version.converted_glb_url,
-            layout_json_url=version.s3_json_url, json_data=version.json_data,
-            furniture_items=furniture_items,
-        )
+        return _to_version_detail_response(version)
     finally:
         db.close()
 
@@ -117,33 +125,41 @@ def get_room_by_confirm_code(confirm_code: str):
 
 # ── GET /rooms/{confirm_code}/versions ────────────────────────────────────────
 
-@router.get("/{confirm_code}/versions", response_model=ScanDetailResponse)
-async def get_room_versions(confirm_code: str):
-    prefixes = await _resolve_prefixes(confirm_code)
-    if prefixes is None:
-        raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
+@router.get("/{confirm_code}/versions", response_model=RoomVersionsResponse)
+def get_room_versions(confirm_code: str):
+    db = SessionLocal()
+    try:
+        room = (
+            db.query(Room)
+            .options(joinedload(Room.versions))
+            .filter(Room.confirm_code == confirm_code)
+            .first()
+        )
+        if room is None:
+            raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
 
-    raw, gen = prefixes
-    candidates = [
-        (f"{raw}/room_data.json",                    "origin"),
-        (f"{gen}/room_data.roomplan_optimized.json", "optimized"),
-    ]
+        versions = sorted(room.versions, key=lambda version: version.version_no)
+        if not versions:
+            raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
-    versions: list[VersionSummary] = []
-    first_created_at = None
-    for key, version_type in candidates:
-        meta = await head_object(key)
-        if meta is None:
-            continue
-        created_at = meta.get("LastModified")
-        if first_created_at is None:
-            first_created_at = created_at
-        versions.append(VersionSummary(version_type=version_type, created_at=created_at))
-
-    if not versions:
-        raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
-
-    return ScanDetailResponse(confirm_code=confirm_code, created_at=first_created_at, versions=versions)
+        latest_version_no = max(version.version_no for version in versions)
+        return RoomVersionsResponse(
+            room_id=room.id,
+            confirm_code=room.confirm_code,
+            versions=[
+                RoomVersionItem(
+                    version_id=version.id,
+                    version_type=version.version_type,
+                    version_no=version.version_no,
+                    version_name=version.version_name,
+                    created_at=version.created_at,
+                    is_latest=version.version_no == latest_version_no,
+                )
+                for version in versions
+            ],
+        )
+    finally:
+        db.close()
 
 
 # ── GET /rooms/{confirm_code}/origin  (다운로드) ──────────────────────────────
