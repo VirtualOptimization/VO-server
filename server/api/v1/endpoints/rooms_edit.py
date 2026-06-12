@@ -6,7 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import func
 
-from server.core.s3 import get_json, parse_s3_uri, upload_json
+from server.core.s3 import delete_objects, get_json, list_keys, parse_s3_uri, upload_json
 from server.schemas.room_view import (
     UserEditedVersionCreateRequest,
     UserEditedVersionCreateResponse,
@@ -90,6 +90,22 @@ def _patch_objects(base_layout: dict, updates: list[dict], label: str) -> dict:
                 target[field] = update[field]
 
     return base_layout
+
+
+def _version_s3_prefix(version: Version) -> str | None:
+    parsed = parse_s3_uri(version.s3_json_url)
+    if parsed is None:
+        return None
+
+    _, key = parsed
+    marker = "/user_edits/"
+    if marker not in key:
+        return None
+
+    prefix, filename = key.rsplit("/", 1)
+    if not filename:
+        return None
+    return f"{prefix}/"
 
 
 # ── POST /rooms/{confirm_code}/versions ──────────────────────────────────────
@@ -230,6 +246,10 @@ def delete_user_version(confirm_code: str, version_id: int):
                 status_code=403,
                 detail="origin 및 optimized 버전은 삭제할 수 없습니다. USER_EDITED 버전만 삭제 가능합니다.",
             )
+
+        s3_prefix = _version_s3_prefix(version)
+        if s3_prefix:
+            delete_objects(list_keys(s3_prefix))
 
         db.delete(version)
         db.commit()
