@@ -6,7 +6,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from sqlalchemy.orm import joinedload
 
-from server.api.v1.endpoints.rooms_common import _list_model_keys, _resolve_prefixes, _raw_prefix
+from server.api.v1.endpoints.rooms_common import _get_catalog_model_urls, _resolve_prefixes
 from server.core.s3 import generate_presigned_url, generate_presigned_url_for_uri, head_object
 from server.schemas.room_view import (
     FurnitureCatalogItemResponse,
@@ -166,16 +166,13 @@ async def get_origin_assets(confirm_code: str):
 
     if not full_exists and not empty_exists and not glb_exists:
         raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
-    usdz_key = empty_key if empty_exists else full_key if full_exists else None
 
-    model_keys = await _list_model_keys(raw)
-    model_urls = {key.split("/")[-1]: generate_presigned_url(key) for key in model_keys}
-
-    glb_url = generate_presigned_url(glb_key) if glb_exists else None
+    model_urls = await _get_catalog_model_urls(raw)
 
     return VersionAssetsResponse(
-        usdz_url=generate_presigned_url(usdz_key) if usdz_key else None,
-        glb_url=glb_url,
+        usdz_url=generate_presigned_url(full_key) if full_exists else None,
+        usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
+        glb_url=generate_presigned_url(glb_key) if glb_exists else None,
         data_url=generate_presigned_url(data_key),
         model_urls=model_urls,
     )
@@ -207,16 +204,13 @@ async def get_optimized_assets(confirm_code: str):
 
     if not full_exists and not empty_exists and not glb_exists:
         raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
-    usdz_key = empty_key if empty_exists else full_key if full_exists else None
 
-    model_keys = await _list_model_keys(raw)
-    model_urls = {key.split("/")[-1]: generate_presigned_url(key) for key in model_keys}
-
-    glb_url = generate_presigned_url(glb_key) if glb_exists else None
+    model_urls = await _get_catalog_model_urls(raw)
 
     return VersionAssetsResponse(
-        usdz_url=generate_presigned_url(usdz_key) if usdz_key else None,
-        glb_url=glb_url,
+        usdz_url=generate_presigned_url(full_key) if full_exists else None,
+        usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
+        glb_url=generate_presigned_url(glb_key) if glb_exists else None,
         data_url=generate_presigned_url(data_key),
         unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
         model_urls=model_urls,

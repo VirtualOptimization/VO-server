@@ -160,13 +160,6 @@ async def start_scan_upload(request: ScanUploadStartRequest):
             presigned_url=await generate_presigned_put_url(s3_key, USDZ_CONTENT_TYPE),
             content_type=USDZ_CONTENT_TYPE,
         ))
-    for filename in request.model_filenames:
-        s3_key = f"{raw_prefix}/models/{filename}"
-        targets.append(PresignedUploadTarget(
-            logical_name=f"model_{filename}", s3_key=s3_key,
-            presigned_url=await generate_presigned_put_url(s3_key, MODEL_CONTENT_TYPE),
-            content_type=MODEL_CONTENT_TYPE,
-        ))
 
     return ScanUploadStartResponse(
         message="Upload session successfully initialized.",
