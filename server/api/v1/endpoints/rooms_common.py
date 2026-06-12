@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
-from server.core.s3 import head_object, list_keys
+from server.core.s3 import generate_presigned_url, get_json, head_object
+
+logger = logging.getLogger(__name__)
 
 RAW_ROOT_PREFIX = "scans"
+CATALOG_PREFIX = "assets/roomplan-catalog/v1/usdc"
 MODEL_CONTENT_TYPE = "application/octet-stream"
 USDZ_CONTENT_TYPE = "model/vnd.usdz+zip"
 JSON_CONTENT_TYPE = "application/json"
@@ -20,10 +24,27 @@ def _generated_prefix(confirm_code: str) -> str:
     return f"{RAW_ROOT_PREFIX}/{confirm_code}/optimized"
 
 
-async def _list_model_keys(raw_prefix: str) -> list[str]:
-    """모델 파일 목록 조회"""
-    keys = await asyncio.to_thread(list_keys, f"{raw_prefix}/models/")
-    return [k for k in keys if not k.endswith("/")]
+def _catalog_model_key(category: str, model_filename: str) -> str:
+    """modelFileName + category → 카탈로그 S3 key"""
+    base_name = model_filename.removesuffix(".rooms.usdc")
+    return f"{CATALOG_PREFIX}/{category.capitalize()}/{base_name}/{base_name}.rooms.usdc"
+
+
+async def _get_catalog_model_urls(raw_prefix: str) -> dict[str, str]:
+    """room_data.json을 읽어 카탈로그 presigned URL 맵 반환"""
+    try:
+        data = await get_json(f"{raw_prefix}/room_data.json")
+        model_urls: dict[str, str] = {}
+        for obj in data.get("objects", []):
+            model_filename = obj.get("modelFileName")
+            category = obj.get("category", "")
+            if model_filename and category:
+                key = _catalog_model_key(category, model_filename)
+                model_urls[model_filename] = generate_presigned_url(key)
+        return model_urls
+    except Exception as e:
+        logger.warning(f"카탈로그 모델 URL 조회 실패: {e}")
+        return {}
 
 
 async def _resolve_prefixes(confirm_code: str) -> tuple[str, str] | None:
