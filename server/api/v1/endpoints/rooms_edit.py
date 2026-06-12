@@ -19,6 +19,8 @@ from shared.models.version import Version
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+MAX_VERSION_COUNT = 5
+
 
 # ── POST /rooms/{confirm_code}/versions ──────────────────────────────────────
 # Unity에서 수정한 가구 배치를 확인 코드 아래 새 USER_EDITED 버전으로 저장
@@ -34,7 +36,12 @@ async def create_user_edited_version(
 ):
     db = SessionLocal()
     try:
-        room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
+        room = (
+            db.query(Room)
+            .filter(Room.confirm_code == confirm_code)
+            .with_for_update()
+            .first()
+        )
         if not room:
             raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
 
@@ -48,6 +55,21 @@ async def create_user_edited_version(
         )
         if not parent_version:
             raise HTTPException(status_code=404, detail="부모 버전을 찾을 수 없습니다.")
+
+        current_version_count = (
+            db.query(func.count(Version.id))
+            .filter(Version.room_id == room.id)
+            .scalar()
+        )
+        if current_version_count >= MAX_VERSION_COUNT:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "저장 가능한 버전 개수를 초과했습니다. USER_EDITED 버전을 삭제한 뒤 다시 저장해주세요.",
+                    "current_version_count": current_version_count,
+                    "max_version_count": MAX_VERSION_COUNT,
+                },
+            )
 
         next_version_no = (
             db.query(func.coalesce(func.max(Version.version_no), 0) + 1)

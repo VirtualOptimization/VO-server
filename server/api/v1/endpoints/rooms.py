@@ -25,6 +25,9 @@ from shared.models.version import Version
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+MAX_VERSION_COUNT = 5
+BASE_VERSION_COUNT = 2
+
 
 def _unity_layout_uri(version: Version) -> str | None:
     if not isinstance(version.json_data, dict):
@@ -143,9 +146,17 @@ def get_room_versions(confirm_code: str):
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
         latest_version_no = max(version.version_no for version in versions)
+        current_version_count = len(versions)
         return RoomVersionsResponse(
             room_id=room.id,
             confirm_code=room.confirm_code,
+            current_version_count=current_version_count,
+            max_version_count=MAX_VERSION_COUNT,
+            can_create_user_version=current_version_count < MAX_VERSION_COUNT,
+            remaining_user_edit_slots=max(
+                0,
+                MAX_VERSION_COUNT - max(BASE_VERSION_COUNT, current_version_count),
+            ),
             versions=[
                 RoomVersionItem(
                     version_id=version.id,
@@ -154,6 +165,7 @@ def get_room_versions(confirm_code: str):
                     version_name=version.version_name,
                     created_at=version.created_at,
                     is_latest=version.version_no == latest_version_no,
+                    can_delete=version.version_type == "USER_EDITED",
                 )
                 for version in versions
             ],
