@@ -1,17 +1,404 @@
-"""공간 편집 — USER_EDITED 버전 삭제 (origin·optimized는 삭제 불가)"""
+"""공간 편집 — USER_EDITED 버전 생성/삭제"""
 from __future__ import annotations
 
 import logging
+import math
 
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import func
 
+from server.core.s3 import delete_objects, get_json, list_keys, parse_s3_uri, upload_json
+from server.schemas.room_view import (
+    UserEditedVersionCreateRequest,
+    UserEditedVersionCreateResponse,
+)
+from server.services.transform.unity_roomplan import denormalize_roomplan_from_unity, normalize_roomplan_for_ios_view
 from shared.db import SessionLocal
-from shared.models.furniture_item import FurnitureItem
 from shared.models.room import Room
 from shared.models.version import Version
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+MAX_VERSION_COUNT = 5
+PATCHABLE_OBJECT_FIELDS = {
+    "center",
+    "rotation",
+    "transform",
+    "frontVector",
+    "backVector",
+    "leftVector",
+    "rightVector",
+    "upVector",
+}
+
+
+def _round6(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
+    yaw = math.atan2(float(transform[0][2]), float(transform[0][0]))
+    return [0.0, _round6(yaw), 0.0]
+
+
+def _yaw_from_rotation(rotation: list) -> float:
+    if len(rotation) >= 3:
+        return float(rotation[1])
+    if len(rotation) >= 1:
+        return float(rotation[0])
+    raise HTTPException(status_code=400, detail="rotation은 [x, y, z] 또는 [yaw] 형식이어야 합니다.")
+
+
+def _apply_yaw_to_transform(item: dict, yaw: float) -> None:
+    transform = item.get("transform")
+    if not isinstance(transform, list) or len(transform) < 4:
+        center = item.get("center") or [0.0, 0.0, 0.0]
+        transform = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [_round6(center[0]), _round6(center[1]), _round6(center[2]), 1.0],
+        ]
+
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    transform[0][0:3] = [_round6(c), 0.0, _round6(s)]
+    transform[1][0:3] = [0.0, 1.0, 0.0]
+    transform[2][0:3] = [_round6(-s), 0.0, _round6(c)]
+    item["transform"] = transform
+
+
+def _center_y(item: dict) -> float:
+    center = item.get("center")
+    if isinstance(center, list) and len(center) >= 2:
+        center_y = float(center[1])
+        obb_min_y = _obb_min_y(item)
+        if obb_min_y is not None and obb_min_y < -0.01:
+            return center_y - obb_min_y
+        return center_y
+
+    transform = item.get("transform")
+    if isinstance(transform, list) and len(transform) >= 4 and len(transform[3]) >= 2:
+        center_y = float(transform[3][1])
+        obb_min_y = _obb_min_y(item)
+        if obb_min_y is not None and obb_min_y < -0.01:
+            return center_y - obb_min_y
+        return center_y
+
+    return 0.0
+
+
+def _obb_min_y(item: dict) -> float | None:
+    vertices = item.get("obbVertices")
+    if not isinstance(vertices, list):
+        return None
+
+    y_values = [
+        float(vertex[1])
+        for vertex in vertices
+        if isinstance(vertex, list) and len(vertex) >= 2 and isinstance(vertex[1], (int, float))
+    ]
+    if not y_values:
+        return None
+
+    return min(y_values)
+
+
+def _vec3(row: list) -> list[float]:
+    return [float(row[0]), float(row[1]), float(row[2])]
+
+
+def _neg(vector: list[float]) -> list[float]:
+    return [_round6(-value) for value in vector]
+
+
+def _rounded(vector: list[float]) -> list[float]:
+    return [_round6(value) for value in vector]
+
+
+def _sync_vectors_from_transform(item: dict) -> None:
+    transform = item.get("transform")
+    if not isinstance(transform, list) or len(transform) < 4:
+        return
+    if any(not isinstance(transform[row], list) or len(transform[row]) < 3 for row in range(3)):
+        return
+
+    right = _vec3(transform[0])
+    up = _vec3(transform[1])
+    back = _vec3(transform[2])
+    item["rightVector"] = _rounded(right)
+    item["leftVector"] = _neg(right)
+    item["upVector"] = _rounded(up)
+    item["backVector"] = _rounded(back)
+    item["frontVector"] = _neg(back)
+    item["rotation"] = _rotation_from_transform(transform)
+
+
+def _sync_obb_vertices(item: dict) -> None:
+    center = item.get("center")
+    dimensions = item.get("dimensions")
+    transform = item.get("transform")
+    if not (
+        isinstance(center, list) and len(center) >= 3
+        and isinstance(dimensions, list) and len(dimensions) >= 3
+        and isinstance(transform, list) and len(transform) >= 3
+    ):
+        return
+    if any(not isinstance(transform[row], list) or len(transform[row]) < 3 for row in range(3)):
+        return
+
+    hx, hy, hz = float(dimensions[0]) / 2.0, float(dimensions[1]) / 2.0, float(dimensions[2]) / 2.0
+    center_v = _vec3(center)
+    right = _vec3(transform[0])
+    up = _vec3(transform[1])
+    back = _vec3(transform[2])
+
+    vertices = []
+    for sx in (1.0, -1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (1.0, -1.0):
+                point = [
+                    center_v[axis] + right[axis] * hx * sx + up[axis] * hy * sy + back[axis] * hz * sz
+                    for axis in range(3)
+                ]
+                vertices.append(_rounded(point))
+    item["obbVertices"] = vertices
+
+
+def _apply_pose_update(target: dict, update: dict) -> None:
+    preserved_y = _center_y(target)
+    preserved_rotation = target.get("rotation")
+    preserved_yaw = (
+        _yaw_from_rotation(preserved_rotation)
+        if isinstance(preserved_rotation, list) and preserved_rotation
+        else None
+    )
+
+    if "center" in update:
+        center = update["center"]
+        if not isinstance(center, list) or len(center) < 3:
+            raise HTTPException(status_code=400, detail="center는 [x, y, z] 형식이어야 합니다.")
+        target["center"] = [_round6(center[0]), _round6(preserved_y), _round6(center[2])]
+
+    if "transform" in update:
+        transform = update["transform"]
+        if not isinstance(transform, list) or len(transform) < 4 or len(transform[3]) < 3:
+            raise HTTPException(status_code=400, detail="transform은 4x4 행렬 형식이어야 합니다.")
+        if "center" not in update:
+            target["center"] = [
+                _round6(transform[3][0]),
+                _round6(preserved_y),
+                _round6(transform[3][2]),
+            ]
+
+    if "rotation" in update:
+        rotation = update["rotation"]
+        if not isinstance(rotation, list):
+            raise HTTPException(status_code=400, detail="rotation은 배열 형식이어야 합니다.")
+        yaw = _yaw_from_rotation(rotation)
+        target["rotation"] = [0.0, _round6(yaw), 0.0]
+        _apply_yaw_to_transform(target, yaw)
+
+    if "transform" in update or "center" in update or "rotation" in update:
+        transform = target.get("transform")
+        if isinstance(transform, list) and len(transform) >= 4:
+            transform[3][0:3] = target["center"]
+        if "rotation" not in update and preserved_yaw is not None:
+            target["rotation"] = [0.0, _round6(preserved_yaw), 0.0]
+            _apply_yaw_to_transform(target, preserved_yaw)
+        _sync_vectors_from_transform(target)
+        _sync_obb_vertices(target)
+
+
+def _unity_layout_uri(version: Version) -> str | None:
+    if not isinstance(version.json_data, dict):
+        json_data = {}
+    else:
+        json_data = version.json_data
+
+    unity_uri = (
+        json_data.get("unity_layout_json")
+        or json_data.get("unity_roomplan_optimized_json")
+    )
+    if unity_uri:
+        return unity_uri
+
+    if version.s3_json_url and version.s3_json_url.endswith("/room_data.json"):
+        return version.s3_json_url.removesuffix("/room_data.json") + "/room_data.unity.json"
+
+    return None
+
+
+async def _load_json_from_s3_uri(uri: str | None, label: str) -> dict:
+    parsed = parse_s3_uri(uri)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail=f"{label} JSON 경로가 없습니다.")
+    _, key = parsed
+    return await get_json(key)
+
+
+def _patch_objects(base_layout: dict, updates: list[dict], label: str) -> dict:
+    if not updates:
+        raise HTTPException(status_code=400, detail=f"{label} 수정 object 목록이 비어 있습니다.")
+
+    base_objects = base_layout.get("objects")
+    if not isinstance(base_objects, list):
+        raise HTTPException(status_code=400, detail=f"{label} JSON에 objects 배열이 없습니다.")
+
+    object_by_identifier = {
+        item.get("identifier"): item
+        for item in base_objects
+        if isinstance(item, dict) and item.get("identifier")
+    }
+
+    for update in updates:
+        identifier = update.get("identifier")
+        if not identifier:
+            raise HTTPException(status_code=400, detail=f"{label} 수정 object에 identifier가 필요합니다.")
+
+        target = object_by_identifier.get(identifier)
+        if target is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label} JSON에서 identifier={identifier} object를 찾을 수 없습니다.",
+            )
+
+        _apply_pose_update(target, update)
+
+    return base_layout
+
+
+def _version_s3_prefix(version: Version) -> str | None:
+    parsed = parse_s3_uri(version.s3_json_url)
+    if parsed is None:
+        return None
+
+    _, key = parsed
+    marker = "/user_edits/"
+    if marker not in key:
+        return None
+
+    prefix, filename = key.rsplit("/", 1)
+    if not filename:
+        return None
+    return f"{prefix}/"
+
+
+# ── POST /rooms/{confirm_code}/versions ──────────────────────────────────────
+# Unity에서 수정한 가구 배치를 확인 코드 아래 새 USER_EDITED 버전으로 저장
+
+@router.post(
+    "/{confirm_code}/versions",
+    response_model=UserEditedVersionCreateResponse,
+    status_code=201,
+)
+async def create_user_edited_version(
+    confirm_code: str,
+    payload: UserEditedVersionCreateRequest,
+):
+    db = SessionLocal()
+    try:
+        room = (
+            db.query(Room)
+            .filter(Room.confirm_code == confirm_code)
+            .with_for_update()
+            .first()
+        )
+        if not room:
+            raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
+
+        parent_version = (
+            db.query(Version)
+            .filter(
+                Version.id == payload.parent_version_id,
+                Version.room_id == room.id,
+            )
+            .first()
+        )
+        if not parent_version:
+            raise HTTPException(status_code=404, detail="부모 버전을 찾을 수 없습니다.")
+
+        current_version_count = (
+            db.query(func.count(Version.id))
+            .filter(Version.room_id == room.id)
+            .scalar()
+        )
+        if current_version_count >= MAX_VERSION_COUNT:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "저장 가능한 버전 개수를 초과했습니다. USER_EDITED 버전을 삭제한 뒤 다시 저장해주세요.",
+                    "current_version_count": current_version_count,
+                    "max_version_count": MAX_VERSION_COUNT,
+                },
+            )
+
+        next_version_no = (
+            db.query(func.coalesce(func.max(Version.version_no), 0) + 1)
+            .filter(Version.room_id == room.id)
+            .scalar()
+        )
+        version_name = payload.version_name or f"Unity Edit {next_version_no}"
+        unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
+        ios_layout = await _load_json_from_s3_uri(parent_version.s3_json_url, "iOS")
+
+        unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
+        if payload.ios_objects is not None:
+            ios_layout = normalize_roomplan_for_ios_view(
+                _patch_objects(ios_layout, payload.ios_objects, "iOS")
+            )
+        else:
+            ios_layout = denormalize_roomplan_from_unity(unity_layout)
+            ios_layout = normalize_roomplan_for_ios_view(ios_layout)
+
+        edit_prefix = f"scans/{confirm_code}/user_edits/version_{next_version_no}"
+        ios_key = f"{edit_prefix}/layout.roomplan.json"
+        unity_key = f"{edit_prefix}/layout.unity.json"
+        ios_s3_url = await upload_json(ios_key, ios_layout)
+        unity_s3_url = await upload_json(unity_key, unity_layout)
+
+        version = Version(
+            room_id=room.id,
+            parent_version_id=parent_version.id,
+            version_type="USER_EDITED",
+            version_no=next_version_no,
+            version_name=version_name,
+            s3_json_url=ios_s3_url,
+            converted_glb_url=parent_version.converted_glb_url,
+            json_data={
+                **(payload.json_data or {}),
+                "source": "unity_edit",
+                "parent_version_id": parent_version.id,
+                "layout_json": ios_s3_url,
+                "unity_layout_json": unity_s3_url,
+            },
+        )
+        db.add(version)
+
+        db.commit()
+        db.refresh(version)
+
+        return UserEditedVersionCreateResponse(
+            version_id=version.id,
+            room_id=room.id,
+            confirm_code=room.confirm_code,
+            parent_version_id=parent_version.id,
+            version_type=version.version_type,
+            version_no=version.version_no,
+            version_name=version.version_name,
+            created_at=version.created_at,
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to create USER_EDITED version for {confirm_code}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 
 # ── DELETE /rooms/{confirm_code}/versions/{version_id} ────────────────────────
@@ -40,7 +427,10 @@ def delete_user_version(confirm_code: str, version_id: int):
                 detail="origin 및 optimized 버전은 삭제할 수 없습니다. USER_EDITED 버전만 삭제 가능합니다.",
             )
 
-        db.query(FurnitureItem).filter(FurnitureItem.version_id == version.id).delete()
+        s3_prefix = _version_s3_prefix(version)
+        if s3_prefix:
+            delete_objects(list_keys(s3_prefix))
+
         db.delete(version)
         db.commit()
 

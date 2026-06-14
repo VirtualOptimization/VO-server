@@ -20,6 +20,11 @@ def _rotate_xz(x: float, z: float, angle: float) -> tuple[float, float]:
     return (x * c - z * s), (x * s + z * c)
 
 
+def _inverse_rotate_xz(rx: float, rz: float, angle: float) -> tuple[float, float]:
+    c, s = math.cos(angle), math.sin(angle)
+    return (rx * c - rz * s), (rx * s + rz * c)
+
+
 def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, float, float, float]:
     floors = room_data.get("floors", [])
     if not floors:
@@ -72,6 +77,11 @@ def _attach_model_keys(room_data: dict[str, Any]) -> None:
             obj["model_key"] = model_key
 
 
+def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
+    yaw = math.atan2(float(transform[0][2]), float(transform[0][0]))
+    return [0.0, _round6(yaw), 0.0]
+
+
 def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
     """Return a RoomPlan-like payload aligned to a Unity-friendly +X/+Z floor frame."""
     floor_theta, floor_y, min_x, min_z = _floor_normalization_context(room_data)
@@ -91,6 +101,7 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
                         item["transform"][row][1] = vector[1]
                         item["transform"][row][2] = vector[2]
                 item["transform"][3][0:3] = item["center"]
+                item["rotation"] = _rotation_from_transform(item["transform"])
             if item.get("obbVertices"):
                 item["obbVertices"] = [
                     _normalize_point(vertex, floor_theta, floor_y, min_x, min_z)
@@ -107,3 +118,66 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
         "minZ": _round6(min_z),
     }
     return normalized
+
+
+def normalize_roomplan_for_ios_view(room_data: dict[str, Any]) -> dict[str, Any]:
+    """Return an iOS RoomPlan-frame payload without Unity floor normalization."""
+    payload = json.loads(json.dumps(room_data))
+    if isinstance(payload.get("unityNormalization"), dict):
+        return denormalize_roomplan_from_unity(payload)
+
+    payload.pop("unityNormalization", None)
+    payload["coordinateSystem"] = payload.get("coordinateSystem") or "RoomPlan"
+    return payload
+
+
+def _denormalize_point(point: list[float], floor_theta: float, floor_y: float, min_x: float, min_z: float) -> list[float]:
+    rx = float(point[0]) + min_x
+    rz = float(point[2]) + min_z
+    x, z = _inverse_rotate_xz(rx, rz, floor_theta)
+    return [_round6(x), _round6(float(point[1]) + floor_y), _round6(z)]
+
+
+def _denormalize_vector(vector: list[float], floor_theta: float) -> list[float]:
+    x, z = _inverse_rotate_xz(float(vector[0]), float(vector[2]), floor_theta)
+    return [_round6(x), _round6(float(vector[1])), _round6(z)]
+
+
+def denormalize_roomplan_from_unity(room_data: dict[str, Any]) -> dict[str, Any]:
+    """Return a Unity-normalized RoomPlan payload back in the original RoomPlan frame."""
+    context = room_data.get("unityNormalization")
+    if not isinstance(context, dict):
+        raise ValueError("Unity-normalized payload must include unityNormalization.")
+
+    floor_theta = float(context["floorThetaRadians"])
+    floor_y = float(context["floorY"])
+    min_x = float(context["minX"])
+    min_z = float(context["minZ"])
+
+    denormalized = json.loads(json.dumps(room_data))
+    denormalized["coordinateSystem"] = "RoomPlan"
+    denormalized.pop("unityNormalization", None)
+
+    for collection_name in ("floors", "walls", "doors", "windows", "objects"):
+        for item in denormalized.get(collection_name, []):
+            if item.get("center"):
+                item["center"] = _denormalize_point(item["center"], floor_theta, floor_y, min_x, min_z)
+            if item.get("transform") and len(item["transform"]) >= 4:
+                for row in range(3):
+                    if item["transform"][row] and len(item["transform"][row]) >= 3:
+                        vector = _denormalize_vector(item["transform"][row], floor_theta)
+                        item["transform"][row][0] = vector[0]
+                        item["transform"][row][1] = vector[1]
+                        item["transform"][row][2] = vector[2]
+                item["transform"][3][0:3] = item["center"]
+                item["rotation"] = _rotation_from_transform(item["transform"])
+            if item.get("obbVertices"):
+                item["obbVertices"] = [
+                    _denormalize_point(vertex, floor_theta, floor_y, min_x, min_z)
+                    for vertex in item["obbVertices"]
+                ]
+            for key in ("frontVector", "backVector", "leftVector", "rightVector", "upVector"):
+                if item.get(key):
+                    item[key] = _denormalize_vector(item[key], floor_theta)
+
+    return denormalized

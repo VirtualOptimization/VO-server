@@ -19,7 +19,7 @@ from server.api.v1.endpoints.rooms_common import (
     _raw_prefix,
 )
 from server.core.config import settings
-from server.core.s3 import build_s3_uri, generate_presigned_put_url, object_exists
+from server.core.s3 import build_s3_uri, generate_presigned_put_url, get_json, object_exists, upload_json
 from server.schemas.scan import (
     PresignedUploadTarget,
     ScanUploadCompleteRequest,
@@ -27,6 +27,7 @@ from server.schemas.scan import (
     ScanUploadStartRequest,
     ScanUploadStartResponse,
 )
+from server.services.transform.unity_roomplan import normalize_roomplan_for_unity
 from shared.db import SessionLocal
 from shared.models.room import Room
 
@@ -101,6 +102,7 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
         "generated_prefix": generated_prefix,
         "inputs": {
             "room_data_json": f"{raw_prefix}/room_data.json",
+            "unity_room_data_json": f"{raw_prefix}/room_data.unity.json",
             "room_usdz": next((k for k in uploaded_keys if k.endswith("/Room.usdz")), None),
             "room_empty_usdz": next((k for k in uploaded_keys if k.endswith("/Room_empty.usdz")), None),
             "models": sorted(k for k in uploaded_keys if "/models/" in k),
@@ -113,6 +115,15 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
             "glb": f"{raw_prefix}/output.glb",
         },
     }
+
+
+async def _create_origin_unity_json(raw_prefix: str) -> str:
+    room_data_key = f"{raw_prefix}/room_data.json"
+    unity_room_data_key = f"{raw_prefix}/room_data.unity.json"
+    room_data = await get_json(room_data_key)
+    unity_room_data = normalize_roomplan_for_unity(room_data)
+    await upload_json(unity_room_data_key, unity_room_data)
+    return unity_room_data_key
 
 
 async def _start_pipeline_execution(pipeline_input: dict[str, Any]) -> str | None:
@@ -160,13 +171,6 @@ async def start_scan_upload(request: ScanUploadStartRequest):
             presigned_url=await generate_presigned_put_url(s3_key, USDZ_CONTENT_TYPE),
             content_type=USDZ_CONTENT_TYPE,
         ))
-    for filename in request.model_filenames:
-        s3_key = f"{raw_prefix}/models/{filename}"
-        targets.append(PresignedUploadTarget(
-            logical_name=f"model_{filename}", s3_key=s3_key,
-            presigned_url=await generate_presigned_put_url(s3_key, MODEL_CONTENT_TYPE),
-            content_type=MODEL_CONTENT_TYPE,
-        ))
 
     return ScanUploadStartResponse(
         message="Upload session successfully initialized.",
@@ -198,6 +202,8 @@ async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteReq
     if missing_keys:
         raise HTTPException(status_code=409, detail={"message": "아직 업로드되지 않은 파일이 있습니다.", "missing_keys": missing_keys})
 
+    unity_room_data_key = await _create_origin_unity_json(raw_prefix)
+
     # 이미 파이프라인이 실행 중이면 중복 실행 방지
     db_check = SessionLocal()
     try:
@@ -213,7 +219,8 @@ async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteReq
         db_check.close()
 
     room_id = await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, False)
-    pipeline_input = _build_pipeline_input(room_id, confirm_code, payload.uploaded_keys)
+    processed_keys = [*payload.uploaded_keys, unity_room_data_key]
+    pipeline_input = _build_pipeline_input(room_id, confirm_code, processed_keys)
     execution_arn = await _start_pipeline_execution(pipeline_input)
     pipeline_started = execution_arn is not None
 
@@ -223,6 +230,6 @@ async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteReq
     return ScanUploadCompleteResponse(
         message="scan upload completed", room_id=room_id, confirm_code=confirm_code,
         raw_prefix=raw_prefix, generated_prefix=_generated_prefix(confirm_code),
-        uploaded_keys=payload.uploaded_keys, pipeline_started=pipeline_started,
+        uploaded_keys=processed_keys, pipeline_started=pipeline_started,
         execution_arn=execution_arn, pipeline_input=pipeline_input,
     )

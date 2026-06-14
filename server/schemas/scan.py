@@ -68,7 +68,6 @@ class PresignedUploadTarget(BaseModel):
 
 
 class ScanUploadStartRequest(BaseModel):
-    model_filenames: list[str] = Field(default_factory=list)
     include_room_usdz: bool = True
     include_room_empty_usdz: bool = False
 
@@ -113,8 +112,9 @@ class ScanDetailResponse(BaseModel):
 
 
 class VersionAssetsResponse(BaseModel):
-    usdz_url: str | None = None # Room_empty.usdz 또는 Room.usdz — JSON 기반 GLB만 있으면 없음
-    glb_url: str | None = None # 변환된 3D 쉘 (output.glb)
-    data_url: str              # 가구 위치 JSON (origin or optimized)
+    usdz_url: str | None = None       # Room.usdz
+    usdz_empty_url: str | None = None # Room_empty.usdz
+    glb_url: str | None = None        # 변환된 3D 쉘 (output.glb)
+    data_url: str                     # 가구 위치 JSON (origin or optimized)
     unity_data_url: str | None = None # Unity 정규화 좌표계 가구 위치 JSON
-    model_urls: dict[str, str] # { "chair_01.usdc": "presigned_url", ... }
+    model_urls: dict[str, str]        # { "chair_01.usdc": "presigned_url", ... }
