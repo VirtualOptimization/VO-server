@@ -15,7 +15,7 @@ def _round6(value: float) -> float:
 
 def _rotate_xz(x: float, z: float, angle: float) -> tuple[float, float]:
     c, s = math.cos(-angle), math.sin(-angle)
-    return (x * c - z * s), -(x * s + z * c)
+    return (x * c - z * s), (x * s + z * c)
 
 
 def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, float, float, float]:
@@ -34,7 +34,7 @@ def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, floa
         dimensions = floor_item["dimensions"]
         transform = floor_item["transform"]
         axis_x = np.array([transform[0][0], transform[0][2]], dtype=float)
-        axis_z = np.array([transform[1][0], transform[1][2]], dtype=float)
+        axis_z = np.array([transform[2][0], transform[2][2]], dtype=float)
         center_xz = np.array([center[0], center[2]], dtype=float)
         for sx in (-1.0, 1.0):
             for sz in (-1.0, 1.0):

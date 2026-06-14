@@ -12,7 +12,7 @@ from .mappers import build_optimizer_metadata, infer_catalog_model_key, map_room
 
 def _rotate_point(x: float, z: float, angle: float) -> tuple[float, float]:
     c, s = np.cos(-angle), np.sin(-angle)
-    return (x * c - z * s), -(x * s + z * c)
+    return (x * c - z * s), (x * s + z * c)
 
 
 def _rotate_vector(x: float, z: float, angle: float) -> tuple[float, float]:

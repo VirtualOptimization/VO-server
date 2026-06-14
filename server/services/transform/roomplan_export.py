@@ -16,12 +16,12 @@ def _round6(value: float) -> float:
 
 def _rotate_point(x: float, z: float, angle: float) -> tuple[float, float]:
     c, s = np.cos(-angle), np.sin(-angle)
-    return (x * c - z * s), -(x * s + z * c)
+    return (x * c - z * s), (x * s + z * c)
 
 
 def _inverse_rotate_point(rx: float, rz: float, angle: float) -> tuple[float, float]:
-    # The transform used in normalization is involutory, so the same matrix inverts it.
-    return _rotate_point(rx, rz, angle)
+    c, s = np.cos(angle), np.sin(angle)
+    return (rx * c - rz * s), (rx * s + rz * c)
 
 
 def _extract_floor_context(src: dict[str, Any]) -> tuple[float, float, float, float]:

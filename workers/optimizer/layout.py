@@ -115,6 +115,32 @@ class CanonicalLayoutOptimizer:
                 min_overlap = min(min_overlap, overlap)
         return min_overlap
 
+    @staticmethod
+    def _sat_mtv(corners1: np.ndarray, corners2: np.ndarray) -> np.ndarray:
+        min_overlap = 1e9
+        best_axis: np.ndarray | None = None
+        for corners in (corners1, corners2):
+            for i in range(4):
+                edge = corners[(i + 1) % 4] - corners[i]
+                axis = np.array([-edge[1], edge[0]], dtype=float)
+                axis /= np.linalg.norm(axis) + 1e-9
+                proj1 = corners1 @ axis
+                proj2 = corners2 @ axis
+                overlap = min(np.max(proj1), np.max(proj2)) - max(np.min(proj1), np.min(proj2))
+                if overlap <= 1e-3:
+                    return np.array([0.0, 0.0], dtype=float)
+                if overlap < min_overlap:
+                    min_overlap = overlap
+                    best_axis = axis
+
+        if best_axis is None:
+            return np.array([0.0, 0.0], dtype=float)
+
+        center_delta = np.mean(corners2, axis=0) - np.mean(corners1, axis=0)
+        if float(np.dot(center_delta, best_axis)) < 0.0:
+            best_axis = -best_axis
+        return best_axis * min_overlap
+
     def _world_front(self, furniture: dict[str, Any], theta: float) -> np.ndarray:
         base = self._normalize(furniture.get("front_vector_2d", [0.0, -1.0]), fallback=(0.0, -1.0))
         c, s = math.cos(theta), math.sin(theta)
@@ -280,6 +306,54 @@ class CanonicalLayoutOptimizer:
                     )
                     moved = True
             if not moved:
+                break
+
+        return adjusted
+
+    @staticmethod
+    def _mobility_weight(furniture: dict[str, Any]) -> float:
+        return {
+            "chair": 1.0,
+            "desk": 0.55,
+            "table": 0.55,
+            "shelf": 0.4,
+            "closet": 0.35,
+            "bed": 0.25,
+        }.get(furniture.get("type"), 0.6)
+
+    def _resolve_furniture_collisions(self, coords: np.ndarray) -> np.ndarray:
+        adjusted = np.array(coords, dtype=float)
+        if self.num_f < 2:
+            return adjusted
+
+        margin = 0.03
+        for _ in range(18):
+            moved = False
+            obbs = [
+                self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
+                for c, f in zip(adjusted, self.furnitures)
+            ]
+
+            for i in range(self.num_f):
+                for j in range(i + 1, self.num_f):
+                    mtv = self._sat_mtv(obbs[i], obbs[j])
+                    penetration = np.linalg.norm(mtv)
+                    if penetration <= 1e-8:
+                        continue
+
+                    direction = mtv / penetration
+                    total_mobility = self._mobility_weight(self.furnitures[i]) + self._mobility_weight(self.furnitures[j])
+                    i_share = self._mobility_weight(self.furnitures[j]) / total_mobility
+                    j_share = self._mobility_weight(self.furnitures[i]) / total_mobility
+                    adjusted[i, :2] -= direction * (penetration + margin) * i_share
+                    adjusted[j, :2] += direction * (penetration + margin) * j_share
+                    adjusted[i] = self._keep_obb_inside_room(adjusted[i], self.furnitures[i])
+                    adjusted[j] = self._keep_obb_inside_room(adjusted[j], self.furnitures[j])
+                    moved = True
+
+            if moved:
+                adjusted = self._resolve_wall_collisions(adjusted)
+            else:
                 break
 
         return adjusted
@@ -648,6 +722,8 @@ class CanonicalLayoutOptimizer:
         optimized = result_local.x.reshape(-1, 4)
         for i, furniture in enumerate(self.furnitures):
             optimized[i, 3] = self._snap_theta(float(optimized[i, 3]))
+        optimized = self._resolve_wall_collisions(optimized)
+        optimized = self._resolve_furniture_collisions(optimized)
         optimized = self._resolve_wall_collisions(optimized)
 
         output = json.loads(json.dumps(self.payload))
