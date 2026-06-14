@@ -12,7 +12,7 @@ from .mappers import build_optimizer_metadata, infer_catalog_model_key, map_room
 
 def _rotate_point(x: float, z: float, angle: float) -> tuple[float, float]:
     c, s = np.cos(-angle), np.sin(-angle)
-    return (x * c - z * s), -(x * s + z * c)
+    return (x * c - z * s), (x * s + z * c)
 
 
 def _rotate_vector(x: float, z: float, angle: float) -> tuple[float, float]:
@@ -53,6 +53,15 @@ def _extract_usage_front_2d(obj: dict[str, Any], floor_theta: float, fallback: l
         return _normalize_vector_2d(tx, ty, fallback)
 
     return fallback
+
+
+def _extract_axis_2d(element: dict[str, Any], floor_theta: float) -> list[float] | None:
+    transform = element.get("transform")
+    if not transform or len(transform) < 1 or len(transform[0]) < 3:
+        return None
+
+    ax, ay = _rotate_vector(transform[0][0], transform[0][2], floor_theta)
+    return _normalize_vector_2d(ax, ay, [1.0, 0.0])
 
 
 def _classify_wall_and_span(
@@ -202,6 +211,9 @@ def convert_roomplan_to_optimizer_payload(src: dict[str, Any]) -> dict[str, Any]
                 fixed_item["height"] = _round3(height)
                 fixed_item["keep_visual_open"] = True
             else:
+                fixed_item["center"] = [_round3(center_x), _round3(center_y)]
+                fixed_item["axis"] = _extract_axis_2d(element, floor_theta) or [1.0, 0.0]
+                fixed_item["length"] = _round3(span_length)
                 fixed_item["thickness"] = _round3(min(dimensions[0], dimensions[2] if len(dimensions) >= 3 else 0.1))
 
             fixed_elements.append(fixed_item)

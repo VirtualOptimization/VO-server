@@ -99,6 +99,48 @@ class CanonicalLayoutOptimizer:
                 max_overlap = max(max_overlap, overlap)
         return max_overlap
 
+    @staticmethod
+    def _sat_penetration(corners1: np.ndarray, corners2: np.ndarray) -> float:
+        min_overlap = 1e9
+        for corners in (corners1, corners2):
+            for i in range(4):
+                edge = corners[(i + 1) % 4] - corners[i]
+                axis = np.array([-edge[1], edge[0]], dtype=float)
+                axis /= np.linalg.norm(axis) + 1e-9
+                proj1 = corners1 @ axis
+                proj2 = corners2 @ axis
+                overlap = min(np.max(proj1), np.max(proj2)) - max(np.min(proj1), np.min(proj2))
+                if overlap <= 1e-3:
+                    return 0.0
+                min_overlap = min(min_overlap, overlap)
+        return min_overlap
+
+    @staticmethod
+    def _sat_mtv(corners1: np.ndarray, corners2: np.ndarray) -> np.ndarray:
+        min_overlap = 1e9
+        best_axis: np.ndarray | None = None
+        for corners in (corners1, corners2):
+            for i in range(4):
+                edge = corners[(i + 1) % 4] - corners[i]
+                axis = np.array([-edge[1], edge[0]], dtype=float)
+                axis /= np.linalg.norm(axis) + 1e-9
+                proj1 = corners1 @ axis
+                proj2 = corners2 @ axis
+                overlap = min(np.max(proj1), np.max(proj2)) - max(np.min(proj1), np.min(proj2))
+                if overlap <= 1e-3:
+                    return np.array([0.0, 0.0], dtype=float)
+                if overlap < min_overlap:
+                    min_overlap = overlap
+                    best_axis = axis
+
+        if best_axis is None:
+            return np.array([0.0, 0.0], dtype=float)
+
+        center_delta = np.mean(corners2, axis=0) - np.mean(corners1, axis=0)
+        if float(np.dot(center_delta, best_axis)) < 0.0:
+            best_axis = -best_axis
+        return best_axis * min_overlap
+
     def _world_front(self, furniture: dict[str, Any], theta: float) -> np.ndarray:
         base = self._normalize(furniture.get("front_vector_2d", [0.0, -1.0]), fallback=(0.0, -1.0))
         c, s = math.cos(theta), math.sin(theta)
@@ -165,6 +207,156 @@ class CanonicalLayoutOptimizer:
         if wall == "south":
             return np.array([[start, 0.0], [end, 0.0], [end, depth], [start, depth]])
         return np.array([[start, self.room_depth], [end, self.room_depth], [end, self.room_depth - depth], [start, self.room_depth - depth]])
+
+    def _wall_inward_normal(self, wall: dict[str, Any]) -> np.ndarray:
+        center = np.array(wall.get("center", [self.room_width / 2.0, self.room_depth / 2.0]), dtype=float)
+        axis = self._normalize(wall.get("axis", [1.0, 0.0]), fallback=(1.0, 0.0))
+        normal = np.array([-axis[1], axis[0]], dtype=float)
+        room_center = np.array([self.room_width / 2.0, self.room_depth / 2.0], dtype=float)
+        if float(np.dot(room_center - center, normal)) < 0.0:
+            normal = -normal
+        return normal
+
+    def _wall_obstacle_polygon(self, wall: dict[str, Any], *, buffer: float = 0.0) -> np.ndarray:
+        if "center" in wall and "axis" in wall and "length" in wall:
+            center = np.array(wall["center"], dtype=float)
+            axis = self._normalize(wall["axis"], fallback=(1.0, 0.0))
+            normal = np.array([-axis[1], axis[0]], dtype=float)
+            length = float(wall["length"])
+            thickness = max(float(wall.get("thickness", 0.1)), 0.1) + buffer * 2.0
+            half_length = length / 2.0
+            half_thickness = thickness / 2.0
+            start = center - axis * half_length
+            end = center + axis * half_length
+            return np.array([
+                start + normal * half_thickness,
+                end + normal * half_thickness,
+                end - normal * half_thickness,
+                start - normal * half_thickness,
+            ])
+
+        span = wall["span"]
+        start = float(span["start"])
+        end = float(span["end"])
+        thickness = max(float(wall.get("thickness", 0.1)), 0.1) + buffer
+        if wall["wall"] == "west":
+            return np.array([[0.0, start], [thickness, start], [thickness, end], [0.0, end]])
+        if wall["wall"] == "east":
+            return np.array([[self.room_width, start], [self.room_width - thickness, start], [self.room_width - thickness, end], [self.room_width, end]])
+        if wall["wall"] == "south":
+            return np.array([[start, 0.0], [end, 0.0], [end, thickness], [start, thickness]])
+        return np.array([[start, self.room_depth], [end, self.room_depth], [end, self.room_depth - thickness], [start, self.room_depth - thickness]])
+
+    def _keep_obb_inside_room(self, coords: np.ndarray, furniture: dict[str, Any]) -> np.ndarray:
+        adjusted = np.array(coords, dtype=float)
+        for _ in range(3):
+            corners = self._obb_corners(
+                adjusted[0],
+                adjusted[1],
+                float(furniture["extent"][0]),
+                float(furniture["extent"][1]),
+                adjusted[3],
+            )
+            left, right, bottom, top = self._distance_to_walls(corners)
+            shift = np.array([0.0, 0.0], dtype=float)
+            if left < 0.0:
+                shift[0] += -left
+            if right < 0.0:
+                shift[0] -= -right
+            if bottom < 0.0:
+                shift[1] += -bottom
+            if top < 0.0:
+                shift[1] -= -top
+            if np.linalg.norm(shift) < 1e-8:
+                break
+            adjusted[:2] += shift
+        return adjusted
+
+    def _resolve_wall_collisions(self, coords: np.ndarray) -> np.ndarray:
+        adjusted = np.array(coords, dtype=float)
+        walls = [fixed for fixed in self.fixed_elements if fixed.get("type") == "wall"]
+        if not walls:
+            return adjusted
+
+        margin = 0.02
+        for _ in range(8):
+            moved = False
+            for i, furniture in enumerate(self.furnitures):
+                corners = self._obb_corners(
+                    adjusted[i, 0],
+                    adjusted[i, 1],
+                    float(furniture["extent"][0]),
+                    float(furniture["extent"][1]),
+                    adjusted[i, 3],
+                )
+                for wall in walls:
+                    wall_poly = self._wall_obstacle_polygon(wall, buffer=margin)
+                    overlap = self._sat_penetration(corners, wall_poly)
+                    if overlap <= 0.0:
+                        continue
+
+                    adjusted[i, :2] += self._wall_inward_normal(wall) * (overlap + margin)
+                    adjusted[i] = self._keep_obb_inside_room(adjusted[i], furniture)
+                    corners = self._obb_corners(
+                        adjusted[i, 0],
+                        adjusted[i, 1],
+                        float(furniture["extent"][0]),
+                        float(furniture["extent"][1]),
+                        adjusted[i, 3],
+                    )
+                    moved = True
+            if not moved:
+                break
+
+        return adjusted
+
+    @staticmethod
+    def _mobility_weight(furniture: dict[str, Any]) -> float:
+        return {
+            "chair": 1.0,
+            "desk": 0.55,
+            "table": 0.55,
+            "shelf": 0.4,
+            "closet": 0.35,
+            "bed": 0.25,
+        }.get(furniture.get("type"), 0.6)
+
+    def _resolve_furniture_collisions(self, coords: np.ndarray) -> np.ndarray:
+        adjusted = np.array(coords, dtype=float)
+        if self.num_f < 2:
+            return adjusted
+
+        margin = 0.03
+        for _ in range(18):
+            moved = False
+            obbs = [
+                self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
+                for c, f in zip(adjusted, self.furnitures)
+            ]
+
+            for i in range(self.num_f):
+                for j in range(i + 1, self.num_f):
+                    mtv = self._sat_mtv(obbs[i], obbs[j])
+                    penetration = np.linalg.norm(mtv)
+                    if penetration <= 1e-8:
+                        continue
+
+                    direction = mtv / penetration
+                    total_mobility = self._mobility_weight(self.furnitures[i]) + self._mobility_weight(self.furnitures[j])
+                    i_share = self._mobility_weight(self.furnitures[j]) / total_mobility
+                    j_share = self._mobility_weight(self.furnitures[i]) / total_mobility
+                    adjusted[i, :2] -= direction * (penetration + margin) * i_share
+                    adjusted[j, :2] += direction * (penetration + margin) * j_share
+                    adjusted[i] = self._keep_obb_inside_room(adjusted[i], self.furnitures[i])
+                    adjusted[j] = self._keep_obb_inside_room(adjusted[j], self.furnitures[j])
+                    moved = True
+
+            if moved:
+                adjusted = self._resolve_wall_collisions(adjusted)
+            else:
+                break
+
+        return adjusted
 
     def _wall_overlap_length(self, furniture_corners: np.ndarray, fixed: dict[str, Any]) -> float:
         wall = fixed["wall"]
@@ -415,12 +607,21 @@ class CanonicalLayoutOptimizer:
     def _fixed_element_penalty(self, all_obbs: list[np.ndarray], all_coords: np.ndarray) -> float:
         total = 0.0
         for fixed in self.fixed_elements:
-            if fixed.get("type") != "door":
+            fixed_type = fixed.get("type")
+            if fixed_type == "door":
+                clearance = self._door_clearance_polygon(fixed)
+            elif fixed_type == "wall":
+                clearance = self._wall_obstacle_polygon(fixed, buffer=0.02)
+            else:
                 continue
-            clearance = self._door_clearance_polygon(fixed)
             for obb in all_obbs:
-                if self._sat_overlap(clearance, obb) > 0:
-                    total += self.weights.critical
+                overlap = (
+                    self._sat_penetration(clearance, obb)
+                    if fixed_type == "wall"
+                    else self._sat_overlap(clearance, obb)
+                )
+                if overlap > 0:
+                    total += self.weights.critical + overlap * self.weights.critical
 
         return total
 
@@ -521,6 +722,10 @@ class CanonicalLayoutOptimizer:
         optimized = result_local.x.reshape(-1, 4)
         for i, furniture in enumerate(self.furnitures):
             optimized[i, 3] = self._snap_theta(float(optimized[i, 3]))
+        optimized = self._resolve_wall_collisions(optimized)
+        optimized = self._resolve_furniture_collisions(optimized)
+        optimized = self._resolve_wall_collisions(optimized)
+
         output = json.loads(json.dumps(self.payload))
         for i, furniture in enumerate(output["movable_items"]):
             theta_deg = round(math.degrees(optimized[i, 3]) % 360.0, 3)
