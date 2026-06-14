@@ -42,6 +42,33 @@ def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
     return [0.0, _round6(yaw), 0.0]
 
 
+def _yaw_from_rotation(rotation: list) -> float:
+    if len(rotation) >= 3:
+        return float(rotation[1])
+    if len(rotation) >= 1:
+        return float(rotation[0])
+    raise HTTPException(status_code=400, detail="rotation은 [x, y, z] 또는 [yaw] 형식이어야 합니다.")
+
+
+def _apply_yaw_to_transform(item: dict, yaw: float) -> None:
+    transform = item.get("transform")
+    if not isinstance(transform, list) or len(transform) < 4:
+        center = item.get("center") or [0.0, 0.0, 0.0]
+        transform = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [_round6(center[0]), _round6(center[1]), _round6(center[2]), 1.0],
+        ]
+
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    transform[0][0:3] = [_round6(c), 0.0, _round6(s)]
+    transform[1][0:3] = [0.0, 1.0, 0.0]
+    transform[2][0:3] = [_round6(-s), 0.0, _round6(c)]
+    item["transform"] = transform
+
+
 def _center_y(item: dict) -> float:
     center = item.get("center")
     if isinstance(center, list) and len(center) >= 2:
@@ -152,28 +179,27 @@ def _apply_pose_update(target: dict, update: dict) -> None:
         transform = update["transform"]
         if not isinstance(transform, list) or len(transform) < 4 or len(transform[3]) < 3:
             raise HTTPException(status_code=400, detail="transform은 4x4 행렬 형식이어야 합니다.")
-        target["transform"] = [list(row) for row in transform]
-
         if "center" not in update:
             target["center"] = [
-                _round6(target["transform"][3][0]),
+                _round6(transform[3][0]),
                 _round6(preserved_y),
-                _round6(target["transform"][3][2]),
+                _round6(transform[3][2]),
             ]
 
-        target["transform"][3][0:3] = target["center"]
+    if "rotation" in update:
+        rotation = update["rotation"]
+        if not isinstance(rotation, list):
+            raise HTTPException(status_code=400, detail="rotation은 배열 형식이어야 합니다.")
+        yaw = _yaw_from_rotation(rotation)
+        target["rotation"] = [0.0, _round6(yaw), 0.0]
+        _apply_yaw_to_transform(target, yaw)
 
-    for field in PATCHABLE_OBJECT_FIELDS - {"center", "transform", "rotation"}:
-        if field in update:
-            target[field] = update[field]
-
-    if "transform" in update or "center" in update:
-        if isinstance(target.get("transform"), list) and len(target["transform"]) >= 4:
-            target["transform"][3][0:3] = target["center"]
+    if "transform" in update or "center" in update or "rotation" in update:
+        transform = target.get("transform")
+        if isinstance(transform, list) and len(transform) >= 4:
+            transform[3][0:3] = target["center"]
         _sync_vectors_from_transform(target)
         _sync_obb_vertices(target)
-    elif "rotation" in update:
-        target["rotation"] = update["rotation"]
 
 
 def _unity_layout_uri(version: Version) -> str | None:
