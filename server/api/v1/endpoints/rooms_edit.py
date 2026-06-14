@@ -168,6 +168,12 @@ def _sync_obb_vertices(item: dict) -> None:
 
 def _apply_pose_update(target: dict, update: dict) -> None:
     preserved_y = _center_y(target)
+    preserved_rotation = target.get("rotation")
+    preserved_yaw = (
+        _yaw_from_rotation(preserved_rotation)
+        if isinstance(preserved_rotation, list) and preserved_rotation
+        else None
+    )
 
     if "center" in update:
         center = update["center"]
@@ -198,6 +204,9 @@ def _apply_pose_update(target: dict, update: dict) -> None:
         transform = target.get("transform")
         if isinstance(transform, list) and len(transform) >= 4:
             transform[3][0:3] = target["center"]
+        if "rotation" not in update and preserved_yaw is not None:
+            target["rotation"] = [0.0, _round6(preserved_yaw), 0.0]
+            _apply_yaw_to_transform(target, preserved_yaw)
         _sync_vectors_from_transform(target)
         _sync_obb_vertices(target)
 
