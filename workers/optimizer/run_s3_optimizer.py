@@ -13,6 +13,7 @@ from server.services.transform import (
     build_layout_problem,
     convert_roomplan_to_optimizer_payload,
     export_optimized_layout_to_roomplan,
+    normalize_roomplan_for_ios_view,
     normalize_roomplan_for_unity,
 )
 from workers.optimizer.layout import CanonicalLayoutOptimizer
@@ -99,8 +100,9 @@ def main() -> int:
             global_popsize=global_popsize,
             local_maxiter=local_maxiter,
         )
-        roomplan_optimized = export_optimized_layout_to_roomplan(raw_payload, optimized)
-        unity_roomplan_optimized = normalize_roomplan_for_unity(roomplan_optimized)
+        roomplan_optimized_raw = export_optimized_layout_to_roomplan(raw_payload, optimized)
+        roomplan_optimized = normalize_roomplan_for_ios_view(roomplan_optimized_raw)
+        unity_roomplan_optimized = normalize_roomplan_for_unity(roomplan_optimized_raw)
 
         write_json(roomplan_optimized_path, roomplan_optimized)
         write_json(unity_roomplan_optimized_path, unity_roomplan_optimized)

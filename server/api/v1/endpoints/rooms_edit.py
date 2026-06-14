@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import func
@@ -11,7 +12,7 @@ from server.schemas.room_view import (
     UserEditedVersionCreateRequest,
     UserEditedVersionCreateResponse,
 )
-from server.services.transform.unity_roomplan import denormalize_roomplan_from_unity
+from server.services.transform.unity_roomplan import denormalize_roomplan_from_unity, normalize_roomplan_for_ios_view
 from shared.db import SessionLocal
 from shared.models.room import Room
 from shared.models.version import Version
@@ -22,14 +23,157 @@ router = APIRouter()
 MAX_VERSION_COUNT = 5
 PATCHABLE_OBJECT_FIELDS = {
     "center",
+    "rotation",
     "transform",
-    "obbVertices",
     "frontVector",
     "backVector",
     "leftVector",
     "rightVector",
     "upVector",
 }
+
+
+def _round6(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
+    yaw = math.atan2(float(transform[0][2]), float(transform[0][0]))
+    return [0.0, _round6(yaw), 0.0]
+
+
+def _center_y(item: dict) -> float:
+    center = item.get("center")
+    if isinstance(center, list) and len(center) >= 2:
+        center_y = float(center[1])
+        obb_min_y = _obb_min_y(item)
+        if obb_min_y is not None and obb_min_y < -0.01:
+            return center_y - obb_min_y
+        return center_y
+
+    transform = item.get("transform")
+    if isinstance(transform, list) and len(transform) >= 4 and len(transform[3]) >= 2:
+        center_y = float(transform[3][1])
+        obb_min_y = _obb_min_y(item)
+        if obb_min_y is not None and obb_min_y < -0.01:
+            return center_y - obb_min_y
+        return center_y
+
+    return 0.0
+
+
+def _obb_min_y(item: dict) -> float | None:
+    vertices = item.get("obbVertices")
+    if not isinstance(vertices, list):
+        return None
+
+    y_values = [
+        float(vertex[1])
+        for vertex in vertices
+        if isinstance(vertex, list) and len(vertex) >= 2 and isinstance(vertex[1], (int, float))
+    ]
+    if not y_values:
+        return None
+
+    return min(y_values)
+
+
+def _vec3(row: list) -> list[float]:
+    return [float(row[0]), float(row[1]), float(row[2])]
+
+
+def _neg(vector: list[float]) -> list[float]:
+    return [_round6(-value) for value in vector]
+
+
+def _rounded(vector: list[float]) -> list[float]:
+    return [_round6(value) for value in vector]
+
+
+def _sync_vectors_from_transform(item: dict) -> None:
+    transform = item.get("transform")
+    if not isinstance(transform, list) or len(transform) < 4:
+        return
+    if any(not isinstance(transform[row], list) or len(transform[row]) < 3 for row in range(3)):
+        return
+
+    right = _vec3(transform[0])
+    up = _vec3(transform[1])
+    back = _vec3(transform[2])
+    item["rightVector"] = _rounded(right)
+    item["leftVector"] = _neg(right)
+    item["upVector"] = _rounded(up)
+    item["backVector"] = _rounded(back)
+    item["frontVector"] = _neg(back)
+    item["rotation"] = _rotation_from_transform(transform)
+
+
+def _sync_obb_vertices(item: dict) -> None:
+    center = item.get("center")
+    dimensions = item.get("dimensions")
+    transform = item.get("transform")
+    if not (
+        isinstance(center, list) and len(center) >= 3
+        and isinstance(dimensions, list) and len(dimensions) >= 3
+        and isinstance(transform, list) and len(transform) >= 3
+    ):
+        return
+    if any(not isinstance(transform[row], list) or len(transform[row]) < 3 for row in range(3)):
+        return
+
+    hx, hy, hz = float(dimensions[0]) / 2.0, float(dimensions[1]) / 2.0, float(dimensions[2]) / 2.0
+    center_v = _vec3(center)
+    right = _vec3(transform[0])
+    up = _vec3(transform[1])
+    back = _vec3(transform[2])
+
+    vertices = []
+    for sx in (1.0, -1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (1.0, -1.0):
+                point = [
+                    center_v[axis] + right[axis] * hx * sx + up[axis] * hy * sy + back[axis] * hz * sz
+                    for axis in range(3)
+                ]
+                vertices.append(_rounded(point))
+    item["obbVertices"] = vertices
+
+
+def _apply_pose_update(target: dict, update: dict) -> None:
+    preserved_y = _center_y(target)
+
+    if "center" in update:
+        center = update["center"]
+        if not isinstance(center, list) or len(center) < 3:
+            raise HTTPException(status_code=400, detail="center는 [x, y, z] 형식이어야 합니다.")
+        target["center"] = [_round6(center[0]), _round6(preserved_y), _round6(center[2])]
+
+    if "transform" in update:
+        transform = update["transform"]
+        if not isinstance(transform, list) or len(transform) < 4 or len(transform[3]) < 3:
+            raise HTTPException(status_code=400, detail="transform은 4x4 행렬 형식이어야 합니다.")
+        target["transform"] = [list(row) for row in transform]
+
+        if "center" not in update:
+            target["center"] = [
+                _round6(target["transform"][3][0]),
+                _round6(preserved_y),
+                _round6(target["transform"][3][2]),
+            ]
+
+        target["transform"][3][0:3] = target["center"]
+
+    for field in PATCHABLE_OBJECT_FIELDS - {"center", "transform", "rotation"}:
+        if field in update:
+            target[field] = update[field]
+
+    if "transform" in update or "center" in update:
+        if isinstance(target.get("transform"), list) and len(target["transform"]) >= 4:
+            target["transform"][3][0:3] = target["center"]
+        _sync_vectors_from_transform(target)
+        _sync_obb_vertices(target)
+    elif "rotation" in update:
+        target["rotation"] = update["rotation"]
 
 
 def _unity_layout_uri(version: Version) -> str | None:
@@ -85,9 +229,7 @@ def _patch_objects(base_layout: dict, updates: list[dict], label: str) -> dict:
                 detail=f"{label} JSON에서 identifier={identifier} object를 찾을 수 없습니다.",
             )
 
-        for field in PATCHABLE_OBJECT_FIELDS:
-            if field in update:
-                target[field] = update[field]
+        _apply_pose_update(target, update)
 
     return base_layout
 
@@ -168,9 +310,12 @@ async def create_user_edited_version(
 
         unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
         if payload.ios_objects is not None:
-            ios_layout = _patch_objects(ios_layout, payload.ios_objects, "iOS")
+            ios_layout = normalize_roomplan_for_ios_view(
+                _patch_objects(ios_layout, payload.ios_objects, "iOS")
+            )
         else:
             ios_layout = denormalize_roomplan_from_unity(unity_layout)
+            ios_layout = normalize_roomplan_for_ios_view(ios_layout)
 
         edit_prefix = f"scans/{confirm_code}/user_edits/version_{next_version_no}"
         ios_key = f"{edit_prefix}/layout.roomplan.json"
