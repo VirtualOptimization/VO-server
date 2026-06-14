@@ -56,6 +56,11 @@ def _normalize_vector(vector: list[float], floor_theta: float) -> list[float]:
     return [_round6(rx), _round6(float(vector[1])), _round6(rz)]
 
 
+def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
+    yaw = math.atan2(float(transform[0][2]), float(transform[0][0]))
+    return [0.0, _round6(yaw), 0.0]
+
+
 def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
     """Return a RoomPlan-like payload aligned to a Unity-friendly +X/+Z floor frame."""
     floor_theta, floor_y, min_x, min_z = _floor_normalization_context(room_data)
@@ -74,6 +79,7 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
                         item["transform"][row][1] = vector[1]
                         item["transform"][row][2] = vector[2]
                 item["transform"][3][0:3] = item["center"]
+                item["rotation"] = _rotation_from_transform(item["transform"])
             if item.get("obbVertices"):
                 item["obbVertices"] = [
                     _normalize_point(vertex, floor_theta, floor_y, min_x, min_z)
@@ -89,6 +95,13 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
         "minX": _round6(min_x),
         "minZ": _round6(min_z),
     }
+    return normalized
+
+
+def normalize_roomplan_for_ios_view(room_data: dict[str, Any]) -> dict[str, Any]:
+    """Return a floor-aligned RoomPlan-like payload for iOS viewers."""
+    normalized = normalize_roomplan_for_unity(room_data)
+    normalized["coordinateSystem"] = "iOS aligned RoomPlan (Y-up, meters, floor aligned to +X/+Z)"
     return normalized
 
 
@@ -131,6 +144,7 @@ def denormalize_roomplan_from_unity(room_data: dict[str, Any]) -> dict[str, Any]
                         item["transform"][row][1] = vector[1]
                         item["transform"][row][2] = vector[2]
                 item["transform"][3][0:3] = item["center"]
+                item["rotation"] = _rotation_from_transform(item["transform"])
             if item.get("obbVertices"):
                 item["obbVertices"] = [
                     _denormalize_point(vertex, floor_theta, floor_y, min_x, min_z)

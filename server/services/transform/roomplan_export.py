@@ -75,6 +75,10 @@ def _build_transform(center: list[float], raw_theta: float) -> list[list[float]]
     ]
 
 
+def _build_rotation(raw_theta: float) -> list[float]:
+    return [0.0, _round6(raw_theta), 0.0]
+
+
 def _build_direction_vectors(raw_theta: float) -> dict[str, list[float]]:
     front = np.array([math.sin(raw_theta), 0.0, -math.cos(raw_theta)], dtype=float)
     back = -front
@@ -138,6 +142,7 @@ def export_optimized_layout_to_roomplan(
         raw_theta = math.radians(rotation_y_deg) + floor_theta
 
         obj["center"] = new_center
+        obj["rotation"] = _build_rotation(raw_theta)
         obj["transform"] = _build_transform(new_center, raw_theta)
         obj.update(_build_direction_vectors(raw_theta))
         obj["obbVertices"] = _build_obb_vertices(new_center, dimensions, raw_theta)
