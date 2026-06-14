@@ -104,10 +104,14 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_roomplan_for_ios_view(room_data: dict[str, Any]) -> dict[str, Any]:
-    """Return a floor-aligned RoomPlan-like payload for iOS viewers."""
-    normalized = normalize_roomplan_for_unity(room_data)
-    normalized["coordinateSystem"] = "iOS aligned RoomPlan (Y-up, meters, floor aligned to +X/+Z)"
-    return normalized
+    """Return an iOS RoomPlan-frame payload without Unity floor normalization."""
+    payload = json.loads(json.dumps(room_data))
+    if isinstance(payload.get("unityNormalization"), dict):
+        return denormalize_roomplan_from_unity(payload)
+
+    payload.pop("unityNormalization", None)
+    payload["coordinateSystem"] = payload.get("coordinateSystem") or "RoomPlan"
+    return payload
 
 
 def _denormalize_point(point: list[float], floor_theta: float, floor_y: float, min_x: float, min_z: float) -> list[float]:
