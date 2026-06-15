@@ -38,7 +38,8 @@ def _round6(value: float) -> float:
 
 
 def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
-    yaw = math.atan2(float(transform[0][2]), float(transform[0][0]))
+    # Catalog GLB furniture faces local -Z in Unity, while RoomPlan transform row 2 is the back axis.
+    yaw = math.atan2(float(transform[2][0]), float(transform[2][2]))
     return [0.0, _round6(yaw), 0.0]
 
 
@@ -63,9 +64,9 @@ def _apply_yaw_to_transform(item: dict, yaw: float) -> None:
 
     c = math.cos(yaw)
     s = math.sin(yaw)
-    transform[0][0:3] = [_round6(c), 0.0, _round6(s)]
+    transform[0][0:3] = [_round6(c), 0.0, _round6(-s)]
     transform[1][0:3] = [0.0, 1.0, 0.0]
-    transform[2][0:3] = [_round6(-s), 0.0, _round6(c)]
+    transform[2][0:3] = [_round6(s), 0.0, _round6(c)]
     item["transform"] = transform
 
 
@@ -115,6 +116,13 @@ def _neg(vector: list[float]) -> list[float]:
 
 def _rounded(vector: list[float]) -> list[float]:
     return [_round6(value) for value in vector]
+
+
+def _rounded_transform(transform: list[list[float]]) -> list[list[float]]:
+    rounded = []
+    for row in transform:
+        rounded.append([_round6(value) if isinstance(value, (int, float)) else value for value in row])
+    return rounded
 
 
 def _sync_vectors_from_transform(item: dict) -> None:
@@ -185,6 +193,7 @@ def _apply_pose_update(target: dict, update: dict) -> None:
         transform = update["transform"]
         if not isinstance(transform, list) or len(transform) < 4 or len(transform[3]) < 3:
             raise HTTPException(status_code=400, detail="transform은 4x4 행렬 형식이어야 합니다.")
+        target["transform"] = _rounded_transform(transform)
         if "center" not in update:
             target["center"] = [
                 _round6(transform[3][0]),
@@ -204,7 +213,7 @@ def _apply_pose_update(target: dict, update: dict) -> None:
         transform = target.get("transform")
         if isinstance(transform, list) and len(transform) >= 4:
             transform[3][0:3] = target["center"]
-        if "rotation" not in update and preserved_yaw is not None:
+        if "rotation" not in update and "transform" not in update and preserved_yaw is not None:
             target["rotation"] = [0.0, _round6(preserved_yaw), 0.0]
             _apply_yaw_to_transform(target, preserved_yaw)
         _sync_vectors_from_transform(target)

@@ -33,6 +33,7 @@ class PenaltyWeights:
     reward: float = 2_000.0
     rotation_snap: float = 25_000.0
     wall_anchor: float = 15_000.0
+    body_collision: float = 50_000_000.0
 
 
 class CanonicalLayoutOptimizer:
@@ -336,21 +337,33 @@ class CanonicalLayoutOptimizer:
         if self.num_f < 2:
             return adjusted
 
-        margin = 0.03
-        for _ in range(18):
+        margin = 0.08
+        for _ in range(80):
             moved = False
-            obbs = [
-                self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
-                for c, f in zip(adjusted, self.furnitures)
-            ]
+            max_penetration = 0.0
 
             for i in range(self.num_f):
                 for j in range(i + 1, self.num_f):
-                    mtv = self._sat_mtv(obbs[i], obbs[j])
+                    obb_i = self._obb_corners(
+                        adjusted[i, 0],
+                        adjusted[i, 1],
+                        float(self.furnitures[i]["extent"][0]),
+                        float(self.furnitures[i]["extent"][1]),
+                        adjusted[i, 3],
+                    )
+                    obb_j = self._obb_corners(
+                        adjusted[j, 0],
+                        adjusted[j, 1],
+                        float(self.furnitures[j]["extent"][0]),
+                        float(self.furnitures[j]["extent"][1]),
+                        adjusted[j, 3],
+                    )
+                    mtv = self._sat_mtv(obb_i, obb_j)
                     penetration = np.linalg.norm(mtv)
                     if penetration <= 1e-8:
                         continue
 
+                    max_penetration = max(max_penetration, float(penetration))
                     direction = mtv / penetration
                     total_mobility = self._mobility_weight(self.furnitures[i]) + self._mobility_weight(self.furnitures[j])
                     i_share = self._mobility_weight(self.furnitures[j]) / total_mobility
@@ -363,10 +376,23 @@ class CanonicalLayoutOptimizer:
 
             if moved:
                 adjusted = self._resolve_wall_collisions(adjusted)
+                if max_penetration <= 1e-3:
+                    break
             else:
                 break
 
         return adjusted
+
+    def _max_furniture_penetration(self, coords: np.ndarray) -> float:
+        max_penetration = 0.0
+        obbs = [
+            self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
+            for c, f in zip(coords, self.furnitures)
+        ]
+        for i in range(self.num_f):
+            for j in range(i + 1, self.num_f):
+                max_penetration = max(max_penetration, self._sat_penetration(obbs[i], obbs[j]))
+        return float(max_penetration)
 
     def _wall_overlap_length(self, furniture_corners: np.ndarray, fixed: dict[str, Any]) -> float:
         wall = fixed["wall"]
@@ -537,14 +563,14 @@ class CanonicalLayoutOptimizer:
         prefs = furniture.get("anchor_preferences", {})
         rules = furniture.get("placement_rules", {})
         back_to_wall = prefs.get("back_to_wall") or rules.get("back_near_wall_preferred")
-        
+
         if not (prefs.get("wall_cling_required") or rules.get("back_near_wall_preferred") or rules.get("corner_preferred")):
             return 0.0
 
         wall_distances = self._distance_to_walls(corners)
         nearest_idx = int(np.argmin(wall_distances))
         nearest_dist = wall_distances[nearest_idx]
-        
+
         total = nearest_dist * self.weights.wall_anchor
 
         if prefs.get("wall_cling_required") and nearest_dist > 0.05:
@@ -555,12 +581,12 @@ class CanonicalLayoutOptimizer:
             theta = float(self._snap_theta(np.arctan2(corners[1, 1] - corners[0, 1], corners[1, 0] - corners[0, 0])))
             # Actually use current optimized theta
             # but corners already reflect the current pose in _objective
-            
+
             # Back vector is opposite of world front
             # We can derive it from the orientation of the OBB
-            front = self._world_front(furniture, self._snap_theta(theta)) # Use snapped for alignment check
+            front = self._world_front(furniture, self._snap_theta(theta))  # Use snapped for alignment check
             back = -front
-            
+
             # Wall normals (pointing OUT of the room to match back vector)
             # 0: West (x=0) -> [-1, 0]
             # 1: East (x=W) -> [1, 0]
@@ -572,11 +598,11 @@ class CanonicalLayoutOptimizer:
                 np.array([0.0, -1.0]),
                 np.array([0.0, 1.0])
             ]
-            
+
             target_normal = wall_normals[nearest_idx]
             alignment = float(np.dot(back, target_normal))
-            
-            if alignment < 0.9: # Not facing the wall
+
+            if alignment < 0.9:  # Not facing the wall
                 total += self.weights.high * (1.0 - alignment)
 
         if prefs.get("corner_preferred") or rules.get("corner_preferred"):
@@ -1150,19 +1176,21 @@ class CanonicalLayoutOptimizer:
             total += self._outside_room_penalty(corners)
 
             for j in range(i + 1, self.num_f):
-                overlap = self._sat_overlap(corners, obbs[j])
-                if overlap > 0:
-                    other = self.furnitures[j]
-                    is_support_pair = (
-                        furniture["type"] == "chair"
-                        and ids.get(furniture.get("pair_with")) == j
-                    ) or (
-                        other["type"] == "chair"
-                        and ids.get(other.get("pair_with")) == i
-                    )
-                    if is_support_pair:
-                        continue
-                    total += self.weights.critical + overlap * self.weights.critical
+                other = self.furnitures[j]
+                is_support_pair = (
+                    furniture["type"] == "chair"
+                    and ids.get(furniture.get("pair_with")) == j
+                ) or (
+                    other["type"] == "chair"
+                    and ids.get(other.get("pair_with")) == i
+                )
+                if is_support_pair:
+                    continue
+
+                penetration = self._sat_penetration(corners, obbs[j])
+                if penetration > 0:
+                    total += self.weights.body_collision
+                    total += ((penetration + 0.02) ** 2) * self.weights.body_collision * 20.0
 
             if furniture["type"] == "bed":
                 total += self._bed_penalty(furniture, coords[i], corners, obbs, i)
@@ -1264,9 +1292,12 @@ class CanonicalLayoutOptimizer:
         optimized = optimized_x.reshape(-1, 4)
         for i, furniture in enumerate(self.furnitures):
             optimized[i, 3] = self._snap_theta(float(optimized[i, 3]))
-        optimized = self._resolve_wall_collisions(optimized)
-        optimized = self._resolve_furniture_collisions(optimized)
-        optimized = self._resolve_wall_collisions(optimized)
+        for _ in range(6):
+            optimized = self._resolve_wall_collisions(optimized)
+            optimized = self._resolve_furniture_collisions(optimized)
+            optimized = self._resolve_wall_collisions(optimized)
+            if self._max_furniture_penetration(optimized) <= 1e-3:
+                break
 
         output = json.loads(json.dumps(self.payload))
         for i, furniture in enumerate(output["movable_items"]):
@@ -1281,6 +1312,7 @@ class CanonicalLayoutOptimizer:
         output["optimization"] = {
             "objective_value": round(float(result_local.fun), 3),
             "solver": "differential_evolution + SLSQP",
+            "remaining_collision_penetration_m": round(self._max_furniture_penetration(optimized), 4),
             "anthropometrics_m": {
                 "shoulder_width": self.body.shoulder_width,
                 "sitting_popliteal": self.body.sitting_popliteal,
