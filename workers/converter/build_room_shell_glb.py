@@ -39,13 +39,11 @@ def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, floa
         dimensions = floor_item["dimensions"]
         transform = floor_item["transform"]
         axis_x = np.array([transform[0][0], transform[0][2]], dtype=float)
-        floor_depth_axis = 1 if len(dimensions) == 2 else 2
-        axis_z = np.array([transform[floor_depth_axis][0], transform[floor_depth_axis][2]], dtype=float)
+        axis_z = np.array([transform[2][0], transform[2][2]], dtype=float)
         center_xz = np.array([center[0], center[2]], dtype=float)
         for sx in (-1.0, 1.0):
             for sz in (-1.0, 1.0):
-                depth = float(dimensions[1] if len(dimensions) == 2 else dimensions[2])
-                point = center_xz + axis_x * float(dimensions[0]) * 0.5 * sx + axis_z * depth * 0.5 * sz
+                point = center_xz + axis_x * float(dimensions[0]) * 0.5 * sx + axis_z * float(dimensions[1]) * 0.5 * sz
                 points.append(_rotate_xz(float(point[0]), float(point[1]), floor_theta))
 
     arr = np.array(points, dtype=float)
