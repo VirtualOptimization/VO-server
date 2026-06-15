@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -28,10 +29,12 @@ FURNITURE_TYPE_MAP = {
     "Chair": "chair",
     "Sofa": "sofa",
     "Storage": "shelf",
-    "Table": "desk",
+    "Table": "table",
 }
 
 _WARNED_MISSING_PXR = False
+GLB_JSON_CHUNK_TYPE = 0x4E4F534A
+GLB_BIN_CHUNK_TYPE = 0x004E4942
 
 
 def load_env_file(env_path: Path) -> None:
@@ -201,6 +204,65 @@ bpy.ops.export_scene.gltf(
     return "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
 
 
+def _pad_json_chunk(raw: bytes) -> bytes:
+    padding = (-len(raw)) % 4
+    return raw + (b" " * padding)
+
+
+def _pad_binary_chunk(raw: bytes) -> bytes:
+    padding = (-len(raw)) % 4
+    return raw + (b"\x00" * padding)
+
+
+def ensure_glb_default_scene(glb_path: Path) -> bool:
+    """Make GLB files compatible with loaders that require a top-level default scene."""
+    data = glb_path.read_bytes()
+    if len(data) < 20:
+        raise ValueError(f"{glb_path} is too small to be a GLB file")
+
+    magic, version, _length = struct.unpack_from("<4sII", data, 0)
+    if magic != b"glTF" or version != 2:
+        raise ValueError(f"{glb_path} is not a GLB v2 file")
+
+    chunks: list[tuple[int, bytes]] = []
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+        offset += 8
+        chunk = data[offset : offset + chunk_length]
+        offset += chunk_length
+        chunks.append((chunk_type, chunk))
+
+    json_index = next(
+        (index for index, (chunk_type, _chunk) in enumerate(chunks) if chunk_type == GLB_JSON_CHUNK_TYPE),
+        None,
+    )
+    if json_index is None:
+        raise ValueError(f"{glb_path} has no JSON chunk")
+
+    gltf = json.loads(chunks[json_index][1].decode("utf-8").rstrip("\x00 \t\r\n"))
+    if gltf.get("scene") is not None:
+        return False
+
+    scenes = gltf.get("scenes") or []
+    if not scenes:
+        raise ValueError(f"{glb_path} has no scenes")
+
+    gltf["scene"] = 0
+    json_bytes = json.dumps(gltf, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    chunks[json_index] = (GLB_JSON_CHUNK_TYPE, _pad_json_chunk(json_bytes))
+
+    rebuilt_chunks = bytearray()
+    for chunk_type, chunk in chunks:
+        padded_chunk = _pad_binary_chunk(chunk) if chunk_type == GLB_BIN_CHUNK_TYPE else chunk
+        rebuilt_chunks.extend(struct.pack("<II", len(padded_chunk), chunk_type))
+        rebuilt_chunks.extend(padded_chunk)
+
+    total_length = 12 + len(rebuilt_chunks)
+    glb_path.write_bytes(struct.pack("<4sII", b"glTF", 2, total_length) + rebuilt_chunks)
+    return True
+
+
 def convert_usdc_to_glb(
     usd2gltf_bin: str,
     input_path: Path,
@@ -255,6 +317,35 @@ def convert_usdc_to_glb(
         )
 
     return usd2gltf_error
+
+
+def convert_and_fix_usdc_to_glb(
+    usd2gltf_bin: str,
+    input_path: Path,
+    output_path: Path,
+    *,
+    blender_bin: str,
+    fallback_converter: str,
+    force: bool,
+) -> str | None:
+    error = convert_usdc_to_glb(
+        usd2gltf_bin,
+        input_path,
+        output_path,
+        blender_bin=blender_bin,
+        fallback_converter=fallback_converter,
+        force=force,
+    )
+    if error is not None:
+        return error
+
+    try:
+        if ensure_glb_default_scene(output_path):
+            print(f"  [FIX] Added default scene to {output_path.name}")
+    except Exception as exc:
+        return f"Failed to fix GLB default scene: {exc}"
+
+    return None
 
 
 def content_type_for(path: Path) -> str:
@@ -390,7 +481,7 @@ def prepare_catalog(
                 print(f"  [DRY RUN] {usdc_path} -> {glb_path} -> s3://{bucket}/{glb_key}")
             else:
                 print(f"  [CONVERT] {relative_path}")
-                error = convert_usdc_to_glb(
+                error = convert_and_fix_usdc_to_glb(
                     usd2gltf_bin,
                     usdc_path,
                     glb_path,
