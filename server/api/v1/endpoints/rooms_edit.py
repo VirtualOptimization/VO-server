@@ -260,7 +260,7 @@ def _apply_pose_update(target: dict, update: dict, coordinate_space: str) -> Non
                 _round6(target["transform"][3][2]),
             ]
 
-    if "rotation" in update and "transform" not in update:
+    if "rotation" in update:
         rotation = update["rotation"]
         if not isinstance(rotation, list):
             raise HTTPException(status_code=400, detail="rotation은 배열 형식이어야 합니다.")
