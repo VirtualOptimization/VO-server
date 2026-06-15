@@ -12,7 +12,11 @@ from server.schemas.room_view import (
     UserEditedVersionCreateRequest,
     UserEditedVersionCreateResponse,
 )
-from server.services.transform.unity_roomplan import denormalize_roomplan_from_unity, normalize_roomplan_for_ios_view
+from server.services.transform.unity_roomplan import (
+    denormalize_roomplan_from_unity,
+    normalize_roomplan_for_ios_view,
+    normalize_roomplan_for_unity,
+)
 from shared.db import SessionLocal
 from shared.models.room import Room
 from shared.models.version import Version
@@ -37,7 +41,13 @@ def _round6(value: float) -> float:
     return round(float(value), 6)
 
 
-def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
+def _unity_rotation_from_transform(transform: list[list[float]]) -> list[float]:
+    # Catalog GLB furniture faces local -Z in Unity, while RoomPlan transform row 2 is the back axis.
+    yaw = math.atan2(float(transform[2][0]), float(transform[2][2]))
+    return [0.0, _round6(yaw), 0.0]
+
+
+def _roomplan_rotation_from_transform(transform: list[list[float]]) -> list[float]:
     yaw = math.atan2(float(transform[0][2]), float(transform[0][0]))
     return [0.0, _round6(yaw), 0.0]
 
@@ -50,7 +60,7 @@ def _yaw_from_rotation(rotation: list) -> float:
     raise HTTPException(status_code=400, detail="rotation은 [x, y, z] 또는 [yaw] 형식이어야 합니다.")
 
 
-def _apply_yaw_to_transform(item: dict, yaw: float) -> None:
+def _apply_yaw_to_transform(item: dict, yaw: float, coordinate_space: str) -> None:
     transform = item.get("transform")
     if not isinstance(transform, list) or len(transform) < 4:
         center = item.get("center") or [0.0, 0.0, 0.0]
@@ -63,9 +73,16 @@ def _apply_yaw_to_transform(item: dict, yaw: float) -> None:
 
     c = math.cos(yaw)
     s = math.sin(yaw)
-    transform[0][0:3] = [_round6(c), 0.0, _round6(s)]
+    if coordinate_space == "roomplan":
+        transform[0][0:3] = [_round6(c), 0.0, _round6(s)]
+        transform[1][0:3] = [0.0, 1.0, 0.0]
+        transform[2][0:3] = [_round6(-s), 0.0, _round6(c)]
+        item["transform"] = transform
+        return
+
+    transform[0][0:3] = [_round6(c), 0.0, _round6(-s)]
     transform[1][0:3] = [0.0, 1.0, 0.0]
-    transform[2][0:3] = [_round6(-s), 0.0, _round6(c)]
+    transform[2][0:3] = [_round6(s), 0.0, _round6(c)]
     item["transform"] = transform
 
 
@@ -117,7 +134,31 @@ def _rounded(vector: list[float]) -> list[float]:
     return [_round6(value) for value in vector]
 
 
-def _sync_vectors_from_transform(item: dict) -> None:
+def _rounded_transform(transform: list[list[float]]) -> list[list[float]]:
+    rounded = []
+    for row in transform:
+        rounded.append([_round6(value) if isinstance(value, (int, float)) else value for value in row])
+    return rounded
+
+
+def _translation_norm(values: list[float]) -> float:
+    return math.sqrt(sum(float(value) * float(value) for value in values))
+
+
+def _normalize_incoming_transform(transform: list[list[float]], coordinate_space: str) -> list[list[float]]:
+    rounded = _rounded_transform(transform)
+    if coordinate_space != "roomplan":
+        return rounded
+
+    row_translation = rounded[3][0:3]
+    column_translation = [rounded[0][3], rounded[1][3], rounded[2][3]]
+    if _translation_norm(row_translation) < 1e-6 and _translation_norm(column_translation) > 1e-6:
+        rounded = [[rounded[col][row] for col in range(4)] for row in range(4)]
+
+    return rounded
+
+
+def _sync_vectors_from_transform(item: dict, coordinate_space: str) -> None:
     transform = item.get("transform")
     if not isinstance(transform, list) or len(transform) < 4:
         return
@@ -132,7 +173,10 @@ def _sync_vectors_from_transform(item: dict) -> None:
     item["upVector"] = _rounded(up)
     item["backVector"] = _rounded(back)
     item["frontVector"] = _neg(back)
-    item["rotation"] = _rotation_from_transform(transform)
+    if coordinate_space == "roomplan":
+        item["rotation"] = _roomplan_rotation_from_transform(transform)
+    else:
+        item["rotation"] = _unity_rotation_from_transform(transform)
 
 
 def _sync_obb_vertices(item: dict) -> None:
@@ -166,7 +210,7 @@ def _sync_obb_vertices(item: dict) -> None:
     item["obbVertices"] = vertices
 
 
-def _apply_pose_update(target: dict, update: dict) -> None:
+def _apply_pose_update(target: dict, update: dict, coordinate_space: str) -> None:
     preserved_y = _center_y(target)
     preserved_rotation = target.get("rotation")
     preserved_yaw = (
@@ -183,13 +227,18 @@ def _apply_pose_update(target: dict, update: dict) -> None:
 
     if "transform" in update:
         transform = update["transform"]
-        if not isinstance(transform, list) or len(transform) < 4 or len(transform[3]) < 3:
+        if (
+            not isinstance(transform, list)
+            or len(transform) < 4
+            or any(not isinstance(row, list) or len(row) < 4 for row in transform[:4])
+        ):
             raise HTTPException(status_code=400, detail="transform은 4x4 행렬 형식이어야 합니다.")
+        target["transform"] = _normalize_incoming_transform(transform, coordinate_space)
         if "center" not in update:
             target["center"] = [
-                _round6(transform[3][0]),
+                _round6(target["transform"][3][0]),
                 _round6(preserved_y),
-                _round6(transform[3][2]),
+                _round6(target["transform"][3][2]),
             ]
 
     if "rotation" in update:
@@ -198,16 +247,16 @@ def _apply_pose_update(target: dict, update: dict) -> None:
             raise HTTPException(status_code=400, detail="rotation은 배열 형식이어야 합니다.")
         yaw = _yaw_from_rotation(rotation)
         target["rotation"] = [0.0, _round6(yaw), 0.0]
-        _apply_yaw_to_transform(target, yaw)
+        _apply_yaw_to_transform(target, yaw, coordinate_space)
 
     if "transform" in update or "center" in update or "rotation" in update:
         transform = target.get("transform")
         if isinstance(transform, list) and len(transform) >= 4:
             transform[3][0:3] = target["center"]
-        if "rotation" not in update and preserved_yaw is not None:
+        if "rotation" not in update and "transform" not in update and preserved_yaw is not None:
             target["rotation"] = [0.0, _round6(preserved_yaw), 0.0]
-            _apply_yaw_to_transform(target, preserved_yaw)
-        _sync_vectors_from_transform(target)
+            _apply_yaw_to_transform(target, preserved_yaw, coordinate_space)
+        _sync_vectors_from_transform(target, coordinate_space)
         _sync_obb_vertices(target)
 
 
@@ -238,7 +287,7 @@ async def _load_json_from_s3_uri(uri: str | None, label: str) -> dict:
     return await get_json(key)
 
 
-def _patch_objects(base_layout: dict, updates: list[dict], label: str) -> dict:
+def _patch_objects(base_layout: dict, updates: list[dict], label: str, coordinate_space: str) -> dict:
     if not updates:
         raise HTTPException(status_code=400, detail=f"{label} 수정 object 목록이 비어 있습니다.")
 
@@ -264,7 +313,7 @@ def _patch_objects(base_layout: dict, updates: list[dict], label: str) -> dict:
                 detail=f"{label} JSON에서 identifier={identifier} object를 찾을 수 없습니다.",
             )
 
-        _apply_pose_update(target, update)
+        _apply_pose_update(target, update, coordinate_space)
 
     return base_layout
 
@@ -347,16 +396,16 @@ async def create_user_edited_version(
 
         if payload.ios_objects is not None:
             ios_layout = normalize_roomplan_for_ios_view(
-                _patch_objects(ios_layout, payload.ios_objects, "iOS")
+                _patch_objects(ios_layout, payload.ios_objects, "iOS", "roomplan")
             )
             if payload.objects:
                 unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
-                unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
+                unity_layout = _patch_objects(unity_layout, payload.objects, "Unity", "unity")
             else:
                 unity_layout = normalize_roomplan_for_unity(ios_layout)
         else:
             unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
-            unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
+            unity_layout = _patch_objects(unity_layout, payload.objects, "Unity", "unity")
             ios_layout = denormalize_roomplan_from_unity(unity_layout)
             ios_layout = normalize_roomplan_for_ios_view(ios_layout)
 
