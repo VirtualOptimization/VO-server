@@ -38,8 +38,8 @@ def _round6(value: float) -> float:
 
 
 def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
-    # Unity's Y rotation points the model's +Z forward. RoomPlan transform row 2 is the back axis.
-    yaw = math.atan2(-float(transform[2][0]), -float(transform[2][2]))
+    # Catalog GLB furniture faces local -Z in Unity, while RoomPlan transform row 2 is the back axis.
+    yaw = math.atan2(float(transform[2][0]), float(transform[2][2]))
     return [0.0, _round6(yaw), 0.0]
 
 
@@ -66,7 +66,7 @@ def _apply_yaw_to_transform(item: dict, yaw: float) -> None:
     s = math.sin(yaw)
     transform[0][0:3] = [_round6(c), 0.0, _round6(-s)]
     transform[1][0:3] = [0.0, 1.0, 0.0]
-    transform[2][0:3] = [_round6(-s), 0.0, _round6(-c)]
+    transform[2][0:3] = [_round6(s), 0.0, _round6(c)]
     item["transform"] = transform
 
 

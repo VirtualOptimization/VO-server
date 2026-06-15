@@ -78,8 +78,8 @@ def _attach_model_keys(room_data: dict[str, Any]) -> None:
 
 
 def _unity_rotation_from_transform(transform: list[list[float]]) -> list[float]:
-    # Unity's Y rotation points the model's +Z forward. RoomPlan transform row 2 is the back axis.
-    yaw = math.atan2(-float(transform[2][0]), -float(transform[2][2]))
+    # Catalog GLB furniture faces local -Z in Unity, while RoomPlan transform row 2 is the back axis.
+    yaw = math.atan2(float(transform[2][0]), float(transform[2][2]))
     return [0.0, _round6(yaw), 0.0]
 
 
