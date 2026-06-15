@@ -77,7 +77,13 @@ def _attach_model_keys(room_data: dict[str, Any]) -> None:
             obj["model_key"] = model_key
 
 
-def _rotation_from_transform(transform: list[list[float]]) -> list[float]:
+def _unity_rotation_from_transform(transform: list[list[float]]) -> list[float]:
+    # Unity's Y rotation points the model's +Z forward. RoomPlan transform row 2 is the back axis.
+    yaw = math.atan2(-float(transform[2][0]), -float(transform[2][2]))
+    return [0.0, _round6(yaw), 0.0]
+
+
+def _roomplan_rotation_from_transform(transform: list[list[float]]) -> list[float]:
     yaw = math.atan2(float(transform[0][2]), float(transform[0][0]))
     return [0.0, _round6(yaw), 0.0]
 
@@ -101,7 +107,7 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
                         item["transform"][row][1] = vector[1]
                         item["transform"][row][2] = vector[2]
                 item["transform"][3][0:3] = item["center"]
-                item["rotation"] = _rotation_from_transform(item["transform"])
+                item["rotation"] = _unity_rotation_from_transform(item["transform"])
             if item.get("obbVertices"):
                 item["obbVertices"] = [
                     _normalize_point(vertex, floor_theta, floor_y, min_x, min_z)
@@ -170,7 +176,7 @@ def denormalize_roomplan_from_unity(room_data: dict[str, Any]) -> dict[str, Any]
                         item["transform"][row][1] = vector[1]
                         item["transform"][row][2] = vector[2]
                 item["transform"][3][0:3] = item["center"]
-                item["rotation"] = _rotation_from_transform(item["transform"])
+                item["rotation"] = _roomplan_rotation_from_transform(item["transform"])
             if item.get("obbVertices"):
                 item["obbVertices"] = [
                     _denormalize_point(vertex, floor_theta, floor_y, min_x, min_z)
