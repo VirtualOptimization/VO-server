@@ -25,7 +25,7 @@ def _inverse_rotate_xz(rx: float, rz: float, angle: float) -> tuple[float, float
     return (rx * c - rz * s), (rx * s + rz * c)
 
 
-def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, float, float, float]:
+def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, float, float, float, float, float]:
     floors = room_data.get("floors", [])
     if not floors:
         raise ValueError("RoomPlan payload must include at least one floor.")
@@ -41,16 +41,19 @@ def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, floa
         dimensions = floor_item["dimensions"]
         transform = floor_item["transform"]
         axis_x = np.array([transform[0][0], transform[0][2]], dtype=float)
-        axis_z = np.array([transform[2][0], transform[2][2]], dtype=float)
+        floor_depth_axis = 1 if len(dimensions) == 2 else 2
+        axis_z = np.array([transform[floor_depth_axis][0], transform[floor_depth_axis][2]], dtype=float)
         center_xz = np.array([center[0], center[2]], dtype=float)
         for sx in (-1.0, 1.0):
             for sz in (-1.0, 1.0):
-                point = center_xz + axis_x * float(dimensions[0]) * 0.5 * sx + axis_z * float(dimensions[1]) * 0.5 * sz
+                depth = float(dimensions[1] if len(dimensions) == 2 else dimensions[2])
+                point = center_xz + axis_x * float(dimensions[0]) * 0.5 * sx + axis_z * depth * 0.5 * sz
                 points.append(_rotate_xz(float(point[0]), float(point[1]), floor_theta))
 
     arr = np.array(points, dtype=float)
     min_x, min_z = np.min(arr, axis=0)
-    return floor_theta, floor_y, float(min_x), float(min_z)
+    max_x, max_z = np.max(arr, axis=0)
+    return floor_theta, floor_y, float(min_x), float(min_z), float(max_x - min_x), float(max_z - min_z)
 
 
 def _normalize_point(point: list[float], floor_theta: float, floor_y: float, min_x: float, min_z: float) -> list[float]:
@@ -77,6 +80,38 @@ def _attach_model_keys(room_data: dict[str, Any]) -> None:
             obj["model_key"] = model_key
 
 
+def _rotate_point_180_in_room(point: list[float], room_width: float, room_depth: float) -> list[float]:
+    return [_round6(room_width - float(point[0])), _round6(float(point[1])), _round6(room_depth - float(point[2]))]
+
+
+def _rotate_vector_180(vector: list[float]) -> list[float]:
+    return [_round6(-float(vector[0])), _round6(float(vector[1])), _round6(-float(vector[2]))]
+
+
+def _rotate_object_layer_180(item: dict[str, Any], room_width: float, room_depth: float) -> None:
+    if item.get("center"):
+        item["center"] = _rotate_point_180_in_room(item["center"], room_width, room_depth)
+
+    if item.get("transform") and len(item["transform"]) >= 4:
+        for row in range(3):
+            if item["transform"][row] and len(item["transform"][row]) >= 3:
+                vector = _rotate_vector_180(item["transform"][row])
+                item["transform"][row][0] = vector[0]
+                item["transform"][row][1] = vector[1]
+                item["transform"][row][2] = vector[2]
+        item["transform"][3][0:3] = item["center"]
+
+    if item.get("obbVertices"):
+        item["obbVertices"] = [
+            _rotate_point_180_in_room(vertex, room_width, room_depth)
+            for vertex in item["obbVertices"]
+        ]
+
+    for key in ("frontVector", "backVector", "leftVector", "rightVector", "upVector"):
+        if item.get(key):
+            item[key] = _rotate_vector_180(item[key])
+
+
 def _unity_rotation_from_transform(transform: list[list[float]]) -> list[float]:
     # Catalog GLB furniture faces local -Z in Unity, while RoomPlan transform row 2 is the back axis.
     yaw = math.atan2(float(transform[2][0]), float(transform[2][2]))
@@ -90,7 +125,7 @@ def _roomplan_rotation_from_transform(transform: list[list[float]]) -> list[floa
 
 def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
     """Return a RoomPlan-like payload aligned to a Unity-friendly +X/+Z floor frame."""
-    floor_theta, floor_y, min_x, min_z = _floor_normalization_context(room_data)
+    floor_theta, floor_y, min_x, min_z, room_width, room_depth = _floor_normalization_context(room_data)
     normalized = json.loads(json.dumps(room_data))
     normalized["coordinateSystem"] = "Unity normalized RoomPlan (Y-up, meters, floor aligned to +X/+Z)"
     _attach_model_keys(normalized)
@@ -117,11 +152,19 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
                 if item.get(key):
                     item[key] = _normalize_vector(item[key], floor_theta)
 
+    for item in normalized.get("objects", []):
+        _rotate_object_layer_180(item, room_width, room_depth)
+        if item.get("transform") and len(item["transform"]) >= 4:
+            item["rotation"] = _unity_rotation_from_transform(item["transform"])
+
     normalized["unityNormalization"] = {
         "floorThetaRadians": _round6(floor_theta),
         "floorY": _round6(floor_y),
         "minX": _round6(min_x),
         "minZ": _round6(min_z),
+        "roomWidth": _round6(room_width),
+        "roomDepth": _round6(room_depth),
+        "objectLayerRotationRadians": _round6(math.pi),
     }
     return normalized
 
@@ -159,10 +202,17 @@ def denormalize_roomplan_from_unity(room_data: dict[str, Any]) -> dict[str, Any]
     floor_y = float(context["floorY"])
     min_x = float(context["minX"])
     min_z = float(context["minZ"])
+    room_width = context.get("roomWidth")
+    room_depth = context.get("roomDepth")
+    object_layer_rotation = float(context.get("objectLayerRotationRadians", 0.0))
 
     denormalized = json.loads(json.dumps(room_data))
     denormalized["coordinateSystem"] = "RoomPlan"
     denormalized.pop("unityNormalization", None)
+
+    if room_width is not None and room_depth is not None and abs(object_layer_rotation - math.pi) < 1e-5:
+        for item in denormalized.get("objects", []):
+            _rotate_object_layer_180(item, float(room_width), float(room_depth))
 
     for collection_name in ("floors", "walls", "doors", "windows", "objects"):
         for item in denormalized.get(collection_name, []):
