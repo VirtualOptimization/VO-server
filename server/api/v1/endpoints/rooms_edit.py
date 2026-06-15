@@ -145,6 +145,25 @@ def _translation_norm(values: list[float]) -> float:
     return math.sqrt(sum(float(value) * float(value) for value in values))
 
 
+def _normalized_xz_axis(vector: list[float]) -> list[float] | None:
+    length = math.sqrt(float(vector[0]) * float(vector[0]) + float(vector[2]) * float(vector[2]))
+    if length < 1e-6:
+        return None
+    return [_round6(float(vector[0]) / length), 0.0, _round6(float(vector[2]) / length)]
+
+
+def _canonicalize_roomplan_transform(transform: list[list[float]]) -> list[list[float]]:
+    back = _normalized_xz_axis(transform[2])
+    if back is None:
+        return transform
+
+    right = [back[2], 0.0, _round6(-back[0])]
+    transform[0][0:3] = right
+    transform[1][0:3] = [0.0, 1.0, 0.0]
+    transform[2][0:3] = back
+    return transform
+
+
 def _normalize_incoming_transform(transform: list[list[float]], coordinate_space: str) -> list[list[float]]:
     rounded = _rounded_transform(transform)
     if coordinate_space != "roomplan":
@@ -155,7 +174,7 @@ def _normalize_incoming_transform(transform: list[list[float]], coordinate_space
     if _translation_norm(row_translation) < 1e-6 and _translation_norm(column_translation) > 1e-6:
         rounded = [[rounded[col][row] for col in range(4)] for row in range(4)]
 
-    return rounded
+    return _canonicalize_roomplan_transform(rounded)
 
 
 def _sync_vectors_from_transform(item: dict, coordinate_space: str) -> None:
@@ -241,7 +260,7 @@ def _apply_pose_update(target: dict, update: dict, coordinate_space: str) -> Non
                 _round6(target["transform"][3][2]),
             ]
 
-    if "rotation" in update:
+    if "rotation" in update and "transform" not in update:
         rotation = update["rotation"]
         if not isinstance(rotation, list):
             raise HTTPException(status_code=400, detail="rotation은 배열 형식이어야 합니다.")
