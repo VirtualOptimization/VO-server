@@ -14,6 +14,7 @@ from server.schemas.room_view import (
 )
 from server.services.transform.unity_roomplan import (
     denormalize_roomplan_from_unity,
+    fix_unity_transforms_from_rotation,
     normalize_roomplan_for_ios_view,
     normalize_roomplan_for_unity,
 )
@@ -420,11 +421,14 @@ async def create_user_edited_version(
             if payload.objects:
                 unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
                 unity_layout = _patch_objects(unity_layout, payload.objects, "Unity", "unity")
+                unity_layout = fix_unity_transforms_from_rotation(unity_layout)
             else:
                 unity_layout = normalize_roomplan_for_unity(ios_layout)
+                unity_layout = fix_unity_transforms_from_rotation(unity_layout)
         else:
             unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
             unity_layout = _patch_objects(unity_layout, payload.objects, "Unity", "unity")
+            unity_layout = fix_unity_transforms_from_rotation(unity_layout)
             ios_layout = denormalize_roomplan_from_unity(unity_layout)
             ios_layout = normalize_roomplan_for_ios_view(ios_layout)
 
