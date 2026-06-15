@@ -25,13 +25,14 @@ def _normalize_2d(vector: list[float]) -> np.ndarray:
     return arr / norm
 
 
-def _classify_chair_relationship(chair: dict[str, Any], desk: dict[str, Any]) -> dict[str, Any]:
+def _classify_chair_relationship(chair: dict[str, Any], support: dict[str, Any]) -> dict[str, Any]:
     chair_pos = np.array(chair["pos"][:2], dtype=float)
-    desk_pos = np.array(desk["pos"][:2], dtype=float)
-    offset = chair_pos - desk_pos
+    support_pos = np.array(support["pos"][:2], dtype=float)
+    offset = chair_pos - support_pos
     distance = float(np.linalg.norm(offset))
 
-    desk_front = _normalize_2d(desk.get("front_vector_2d", [0.0, -1.0]))
+    support_front = _normalize_2d(support.get("front_vector_2d", [0.0, -1.0]))
+    support_lateral = np.array([-support_front[1], support_front[0]], dtype=float)
     chair_front = _normalize_2d(chair.get("front_vector_2d", [0.0, 1.0]))
 
     if distance < 1e-8:
@@ -39,10 +40,16 @@ def _classify_chair_relationship(chair: dict[str, Any], desk: dict[str, Any]) ->
     else:
         direction_to_chair = offset / distance
 
-    front_projection = float(np.dot(direction_to_chair, desk_front))
-    facing_alignment = float(np.dot(chair_front, -desk_front))
+    front_projection = float(np.dot(direction_to_chair, support_front))
+    facing_alignment = float(np.dot(chair_front, -support_front))
 
-    if distance <= 1.2 and front_projection > 0.25 and facing_alignment > 0.1:
+    local_front = float(np.dot(offset, support_front))
+    local_lateral = float(np.dot(offset, support_lateral))
+    rotation_delta_deg = float(chair.get("rotation_y_deg", 0.0)) - float(support.get("rotation_y_deg", 0.0))
+
+    if support["type"] == "table" and distance <= 1.6:
+        strength = "primary"
+    elif distance <= 1.2 and facing_alignment > 0.1:
         strength = "primary"
     elif distance <= 2.2:
         strength = "weak"
@@ -50,10 +57,15 @@ def _classify_chair_relationship(chair: dict[str, Any], desk: dict[str, Any]) ->
         strength = "free"
 
     return {
-        "nearest_desk_id": desk["id"],
+        "nearest_support_id": support["id"],
+        "nearest_support_type": support["type"],
+        "nearest_desk_id": support["id"],
+        "distance_to_nearest_support": round(distance, 3),
         "distance_to_nearest_desk": round(distance, 3),
         "front_projection": round(front_projection, 3),
         "facing_alignment": round(facing_alignment, 3),
+        "local_offset": [round(local_front, 3), round(local_lateral, 3)],
+        "rotation_delta_deg": round(rotation_delta_deg, 3),
         "strength": strength,
     }
 
@@ -75,6 +87,14 @@ def _placement_rules(item_type: str) -> dict[str, Any]:
             "side_clearance": 0.6,
             "back_near_wall_preferred": True,
             "window_block_soft_penalty": True,
+        },
+        "table": {
+            **common,
+            "front_clearance": 0.75,
+            "side_clearance": 0.6,
+            "back_near_wall_preferred": True,
+            "window_block_soft_penalty": True,
+            "chair_group_preferred": True,
         },
         "chair": {
             **common,
@@ -105,7 +125,7 @@ def build_layout_problem(normalized_scan: dict[str, Any]) -> dict[str, Any]:
     fixed_elements = _copy(normalized_scan.get("fixed_elements", []))
     room_metadata = _copy(normalized_scan["room_metadata"])
 
-    desks = [obj for obj in scanned_objects if obj["type"] == "desk"]
+    chair_supports = [obj for obj in scanned_objects if obj["type"] in {"desk", "table"}]
     chairs = [obj for obj in scanned_objects if obj["type"] == "chair"]
 
     movable_items: list[dict[str, Any]] = []
@@ -117,17 +137,17 @@ def build_layout_problem(normalized_scan: dict[str, Any]) -> dict[str, Any]:
         item["source"] = "scan"
         movable_items.append(item)
 
-    desk_positions = {desk["id"]: desk["pos"] for desk in desks}
-    desk_by_id = {desk["id"]: desk for desk in desks}
+    support_positions = {support["id"]: support["pos"] for support in chair_supports}
+    support_by_id = {support["id"]: support for support in chair_supports}
     for item in movable_items:
-        if item["type"] != "chair" or not desk_positions:
+        if item["type"] != "chair" or not support_positions:
             continue
-        nearest_desk_id = min(
-            desk_positions,
-            key=lambda desk_id: _distance(item["pos"], desk_positions[desk_id]),
+        nearest_support_id = min(
+            support_positions,
+            key=lambda support_id: _distance(item["pos"], support_positions[support_id]),
         )
-        item["pair_with"] = nearest_desk_id
-        item["relationship"] = _classify_chair_relationship(item, desk_by_id[nearest_desk_id])
+        item["pair_with"] = nearest_support_id
+        item["relationship"] = _classify_chair_relationship(item, support_by_id[nearest_support_id])
 
     constraints = {
         "min_walkway": 0.425,

@@ -27,7 +27,7 @@ FURNITURE_TYPE_MAP = {
     "Chair": "chair",
     "Sofa": "sofa",
     "Storage": "shelf",
-    "Table": "desk",
+    "Table": "table",
 }
 
 
