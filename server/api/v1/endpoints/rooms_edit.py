@@ -348,24 +348,16 @@ async def create_user_edited_version(
             .filter(Version.room_id == room.id)
             .scalar()
         )
-        if not payload.objects and not payload.ios_objects:
-            raise HTTPException(status_code=400, detail="objects 또는 ios_objects 중 하나는 필요합니다.")
-
-        version_name = payload.version_name or f"User Edit {next_version_no}"
+        version_name = payload.version_name or f"Unity Edit {next_version_no}"
+        unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
         ios_layout = await _load_json_from_s3_uri(parent_version.s3_json_url, "iOS")
 
+        unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
         if payload.ios_objects is not None:
             ios_layout = normalize_roomplan_for_ios_view(
                 _patch_objects(ios_layout, payload.ios_objects, "iOS")
             )
-            if payload.objects:
-                unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
-                unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
-            else:
-                unity_layout = normalize_roomplan_for_unity(ios_layout)
         else:
-            unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
-            unity_layout = _patch_objects(unity_layout, payload.objects, "Unity")
             ios_layout = denormalize_roomplan_from_unity(unity_layout)
             ios_layout = normalize_roomplan_for_ios_view(ios_layout)
 

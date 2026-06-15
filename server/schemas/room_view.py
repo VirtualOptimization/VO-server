@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class RoomSummaryResponse(BaseModel):
@@ -76,7 +76,7 @@ class UserEditedVersionCreateRequest(BaseModel):
     parent_version_id: int
     version_name: str | None = None
     json_data: dict[str, Any] | None = None
-    objects: list[dict[str, Any]] = Field(default_factory=list)
+    objects: list[dict[str, Any]]
     ios_objects: list[dict[str, Any]] | None = None
 
 
