@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -11,19 +12,25 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from server.core.config import settings
-from server.core.security import hash_secret, verify_secret
+from server.core.security import decode_access_token, hash_secret, verify_secret
 from server.schemas.auth import SignupRequest
 from shared.models.email_verification_code import EmailVerificationCode
+from shared.models.refresh_token import RefreshToken
 from shared.models.user import User
 
 logger = logging.getLogger(__name__)
 
 EMAIL_CODE_EXPIRE_SECONDS = 10 * 60
+REFRESH_TOKEN_EXPIRE_DAYS = 30
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def normalize_email(email: str) -> str:
@@ -141,3 +148,63 @@ def create_user_after_email_verification(db: Session, request: SignupRequest) ->
 
 def should_return_debug_code() -> bool:
     return settings.env == "local"
+
+
+def authenticate_user(db: Session, login_id: str, password: str) -> User:
+    user = db.query(User).filter(User.login_id == login_id.strip()).first()
+    if user is None or not verify_secret(password, user.password_hash):
+        raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 일치하지 않습니다.")
+    return user
+
+
+def create_refresh_token(db: Session, user: User) -> str:
+    token = secrets.token_urlsafe(48)
+    refresh_token = RefreshToken(
+        user_id=user.id,
+        token_hash=_hash_refresh_token(token),
+        expires_at=_now() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    db.add(refresh_token)
+    db.commit()
+    return token
+
+
+def get_user_by_refresh_token(db: Session, token: str) -> User:
+    refresh_token = (
+        db.query(RefreshToken)
+        .filter(RefreshToken.token_hash == _hash_refresh_token(token))
+        .first()
+    )
+    if refresh_token is None:
+        raise HTTPException(status_code=401, detail="유효하지 않은 refresh token입니다.")
+    if refresh_token.revoked_at is not None:
+        raise HTTPException(status_code=401, detail="폐기된 refresh token입니다.")
+    if refresh_token.expires_at < _now():
+        raise HTTPException(status_code=401, detail="만료된 refresh token입니다.")
+
+    return refresh_token.user
+
+
+def revoke_refresh_token(db: Session, token: str) -> None:
+    refresh_token = (
+        db.query(RefreshToken)
+        .filter(RefreshToken.token_hash == _hash_refresh_token(token))
+        .first()
+    )
+    if refresh_token is None:
+        raise HTTPException(status_code=401, detail="유효하지 않은 refresh token입니다.")
+
+    refresh_token.revoked_at = _now()
+    db.commit()
+
+
+def get_user_by_access_token(db: Session, token: str) -> User:
+    payload = decode_access_token(token)
+    subject = payload.get("sub")
+    if not isinstance(subject, str) or not subject.isdigit():
+        raise HTTPException(status_code=401, detail="유효하지 않은 인증 토큰입니다.")
+
+    user = db.get(User, int(subject))
+    if user is None:
+        raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
+    return user

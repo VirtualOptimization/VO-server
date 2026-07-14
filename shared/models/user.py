@@ -31,3 +31,8 @@ class User(Base):
     rooms: Mapped[list["Room"]] = relationship(back_populates="user")
     furniture_models: Mapped[list["FurnitureModel"]] = relationship(back_populates="user")
     email_verification_codes: Mapped[list["EmailVerificationCode"]] = relationship(back_populates="user")
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )

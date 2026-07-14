@@ -38,3 +38,40 @@ class SignupResponse(BaseModel):
     email: str
     nickname: str
     is_email_verified: bool
+
+
+class LoginRequest(BaseModel):
+    login_id: str = Field(..., min_length=1, max_length=100)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class AuthUserResponse(BaseModel):
+    user_id: int
+    login_id: str
+    email: str
+    nickname: str
+    is_email_verified: bool
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user: AuthUserResponse
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=32, max_length=512)
+
+
+class RefreshTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=32, max_length=512)
+
+
+class LogoutResponse(BaseModel):
+    message: str

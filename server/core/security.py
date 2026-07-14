@@ -5,12 +5,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import secrets
+from datetime import datetime, timedelta, timezone
+
+from fastapi import HTTPException
+
+from server.core.config import settings
 
 
 _HASH_NAME = "sha256"
 _ITERATIONS = 260_000
 _SALT_BYTES = 16
+_JWT_ALLOWED_ALGORITHMS = {"HS256": hashlib.sha256}
 
 
 def hash_secret(value: str) -> str:
@@ -40,3 +47,72 @@ def verify_secret(value: str, hashed_value: str) -> bool:
         return False
 
     return hmac.compare_digest(actual_digest, expected_digest)
+
+
+def _base64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _base64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _jwt_secret_key() -> str:
+    if not settings.jwt_secret_key:
+        raise RuntimeError("JWT_SECRET_KEY is not configured")
+    return settings.jwt_secret_key
+
+
+def create_access_token(subject: str) -> str:
+    """Create a signed HS256 JWT access token."""
+    algorithm = settings.jwt_algorithm
+    digestmod = _JWT_ALLOWED_ALGORITHMS.get(algorithm)
+    if digestmod is None:
+        raise RuntimeError(f"Unsupported JWT algorithm: {algorithm}")
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=settings.access_token_expire_minutes)
+    header = {"alg": algorithm, "typ": "JWT"}
+    payload = {
+        "sub": subject,
+        "iat": int(now.timestamp()),
+        "exp": int(expires_at.timestamp()),
+    }
+
+    encoded_header = _base64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    encoded_payload = _base64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
+    signature = hmac.new(_jwt_secret_key().encode("utf-8"), signing_input, digestmod).digest()
+    return f"{encoded_header}.{encoded_payload}.{_base64url_encode(signature)}"
+
+
+def decode_access_token(token: str) -> dict:
+    """Verify a JWT access token and return its payload."""
+    try:
+        encoded_header, encoded_payload, encoded_signature = token.split(".", 2)
+        header = json.loads(_base64url_decode(encoded_header))
+        payload = json.loads(_base64url_decode(encoded_payload))
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(status_code=401, detail="유효하지 않은 인증 토큰입니다.")
+
+    algorithm = header.get("alg")
+    digestmod = _JWT_ALLOWED_ALGORITHMS.get(algorithm)
+    if digestmod is None or algorithm != settings.jwt_algorithm:
+        raise HTTPException(status_code=401, detail="지원하지 않는 인증 토큰입니다.")
+
+    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
+    expected_signature = hmac.new(_jwt_secret_key().encode("utf-8"), signing_input, digestmod).digest()
+    try:
+        actual_signature = _base64url_decode(encoded_signature)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="유효하지 않은 인증 토큰입니다.")
+
+    if not hmac.compare_digest(actual_signature, expected_signature):
+        raise HTTPException(status_code=401, detail="유효하지 않은 인증 토큰입니다.")
+
+    expires_at = payload.get("exp")
+    if not isinstance(expires_at, int) or expires_at < int(datetime.now(timezone.utc).timestamp()):
+        raise HTTPException(status_code=401, detail="인증 토큰이 만료되었습니다.")
+
+    return payload

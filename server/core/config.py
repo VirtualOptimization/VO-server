@@ -21,6 +21,12 @@ class Settings(BaseSettings):
         default="",
         validation_alias="STEP_FUNCTIONS_STATE_MACHINE_ARN",
     )
+    jwt_secret_key: str = Field(default="", validation_alias="JWT_SECRET_KEY")
+    jwt_algorithm: str = Field(default="HS256", validation_alias="JWT_ALGORITHM")
+    access_token_expire_minutes: int = Field(
+        default=10080,
+        validation_alias="ACCESS_TOKEN_EXPIRE_MINUTES",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env" if os.getenv("ENV", "local") == "local" else None,
