@@ -34,7 +34,6 @@ class RoomVersionsResponse(BaseModel):
 class FurnitureItemView(BaseModel):
     item_key: str
     model_key: str | None = None
-    usdc_url: str | None = None
     glb_url: str | None = None
     pos: list[float]
     rot: list[float]
@@ -45,7 +44,6 @@ class FurnitureCatalogItemResponse(BaseModel):
     model_key: str
     name: str | None = None
     furniture_type: str | None = None
-    usdc_url: str | None = None
     glb_url: str | None = None
     width: float
     depth: float

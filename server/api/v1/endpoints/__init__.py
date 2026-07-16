@@ -1,1 +1,1 @@
-from . import auth, optimizer_preview, scan, rooms, rooms_edit
+from . import auth, furniture, scan, rooms, rooms_edit
