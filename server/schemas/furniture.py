@@ -19,6 +19,9 @@ class FurnitureModelResponse(BaseModel):
     name: str | None
     status: str
     glb_url: str | None
+    upload_url: str | None = None
+    upload_content_type: str | None = None
+    upload_s3_key: str | None = None
     width: float
     depth: float
     height: float

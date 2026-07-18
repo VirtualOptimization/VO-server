@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import joinedload
 
+from server.api.v1.deps import get_current_user
 from server.api.v1.endpoints.rooms_common import _get_catalog_model_urls, _resolve_prefixes
 from server.core.s3 import generate_presigned_url, generate_presigned_url_for_uri, head_object
 from server.schemas.room_view import (
     FurnitureCatalogItemResponse,
     FurnitureCatalogResponse,
+    MyRoomListItem,
+    MyRoomListResponse,
     RoomSummaryResponse,
     RoomVersionItem,
+    RoomVersionStateSummary,
     RoomVersionsResponse,
     VersionDetailResponse,
 )
@@ -20,6 +24,7 @@ from server.schemas.scan import VersionAssetsResponse
 from shared.db import SessionLocal
 from shared.models.furniture_model import FurnitureModel
 from shared.models.room import Room
+from shared.models.user import User
 from shared.models.version import Version
 
 logger = logging.getLogger(__name__)
@@ -61,6 +66,49 @@ def _to_version_detail_response(version: Version) -> VersionDetailResponse:
         json_data=version.json_data,
     )
 
+
+def _version_state_summary(confirm_code: str, versions: list[Version]) -> RoomVersionStateSummary:
+    version_types = {version.version_type for version in versions}
+    user_edited_count = sum(1 for version in versions if version.version_type == "USER_EDITED")
+    return RoomVersionStateSummary(
+        confirm_code=confirm_code,
+        has_original="ORIGINAL" in version_types,
+        has_optimized="OPTIMIZED" in version_types,
+        user_edited_count=user_edited_count,
+    )
+
+
+# ── GET /rooms  (로그인 사용자 공간 목록) ─────────────────────────────────────
+
+@router.get("", response_model=MyRoomListResponse)
+def get_my_rooms(current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        rooms = (
+            db.query(Room)
+            .options(joinedload(Room.versions))
+            .filter(Room.user_id == current_user.id)
+            .order_by(Room.updated_at.desc(), Room.created_at.desc(), Room.id.desc())
+            .all()
+        )
+
+        items: list[MyRoomListItem] = []
+        for room in rooms:
+            summary = _version_state_summary(room.confirm_code, room.versions)
+            items.append(
+                MyRoomListItem(
+                    room_id=room.id,
+                    confirm_code=room.confirm_code,
+                    created_at=room.created_at,
+                    has_original=summary.has_original,
+                    has_optimized=summary.has_optimized,
+                    user_edited_count=summary.user_edited_count,
+                )
+            )
+
+        return MyRoomListResponse(rooms=items)
+    finally:
+        db.close()
 
 # ── GET /rooms/{confirm_code}/versions/{version_id} ──────────────────────────
 

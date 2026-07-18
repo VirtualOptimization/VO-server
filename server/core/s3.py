@@ -1,17 +1,23 @@
 import asyncio
 import json
+from functools import lru_cache
 
-import boto3
 from botocore.exceptions import ClientError
 
 from server.core.config import settings
 
-s3_client = boto3.client(
-    "s3",
-    region_name=settings.aws_region,
-    aws_access_key_id=settings.aws_access_key_id,
-    aws_secret_access_key=settings.aws_secret_access_key,
-)
+
+@lru_cache(maxsize=1)
+def get_s3_client():
+    import boto3
+
+    client_kwargs = {"region_name": settings.aws_region}
+    if settings.aws_access_key_id and settings.aws_secret_access_key:
+        client_kwargs.update(
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+        )
+    return boto3.client("s3", **client_kwargs)
 
 
 def build_s3_uri(key: str) -> str:
@@ -43,7 +49,7 @@ def generate_presigned_url_for_uri(uri: str | None, expires_in: int = 3600) -> s
         return uri
 
     bucket, key = parsed
-    return s3_client.generate_presigned_url(
+    return get_s3_client().generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=expires_in,
@@ -58,7 +64,7 @@ async def upload_json(key: str, data: dict) -> str:
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
 
     await asyncio.to_thread(
-        s3_client.put_object,
+        get_s3_client().put_object,
         Bucket=settings.s3_bucket_name,
         Key=key,
         Body=body,
@@ -74,7 +80,7 @@ async def upload_bytes(key: str, data: bytes, content_type: str = "application/o
         raise ValueError("S3_BUCKET_NAME is not configured")
 
     await asyncio.to_thread(
-        s3_client.put_object,
+        get_s3_client().put_object,
         Bucket=settings.s3_bucket_name,
         Key=key,
         Body=data,
@@ -88,12 +94,12 @@ async def head_object(key: str) -> dict | None:
     """S3 객체 메타데이터를 반환한다. 없으면 None."""
     try:
         response = await asyncio.to_thread(
-            s3_client.head_object,
+            get_s3_client().head_object,
             Bucket=settings.s3_bucket_name,
             Key=key,
         )
         return response
-    except s3_client.exceptions.ClientError:
+    except ClientError:
         return None
     except Exception:
         return None
@@ -103,7 +109,7 @@ def delete_objects(keys: list[str]) -> None:
     """S3 객체 여러 개를 한 번에 삭제한다."""
     if not keys:
         return
-    s3_client.delete_objects(
+    get_s3_client().delete_objects(
         Bucket=settings.s3_bucket_name,
         Delete={"Objects": [{"Key": k} for k in keys]},
     )
@@ -111,7 +117,7 @@ def delete_objects(keys: list[str]) -> None:
 
 def list_keys(prefix: str) -> list[str]:
     """S3 prefix 하위의 모든 객체 key 목록을 반환한다."""
-    response = s3_client.list_objects_v2(
+    response = get_s3_client().list_objects_v2(
         Bucket=settings.s3_bucket_name,
         Prefix=prefix,
     )
@@ -120,7 +126,7 @@ def list_keys(prefix: str) -> list[str]:
 
 def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
     """S3 객체의 Presigned URL을 반환한다."""
-    return s3_client.generate_presigned_url(
+    return get_s3_client().generate_presigned_url(
         "get_object",
         Params={"Bucket": settings.s3_bucket_name, "Key": key},
         ExpiresIn=expires_in,
@@ -130,7 +136,7 @@ def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
 async def get_json(key: str) -> dict:
     """S3에서 JSON 파일을 읽어 dict로 반환한다."""
     response = await asyncio.to_thread(
-        s3_client.get_object,
+        get_s3_client().get_object,
         Bucket=settings.s3_bucket_name,
         Key=key,
     )
@@ -143,7 +149,7 @@ async def generate_presigned_put_url(key: str, content_type: str) -> str:
         raise ValueError("S3_BUCKET_NAME is not configured")
 
     return await asyncio.to_thread(
-        s3_client.generate_presigned_url,
+        get_s3_client().generate_presigned_url,
         "put_object",
         Params={
             "Bucket": settings.s3_bucket_name,
@@ -160,7 +166,7 @@ async def object_exists(key: str) -> bool:
 
     try:
         await asyncio.to_thread(
-            s3_client.head_object,
+            get_s3_client().head_object,
             Bucket=settings.s3_bucket_name,
             Key=key,
         )

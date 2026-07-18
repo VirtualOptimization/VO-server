@@ -11,7 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from server.core.s3 import build_s3_uri, generate_presigned_url_for_uri
+from server.core.s3 import build_s3_uri, generate_presigned_put_url, generate_presigned_url_for_uri
 from server.schemas.furniture import (
     FurnitureModelCreateRequest,
     FurnitureModelDeleteResponse,
@@ -25,6 +25,7 @@ from shared.models.user import User
 
 router = APIRouter()
 bearer_scheme = HTTPBearer(auto_error=False)
+GLB_CONTENT_TYPE = "model/gltf-binary"
 
 
 def get_db():
@@ -56,13 +57,20 @@ def _safe_filename(value: str) -> str:
     return safe or "model.glb"
 
 
-def _to_model_response(model: FurnitureModel) -> FurnitureModelResponse:
+def _to_model_response(
+    model: FurnitureModel,
+    upload_url: str | None = None,
+    upload_s3_key: str | None = None,
+) -> FurnitureModelResponse:
     return FurnitureModelResponse(
         model_id=model.id,
         model_key=model.model_key,
         name=model.name,
         status=model.status,
         glb_url=generate_presigned_url_for_uri(model.glb_url),
+        upload_url=upload_url,
+        upload_content_type=GLB_CONTENT_TYPE if upload_url else None,
+        upload_s3_key=upload_s3_key,
         width=model.width,
         depth=model.depth,
         height=model.height,
@@ -72,7 +80,7 @@ def _to_model_response(model: FurnitureModel) -> FurnitureModelResponse:
 
 
 @router.post("/models/register", response_model=FurnitureModelResponse, summary="내 가구 등록")
-def create_furniture_model(
+async def create_furniture_model(
     request: FurnitureModelCreateRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -102,7 +110,8 @@ def create_furniture_model(
         raise HTTPException(status_code=409, detail="이미 등록된 model_key입니다.") from exc
 
     db.refresh(model)
-    return _to_model_response(model)
+    upload_url = await generate_presigned_put_url(glb_key, GLB_CONTENT_TYPE)
+    return _to_model_response(model, upload_url=upload_url, upload_s3_key=glb_key)
 
 
 @router.get("/models", response_model=FurnitureModelListResponse, summary="내 가구 목록 조회")

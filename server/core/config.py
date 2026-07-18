@@ -27,6 +27,7 @@ class Settings(BaseSettings):
         default=10080,
         validation_alias="ACCESS_TOKEN_EXPIRE_MINUTES",
     )
+    api_docs_enabled: bool = Field(default=True, validation_alias="API_DOCS_ENABLED")
 
     model_config = SettingsConfigDict(
         env_file=".env" if os.getenv("ENV", "local") == "local" else None,

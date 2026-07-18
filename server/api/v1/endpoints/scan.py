@@ -7,9 +7,9 @@ import logging
 import uuid
 from typing import Any
 
-import boto3
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from server.api.v1.deps import get_optional_current_user
 from server.api.v1.endpoints.rooms_common import (
     JSON_CONTENT_TYPE,
     MODEL_CONTENT_TYPE,
@@ -27,22 +27,26 @@ from server.schemas.scan import (
     ScanUploadStartRequest,
     ScanUploadStartResponse,
 )
-from server.services.transform.unity_roomplan import normalize_roomplan_for_unity
 from shared.db import SessionLocal
 from shared.models.room import Room
+from shared.models.user import User
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-stepfunctions_client = boto3.client(
-    "stepfunctions",
-    region_name=settings.aws_region,
-    aws_access_key_id=settings.aws_access_key_id,
-    aws_secret_access_key=settings.aws_secret_access_key,
-)
-
 
 # ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
+
+def _get_stepfunctions_client():
+    import boto3
+
+    client_kwargs = {"region_name": settings.aws_region}
+    if settings.aws_access_key_id and settings.aws_secret_access_key:
+        client_kwargs.update(
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
+        )
+    return boto3.client("stepfunctions", **client_kwargs)
 
 def _generate_unique_confirm_code(db) -> str:
     while True:
@@ -51,13 +55,18 @@ def _generate_unique_confirm_code(db) -> str:
             return code
 
 
-def _create_upload_session(include_room_usdz: bool, include_room_empty_usdz: bool) -> tuple[int, str]:
+def _create_upload_session(
+    include_room_usdz: bool,
+    include_room_empty_usdz: bool,
+    user_id: int | None = None,
+) -> tuple[int, str]:
     db = SessionLocal()
     try:
         confirm_code = _generate_unique_confirm_code(db)
         raw_prefix = _raw_prefix(confirm_code)
         room_shell_key = f"{raw_prefix}/Room.usdz" if include_room_usdz else None
         room = Room(
+            user_id=user_id,
             confirm_code=confirm_code,
             status="PENDING",
             room_shell_usdc_url=build_s3_uri(room_shell_key) if room_shell_key else None,
@@ -118,6 +127,8 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
 
 
 async def _create_origin_unity_json(raw_prefix: str) -> str:
+    from server.services.transform.unity_roomplan import normalize_roomplan_for_unity
+
     room_data_key = f"{raw_prefix}/room_data.json"
     unity_room_data_key = f"{raw_prefix}/room_data.unity.json"
     room_data = await get_json(room_data_key)
@@ -129,7 +140,7 @@ async def _create_origin_unity_json(raw_prefix: str) -> str:
 async def _start_pipeline_execution(pipeline_input: dict[str, Any]) -> str | None:
     try:
         confirm_code = pipeline_input["confirm_code"]
-        response = stepfunctions_client.start_execution(
+        response = _get_stepfunctions_client().start_execution(
             stateMachineArn=settings.step_functions_state_machine_arn,
             name=f"VO-Scan-{confirm_code}-{uuid.uuid4().hex[:8].upper()}",
             input=json.dumps(pipeline_input),
@@ -143,10 +154,14 @@ async def _start_pipeline_execution(pipeline_input: dict[str, Any]) -> str | Non
 # ── POST /rooms/start ─────────────────────────────────────────────────────────
 
 @router.post("/start", response_model=ScanUploadStartResponse)
-async def start_scan_upload(request: ScanUploadStartRequest):
+async def start_scan_upload(
+    request: ScanUploadStartRequest,
+    current_user: User | None = Depends(get_optional_current_user),
+):
     room_id, confirm_code = _create_upload_session(
         include_room_usdz=request.include_room_usdz,
         include_room_empty_usdz=request.include_room_empty_usdz,
+        user_id=current_user.id if current_user else None,
     )
     raw_prefix = _raw_prefix(confirm_code)
     targets = []
