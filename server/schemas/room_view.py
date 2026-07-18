@@ -31,6 +31,26 @@ class RoomVersionsResponse(BaseModel):
     versions: list[RoomVersionItem]
 
 
+class RoomVersionStateSummary(BaseModel):
+    confirm_code: str
+    has_original: bool
+    has_optimized: bool
+    user_edited_count: int
+
+
+class MyRoomListItem(BaseModel):
+    room_id: int
+    confirm_code: str
+    created_at: datetime | None = None
+    has_original: bool
+    has_optimized: bool
+    user_edited_count: int
+
+
+class MyRoomListResponse(BaseModel):
+    rooms: list[MyRoomListItem]
+
+
 class FurnitureItemView(BaseModel):
     item_key: str
     model_key: str | None = None

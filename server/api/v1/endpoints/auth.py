@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Security
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import APIRouter, Depends
+
+from server.api.v1.deps import get_current_user
 
 from server.core.security import create_access_token
 from server.schemas.auth import (
@@ -27,7 +28,6 @@ from server.services.auth_service import (
     create_email_verification_code,
     create_user_after_email_verification,
     get_user_by_refresh_token,
-    get_user_by_access_token,
     revoke_refresh_token,
     should_return_debug_code,
     verify_email_code,
@@ -36,7 +36,6 @@ from shared.models.user import User
 from shared.db import SessionLocal
 
 router = APIRouter()
-bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _to_auth_user_response(user: User) -> AuthUserResponse:
@@ -124,14 +123,5 @@ def logout(request: LogoutRequest):
 
 
 @router.get("/me", response_model=AuthUserResponse)
-def get_me(credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme)):
-    token = credentials.credentials if credentials else ""
-    if not token:
-        raise HTTPException(status_code=401, detail="Authorization Bearer 토큰이 필요합니다.")
-
-    db = SessionLocal()
-    try:
-        user = get_user_by_access_token(db, token)
-        return _to_auth_user_response(user)
-    finally:
-        db.close()
+def get_me(user: User = Depends(get_current_user)):
+    return _to_auth_user_response(user)
