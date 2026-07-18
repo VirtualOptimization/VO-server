@@ -21,6 +21,14 @@ jobs:
             git fetch origin
             git checkout dev
             git pull origin dev
+            touch .env
+            grep -v -E '^(JWT_SECRET_KEY|JWT_ALGORITHM|ACCESS_TOKEN_EXPIRE_MINUTES)=' .env > .env.tmp || true
+            mv .env.tmp .env
+            cat >> .env << 'EOF'
+            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+            JWT_ALGORITHM=${{ secrets.JWT_ALGORITHM }}
+            ACCESS_TOKEN_EXPIRE_MINUTES=${{ secrets.ACCESS_TOKEN_EXPIRE_MINUTES }}
+            EOF
             source .venv/bin/activate
             pip install -r requirements.txt -q
             sudo systemctl restart vo-server
