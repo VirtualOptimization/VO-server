@@ -153,7 +153,6 @@ def get_furniture_catalog():
                     model_key=model.model_key,
                     name=model.name,
                     furniture_type=model.furniture_type,
-                    usdc_url=generate_presigned_url_for_uri(model.usdc_url),
                     glb_url=generate_presigned_url_for_uri(model.glb_url),
                     width=float(model.width),
                     depth=float(model.depth),
