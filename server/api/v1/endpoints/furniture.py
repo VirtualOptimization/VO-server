@@ -78,7 +78,7 @@ async def create_furniture_model(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    model_key = f"user_{current_user.id}_{uuid4().hex}"
+    model_key = uuid4().hex
     user_segment = _safe_s3_segment(current_user.login_id, f"user_{current_user.id}")
     glb_key = f"{user_segment}/furniture/{model_key}.glb"
 
