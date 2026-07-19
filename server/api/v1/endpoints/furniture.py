@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Security
@@ -51,12 +50,6 @@ def _safe_s3_segment(value: str | None, fallback: str) -> str:
     return safe or fallback
 
 
-def _safe_filename(value: str) -> str:
-    name = Path(value).name
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
-    return safe or "model.glb"
-
-
 def _to_model_response(
     model: FurnitureModel,
     upload_url: str | None = None,
@@ -87,8 +80,7 @@ async def create_furniture_model(
 ):
     model_key = f"user_{current_user.id}_{uuid4().hex}"
     user_segment = _safe_s3_segment(current_user.login_id, f"user_{current_user.id}")
-    model_filename = _safe_filename(request.model_filename)
-    glb_key = f"{user_segment}/furniture/{model_key}/{model_filename}"
+    glb_key = f"{user_segment}/furniture/{model_key}.glb"
 
     model = FurnitureModel(
         user_id=current_user.id,
