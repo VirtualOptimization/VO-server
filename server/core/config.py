@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     database_url: str = Field(validation_alias="DATABASE_URL")
     async_database_url: str = Field(validation_alias="ASYNC_DATABASE_URL")
 
-    aws_region: str = Field(default="ap-northeast-2", validation_alias="AWS_REGION")
+    aws_region: str = Field(default="ap-southeast-2", validation_alias="AWS_REGION")
     s3_bucket_name: str = Field(default="", validation_alias="S3_BUCKET_NAME")
     aws_access_key_id: str = Field(default="", validation_alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str = Field(default="", validation_alias="AWS_SECRET_ACCESS_KEY")
@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     step_functions_state_machine_arn: str = Field(
         default="",
         validation_alias="STEP_FUNCTIONS_STATE_MACHINE_ARN",
+    )
+    scan_pipeline_mode: str = Field(default="step_functions", validation_alias="SCAN_PIPELINE_MODE")
+    local_pipeline_timeout_seconds: int = Field(
+        default=1800,
+        validation_alias="LOCAL_PIPELINE_TIMEOUT_SECONDS",
     )
     jwt_secret_key: str = Field(default="", validation_alias="JWT_SECRET_KEY")
     jwt_algorithm: str = Field(default="HS256", validation_alias="JWT_ALGORITHM")

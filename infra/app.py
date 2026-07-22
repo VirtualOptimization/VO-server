@@ -13,7 +13,7 @@ app = cdk.App()
 
 env = cdk.Environment(
     account=os.getenv("CDK_DEFAULT_ACCOUNT"),
-    region=os.getenv("CDK_DEFAULT_REGION", "ap-northeast-2"),
+    region=os.getenv("CDK_DEFAULT_REGION", "ap-southeast-2"),
 )
 
 VoRdsStack(
