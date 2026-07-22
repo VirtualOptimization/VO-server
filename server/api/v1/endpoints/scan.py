@@ -20,6 +20,7 @@ from server.api.v1.endpoints.rooms_common import (
 )
 from server.core.config import settings
 from server.core.s3 import build_s3_uri, generate_presigned_put_url, get_json, object_exists, upload_json
+from server.services.local_scan_pipeline import run_local_scan_pipeline
 from server.schemas.scan import (
     PresignedUploadTarget,
     ScanUploadCompleteRequest,
@@ -117,6 +118,7 @@ def _build_pipeline_input(room_id: int, confirm_code: str, uploaded_keys: list[s
             "models": sorted(k for k in uploaded_keys if "/models/" in k),
         },
         "outputs": {
+            "normalized_json": f"{generated_prefix}/room_data.normalized.json",
             "problem_json": f"{generated_prefix}/room_data.problem.json",
             "optimized_json": f"{generated_prefix}/room_data.optimized.json",
             "roomplan_optimized_json": f"{generated_prefix}/room_data.roomplan_optimized.json",
@@ -236,10 +238,18 @@ async def complete_scan_upload(confirm_code: str, payload: ScanUploadCompleteReq
     room_id = await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, False)
     processed_keys = [*payload.uploaded_keys, unity_room_data_key]
     pipeline_input = _build_pipeline_input(room_id, confirm_code, processed_keys)
-    execution_arn = await _start_pipeline_execution(pipeline_input)
-    pipeline_started = execution_arn is not None
 
-    if pipeline_started:
+    is_local_pipeline = settings.scan_pipeline_mode.lower() == "local"
+
+    if is_local_pipeline:
+        await run_local_scan_pipeline(pipeline_input)
+        execution_arn = None
+        pipeline_started = True
+    else:
+        execution_arn = await _start_pipeline_execution(pipeline_input)
+        pipeline_started = execution_arn is not None
+
+    if pipeline_started and not is_local_pipeline:
         await asyncio.to_thread(_mark_upload_completed, confirm_code, payload.uploaded_keys, True)
 
     return ScanUploadCompleteResponse(

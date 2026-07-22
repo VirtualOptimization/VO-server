@@ -14,14 +14,14 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 confirm_code = sys.argv[1].upper()
-bucket = os.getenv("S3_BUCKET_NAME", "aja-vo-server-bucket")
+bucket = os.getenv("S3_BUCKET_NAME", "project7-65-sydney-vo-s3")
 prefix = f"{confirm_code}/"
 
 s3 = boto3.client(
     "s3",
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    region_name=os.getenv("AWS_REGION", "ap-northeast-2"),
+    region_name=os.getenv("AWS_REGION", "ap-southeast-2"),
 )
 
 deleted = 0

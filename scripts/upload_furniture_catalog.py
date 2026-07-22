@@ -3,7 +3,7 @@
 Example:
     .venv/bin/python scripts/upload_furniture_catalog.py \
         --catalog-root /path/to/RoomPlanCatalog.bundle/Resources \
-        --bucket aja-vo-server-bucket \
+        --bucket project7-65-sydney-vo-s3 \
         --prefix models
 """
 
@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--region",
-        default=os.getenv("AWS_REGION", "ap-northeast-2"),
+        default=os.getenv("AWS_REGION", "ap-southeast-2"),
         help="AWS region for the S3 client.",
     )
     parser.add_argument(

@@ -20,7 +20,7 @@ python3 -m venv .venv
 
 ```bash
 export CDK_DEFAULT_ACCOUNT=123456789012
-export CDK_DEFAULT_REGION=ap-northeast-2
+export CDK_DEFAULT_REGION=ap-southeast-2
 export VO_RDS_STACK_NAME=vo-rds-stack
 export VO_RDS_INSTANCE_IDENTIFIER=vo-rds-dev
 export VO_RDS_DB_NAME=vo_db
