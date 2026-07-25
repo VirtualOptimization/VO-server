@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 
-
 def _copy(data: Any) -> Any:
     return json.loads(json.dumps(data))
 
@@ -146,8 +145,10 @@ def build_layout_problem(normalized_scan: dict[str, Any]) -> dict[str, Any]:
             support_positions,
             key=lambda support_id: _distance(item["pos"], support_positions[support_id]),
         )
-        item["pair_with"] = nearest_support_id
-        item["relationship"] = _classify_chair_relationship(item, support_by_id[nearest_support_id])
+        relationship = _classify_chair_relationship(item, support_by_id[nearest_support_id])
+        item["relationship"] = relationship
+        if relationship["strength"] != "free":
+            item["pair_with"] = nearest_support_id
 
     constraints = {
         "min_walkway": 0.425,
