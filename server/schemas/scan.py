@@ -53,7 +53,7 @@ class IOSRoomScanData(BaseModel):
 
 class ScanUploadResponse(BaseModel):
     message: str
-    confirm_code: str
+    room_id: int
     object_count: int
     uploaded_files: list[str]
 
@@ -75,7 +75,6 @@ class ScanUploadStartRequest(BaseModel):
 class ScanUploadStartResponse(BaseModel):
     message: str
     room_id: int
-    confirm_code: str
     raw_prefix: str
     generated_prefix: str
     expires_in_seconds: int
@@ -89,7 +88,6 @@ class ScanUploadCompleteRequest(BaseModel):
 class ScanUploadCompleteResponse(BaseModel):
     message: str
     room_id: int
-    confirm_code: str
     raw_prefix: str
     generated_prefix: str
     uploaded_keys: list[str]
@@ -106,7 +104,7 @@ class VersionSummary(BaseModel):
 
 
 class ScanDetailResponse(BaseModel):
-    confirm_code: str
+    room_id: int
     created_at: datetime
     versions: list[VersionSummary]
 

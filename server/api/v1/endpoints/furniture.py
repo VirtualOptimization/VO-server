@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Security
@@ -11,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from server.api.v1.endpoints.rooms_common import _safe_s3_segment
 from server.core.s3 import build_s3_uri, generate_presigned_put_url, generate_presigned_url_for_uri
 from server.schemas.furniture import (
     FurnitureModelCreateRequest,
@@ -45,18 +44,6 @@ def get_current_user(
     return get_user_by_access_token(db, credentials.credentials)
 
 
-def _safe_s3_segment(value: str | None, fallback: str) -> str:
-    source = value or fallback
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", source).strip("._-")
-    return safe or fallback
-
-
-def _safe_filename(value: str) -> str:
-    name = Path(value).name
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
-    return safe or "model.glb"
-
-
 def _to_model_response(
     model: FurnitureModel,
     upload_url: str | None = None,
@@ -85,10 +72,9 @@ async def create_furniture_model(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    model_key = f"user_{current_user.id}_{uuid4().hex}"
+    model_key = uuid4().hex
     user_segment = _safe_s3_segment(current_user.login_id, f"user_{current_user.id}")
-    model_filename = _safe_filename(request.model_filename)
-    glb_key = f"{user_segment}/furniture/{model_key}/{model_filename}"
+    glb_key = f"{user_segment}/furniture/{model_key}.glb"
 
     model = FurnitureModel(
         user_id=current_user.id,

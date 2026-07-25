@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import joinedload
 
 from server.api.v1.deps import get_current_user
-from server.api.v1.endpoints.rooms_common import _get_catalog_model_urls, _resolve_prefixes
+from server.api.v1.endpoints.rooms_common import _get_catalog_model_urls, _resolve_prefixes, _user_s3_segment
 from server.core.s3 import generate_presigned_url, generate_presigned_url_for_uri, head_object
 from server.schemas.room_view import (
     FurnitureCatalogItemResponse,
@@ -16,7 +16,6 @@ from server.schemas.room_view import (
     MyRoomListResponse,
     RoomSummaryResponse,
     RoomVersionItem,
-    RoomVersionStateSummary,
     RoomVersionsResponse,
     VersionDetailResponse,
 )
@@ -53,7 +52,6 @@ def _to_version_detail_response(version: Version) -> VersionDetailResponse:
     return VersionDetailResponse(
         version_id=version.id,
         room_id=version.room_id,
-        confirm_code=version.room.confirm_code if version.room else "",
         parent_version_id=version.parent_version_id,
         version_type=version.version_type,
         version_no=version.version_no,
@@ -67,15 +65,14 @@ def _to_version_detail_response(version: Version) -> VersionDetailResponse:
     )
 
 
-def _version_state_summary(confirm_code: str, versions: list[Version]) -> RoomVersionStateSummary:
+def _version_state_summary(versions: list[Version]) -> dict[str, int | bool]:
     version_types = {version.version_type for version in versions}
     user_edited_count = sum(1 for version in versions if version.version_type == "USER_EDITED")
-    return RoomVersionStateSummary(
-        confirm_code=confirm_code,
-        has_original="ORIGINAL" in version_types,
-        has_optimized="OPTIMIZED" in version_types,
-        user_edited_count=user_edited_count,
-    )
+    return {
+        "has_original": "ORIGINAL" in version_types,
+        "has_optimized": "OPTIMIZED" in version_types,
+        "user_edited_count": user_edited_count,
+    }
 
 
 # ── GET /rooms  (로그인 사용자 공간 목록) ─────────────────────────────────────
@@ -94,15 +91,14 @@ def get_my_rooms(current_user: User = Depends(get_current_user)):
 
         items: list[MyRoomListItem] = []
         for room in rooms:
-            summary = _version_state_summary(room.confirm_code, room.versions)
+            summary = _version_state_summary(room.versions)
             items.append(
                 MyRoomListItem(
                     room_id=room.id,
-                    confirm_code=room.confirm_code,
                     created_at=room.created_at,
-                    has_original=summary.has_original,
-                    has_optimized=summary.has_optimized,
-                    user_edited_count=summary.user_edited_count,
+                    has_original=bool(summary["has_original"]),
+                    has_optimized=bool(summary["has_optimized"]),
+                    user_edited_count=int(summary["user_edited_count"]),
                 )
             )
 
@@ -110,21 +106,26 @@ def get_my_rooms(current_user: User = Depends(get_current_user)):
     finally:
         db.close()
 
-# ── GET /rooms/{confirm_code}/versions/{version_id} ──────────────────────────
+# ── GET /rooms/{room_id}/versions/{version_id} ───────────────────────────────
 
-@router.get("/{confirm_code}/versions/{version_id}", response_model=VersionDetailResponse)
-def get_room_version_detail(confirm_code: str, version_id: int):
+@router.get("/{room_id}/versions/{version_id}", response_model=VersionDetailResponse)
+def get_room_version_detail(
+    room_id: int,
+    version_id: int,
+    current_user: User = Depends(get_current_user),
+):
     db = SessionLocal()
     try:
         version = (
             db.query(Version)
-            .join(Room)
             .options(
                 joinedload(Version.room),
             )
+            .join(Room)
             .filter(
                 Version.id == version_id,
-                Room.confirm_code == confirm_code,
+                Version.room_id == room_id,
+                Room.user_id == current_user.id,
             )
             .first()
         )
@@ -165,34 +166,34 @@ def get_furniture_catalog():
         db.close()
 
 
-# ── GET /rooms/{confirm_code} ─────────────────────────────────────────────────
+# ── GET /rooms/{room_id} ──────────────────────────────────────────────────────
 
-@router.get("/{confirm_code}", response_model=RoomSummaryResponse)
-def get_room_by_confirm_code(confirm_code: str):
+@router.get("/{room_id}", response_model=RoomSummaryResponse)
+def get_room_by_id(room_id: int, current_user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
-        room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
+        room = db.query(Room).filter(Room.id == room_id, Room.user_id == current_user.id).first()
         if room is None:
             raise HTTPException(status_code=404, detail="room not found")
-        return RoomSummaryResponse(room_id=room.id, confirm_code=room.confirm_code, status=room.status)
+        return RoomSummaryResponse(room_id=room.id, status=room.status)
     finally:
         db.close()
 
 
-# ── GET /rooms/{confirm_code}/versions ────────────────────────────────────────
+# ── GET /rooms/{room_id}/versions ─────────────────────────────────────────────
 
-@router.get("/{confirm_code}/versions", response_model=RoomVersionsResponse)
-def get_room_versions(confirm_code: str):
+@router.get("/{room_id}/versions", response_model=RoomVersionsResponse)
+def get_room_versions(room_id: int, current_user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
         room = (
             db.query(Room)
             .options(joinedload(Room.versions))
-            .filter(Room.confirm_code == confirm_code)
+            .filter(Room.id == room_id, Room.user_id == current_user.id)
             .first()
         )
         if room is None:
-            raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
 
         versions = sorted(room.versions, key=lambda version: version.version_no)
         if not versions:
@@ -202,7 +203,6 @@ def get_room_versions(confirm_code: str):
         current_version_count = len(versions)
         return RoomVersionsResponse(
             room_id=room.id,
-            confirm_code=room.confirm_code,
             current_version_count=current_version_count,
             max_version_count=MAX_VERSION_COUNT,
             can_create_user_version=current_version_count < MAX_VERSION_COUNT,
@@ -227,13 +227,25 @@ def get_room_versions(confirm_code: str):
         db.close()
 
 
-# ── GET /rooms/{confirm_code}/origin  (다운로드) ──────────────────────────────
+# ── GET /rooms/{room_id}/origin  (다운로드) ──────────────────────────────────
 
-@router.get("/{confirm_code}/origin", response_model=VersionAssetsResponse)
-async def get_origin_assets(confirm_code: str):
-    prefixes = await _resolve_prefixes(confirm_code)
+@router.get("/{room_id}/origin", response_model=VersionAssetsResponse)
+async def get_origin_assets(room_id: int, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        room = (
+            db.query(Room)
+            .options(joinedload(Room.user))
+            .filter(Room.id == room_id, Room.user_id == current_user.id)
+            .first()
+        )
+        owner_segment = _user_s3_segment(room.user) if room else None
+    finally:
+        db.close()
+
+    prefixes = await _resolve_prefixes(str(room_id), owner_segment)
     if prefixes is None:
-        raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
 
     raw, _ = prefixes
     data_key = f"{raw}/room_data.json"
@@ -262,13 +274,25 @@ async def get_origin_assets(confirm_code: str):
     )
 
 
-# ── GET /rooms/{confirm_code}/optimized  (다운로드) ───────────────────────────
+# ── GET /rooms/{room_id}/optimized  (다운로드) ───────────────────────────────
 
-@router.get("/{confirm_code}/optimized", response_model=VersionAssetsResponse)
-async def get_optimized_assets(confirm_code: str):
-    prefixes = await _resolve_prefixes(confirm_code)
+@router.get("/{room_id}/optimized", response_model=VersionAssetsResponse)
+async def get_optimized_assets(room_id: int, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        room = (
+            db.query(Room)
+            .options(joinedload(Room.user))
+            .filter(Room.id == room_id, Room.user_id == current_user.id)
+            .first()
+        )
+        owner_segment = _user_s3_segment(room.user) if room else None
+    finally:
+        db.close()
+
+    prefixes = await _resolve_prefixes(str(room_id), owner_segment)
     if prefixes is None:
-        raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
 
     raw, gen = prefixes
     data_key = f"{gen}/room_data.roomplan_optimized.json"

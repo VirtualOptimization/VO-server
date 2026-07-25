@@ -51,7 +51,6 @@ def _mark_room_status(db: Session, room_id: int, status: str) -> None:
 
 def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, Any]:
     room_id = event["room_id"]
-    confirm_code = event["confirm_code"]
     inputs = event["inputs"]
     outputs = event["outputs"]
     bucket = event.get("bucket") or settings.s3_bucket_name
@@ -80,7 +79,6 @@ def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, A
 
     original_json_data = {
         "source": "ios_upload",
-        "confirm_code": confirm_code,
         "room_data_json": original_s3_url,
     }
     original = (
@@ -111,7 +109,6 @@ def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, A
 
     optimized_json_data = {
         "source": "local_pipeline",
-        "confirm_code": confirm_code,
         "normalized_json": normalized_s3_url,
         "problem_json": problem_s3_url,
         "optimized_json": optimized_s3_url,
@@ -149,7 +146,6 @@ def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, A
     return {
         "status": "ok",
         "room_id": room_id,
-        "confirm_code": confirm_code,
         "original_version_id": original.id,
         "optimized_version_id": optimized.id,
         "original_json": raw_json_key,
