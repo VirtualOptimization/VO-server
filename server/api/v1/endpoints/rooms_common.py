@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from typing import Any
 
 from server.core.s3 import generate_presigned_url, get_json, head_object
 
@@ -16,12 +18,31 @@ JSON_CONTENT_TYPE = "application/json"
 URL_EXPIRATION_SECONDS = 3600
 
 
-def _raw_prefix(confirm_code: str) -> str:
-    return f"{RAW_ROOT_PREFIX}/{confirm_code}/origin"
+def _safe_s3_segment(value: str | None, fallback: str) -> str:
+    source = value or fallback
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", source).strip("._-")
+    return safe or fallback
 
 
-def _generated_prefix(confirm_code: str) -> str:
-    return f"{RAW_ROOT_PREFIX}/{confirm_code}/optimized"
+def _user_s3_segment(user: Any | None) -> str | None:
+    if user is None:
+        return None
+    user_id = getattr(user, "id", None)
+    return _safe_s3_segment(getattr(user, "login_id", None), f"user_{user_id or 'unknown'}")
+
+
+def _scan_root(room_ref: str, owner_segment: str | None = None) -> str:
+    if owner_segment:
+        return f"{owner_segment}/{RAW_ROOT_PREFIX}/{room_ref}"
+    return f"{RAW_ROOT_PREFIX}/{room_ref}"
+
+
+def _raw_prefix(room_ref: str, owner_segment: str | None = None) -> str:
+    return f"{_scan_root(room_ref, owner_segment)}/origin"
+
+
+def _generated_prefix(room_ref: str, owner_segment: str | None = None) -> str:
+    return f"{_scan_root(room_ref, owner_segment)}/optimized"
 
 
 def _catalog_model_key(category: str, model_filename: str) -> str:
@@ -47,14 +68,19 @@ async def _get_catalog_model_urls(raw_prefix: str) -> dict[str, str]:
         return {}
 
 
-async def _resolve_prefixes(confirm_code: str) -> tuple[str, str] | None:
-    """새 경로(scans/{code}/origin) 우선, 없으면 구 경로({code}/origin) 폴백."""
-    new_raw = _raw_prefix(confirm_code)
-    if await head_object(f"{new_raw}/room_data.json"):
-        return new_raw, _generated_prefix(confirm_code)
+async def _resolve_prefixes(room_ref: str, owner_segment: str | None = None) -> tuple[str, str] | None:
+    """사용자 경로 우선, 없으면 기존 scans/{code} 및 레거시 경로 폴백."""
+    if owner_segment:
+        owned_raw = _raw_prefix(room_ref, owner_segment)
+        if await head_object(f"{owned_raw}/room_data.json"):
+            return owned_raw, _generated_prefix(room_ref, owner_segment)
 
-    old_raw = f"{confirm_code}/origin"
+    new_raw = _raw_prefix(room_ref)
+    if await head_object(f"{new_raw}/room_data.json"):
+        return new_raw, _generated_prefix(room_ref)
+
+    old_raw = f"{room_ref}/origin"
     if await head_object(f"{old_raw}/room_data.json"):
-        return old_raw, f"{confirm_code}/processed"
+        return old_raw, f"{room_ref}/processed"
 
     return None

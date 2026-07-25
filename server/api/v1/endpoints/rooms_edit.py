@@ -4,9 +4,12 @@ from __future__ import annotations
 import logging
 import math
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
+from sqlalchemy.orm import joinedload
 
+from server.api.v1.deps import get_current_user
+from server.api.v1.endpoints.rooms_common import _scan_root, _user_s3_segment
 from server.core.s3 import delete_objects, get_json, list_keys, parse_s3_uri, upload_json
 from server.schemas.room_view import (
     UserEditedVersionCreateRequest,
@@ -20,6 +23,7 @@ from server.services.transform.unity_roomplan import (
 )
 from shared.db import SessionLocal
 from shared.models.room import Room
+from shared.models.user import User
 from shared.models.version import Version
 
 logger = logging.getLogger(__name__)
@@ -354,28 +358,30 @@ def _version_s3_prefix(version: Version) -> str | None:
     return f"{prefix}/"
 
 
-# ── POST /rooms/{confirm_code}/versions ──────────────────────────────────────
-# Unity에서 수정한 가구 배치를 확인 코드 아래 새 USER_EDITED 버전으로 저장
+# ── POST /rooms/{room_id}/versions ───────────────────────────────────────────
+# Unity에서 수정한 가구 배치를 room_id 아래 새 USER_EDITED 버전으로 저장
 
 @router.post(
-    "/{confirm_code}/versions",
+    "/{room_id}/versions",
     response_model=UserEditedVersionCreateResponse,
     status_code=201,
 )
 async def create_user_edited_version(
-    confirm_code: str,
+    room_id: int,
     payload: UserEditedVersionCreateRequest,
+    current_user: User = Depends(get_current_user),
 ):
     db = SessionLocal()
     try:
         room = (
             db.query(Room)
-            .filter(Room.confirm_code == confirm_code)
+            .options(joinedload(Room.user))
+            .filter(Room.id == room_id, Room.user_id == current_user.id)
             .with_for_update()
             .first()
         )
         if not room:
-            raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
 
         parent_version = (
             db.query(Version)
@@ -432,7 +438,8 @@ async def create_user_edited_version(
             ios_layout = denormalize_roomplan_from_unity(unity_layout)
             ios_layout = normalize_roomplan_for_ios_view(ios_layout)
 
-        edit_prefix = f"scans/{confirm_code}/user_edits/version_{next_version_no}"
+        owner_segment = _user_s3_segment(room.user)
+        edit_prefix = f"{_scan_root(str(room.id), owner_segment)}/user_edits/version_{next_version_no}"
         ios_key = f"{edit_prefix}/layout.roomplan.json"
         unity_key = f"{edit_prefix}/layout.unity.json"
         ios_s3_url = await upload_json(ios_key, ios_layout)
@@ -462,7 +469,6 @@ async def create_user_edited_version(
         return UserEditedVersionCreateResponse(
             version_id=version.id,
             room_id=room.id,
-            confirm_code=room.confirm_code,
             parent_version_id=parent_version.id,
             version_type=version.version_type,
             version_no=version.version_no,
@@ -475,23 +481,27 @@ async def create_user_edited_version(
         raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Failed to create USER_EDITED version for {confirm_code}: {e}")
+        logger.error(f"Failed to create USER_EDITED version for room_id={room_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
 
-# ── DELETE /rooms/{confirm_code}/versions/{version_id} ────────────────────────
+# ── DELETE /rooms/{room_id}/versions/{version_id} ─────────────────────────────
 # origin(ORIGINAL) / optimized(OPTIMIZED) 는 삭제 불가
 # USER_EDITED 버전만 삭제 가능
 
-@router.delete("/{confirm_code}/versions/{version_id}", status_code=204)
-def delete_user_version(confirm_code: str, version_id: int):
+@router.delete("/{room_id}/versions/{version_id}", status_code=204)
+def delete_user_version(
+    room_id: int,
+    version_id: int,
+    current_user: User = Depends(get_current_user),
+):
     db = SessionLocal()
     try:
-        room = db.query(Room).filter(Room.confirm_code == confirm_code).first()
+        room = db.query(Room).filter(Room.id == room_id, Room.user_id == current_user.id).first()
         if not room:
-            raise HTTPException(status_code=404, detail="확인 코드를 찾을 수 없습니다.")
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
 
         version = db.query(Version).filter(
             Version.id == version_id,

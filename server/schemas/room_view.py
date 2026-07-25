@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 
 class RoomSummaryResponse(BaseModel):
     room_id: int
-    confirm_code: str
     status: str
 
 
@@ -23,7 +22,6 @@ class RoomVersionItem(BaseModel):
 
 class RoomVersionsResponse(BaseModel):
     room_id: int
-    confirm_code: str
     current_version_count: int
     max_version_count: int
     can_create_user_version: bool
@@ -31,16 +29,8 @@ class RoomVersionsResponse(BaseModel):
     versions: list[RoomVersionItem]
 
 
-class RoomVersionStateSummary(BaseModel):
-    confirm_code: str
-    has_original: bool
-    has_optimized: bool
-    user_edited_count: int
-
-
 class MyRoomListItem(BaseModel):
     room_id: int
-    confirm_code: str
     created_at: datetime | None = None
     has_original: bool
     has_optimized: bool
@@ -77,7 +67,6 @@ class FurnitureCatalogResponse(BaseModel):
 class VersionDetailResponse(BaseModel):
     version_id: int
     room_id: int
-    confirm_code: str
     parent_version_id: int | None = None
     version_type: str
     version_no: int
@@ -101,7 +90,6 @@ class UserEditedVersionCreateRequest(BaseModel):
 class UserEditedVersionCreateResponse(BaseModel):
     version_id: int
     room_id: int
-    confirm_code: str
     parent_version_id: int
     version_type: str
     version_no: int
