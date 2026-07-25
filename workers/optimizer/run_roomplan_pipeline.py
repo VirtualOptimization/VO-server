@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from server.services.transform import build_layout_problem, convert_roomplan_to_optimizer_payload
+from workers.optimizer.ai_constraints import maybe_apply_ai_constraints
 from workers.optimizer.layout import CanonicalLayoutOptimizer
 
 
@@ -47,6 +48,7 @@ def main() -> None:
     raw_payload = json.loads(src_path.read_text(encoding="utf-8"))
     normalized = convert_roomplan_to_optimizer_payload(raw_payload)
     problem = build_layout_problem(normalized)
+    problem = maybe_apply_ai_constraints(problem)
 
     normalized_out.parent.mkdir(parents=True, exist_ok=True)
     normalized_out.write_text(
@@ -66,6 +68,10 @@ def main() -> None:
         global_popsize=args.global_popsize,
         local_maxiter=args.local_maxiter,
     )
+    optimized["ai_used"] = problem.get("ai_used", False)
+    optimized["ai_error"] = problem.get("ai_error")
+    if problem.get("ai_constraints"):
+        optimized["ai_constraints"] = problem["ai_constraints"]
 
     optimized_out.parent.mkdir(parents=True, exist_ok=True)
     optimized_out.write_text(

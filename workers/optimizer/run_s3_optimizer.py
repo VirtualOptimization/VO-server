@@ -16,6 +16,7 @@ from server.services.transform import (
     normalize_roomplan_for_ios_view,
     normalize_roomplan_for_unity,
 )
+from workers.optimizer.ai_constraints import maybe_apply_ai_constraints
 from workers.optimizer.layout import CanonicalLayoutOptimizer
 
 
@@ -93,6 +94,7 @@ def main() -> int:
         raw_payload = json.loads(input_path.read_text(encoding="utf-8"))
         normalized = convert_roomplan_to_optimizer_payload(raw_payload)
         problem = build_layout_problem(normalized)
+        problem = maybe_apply_ai_constraints(problem)
 
         optimizer = CanonicalLayoutOptimizer(problem)
         optimized = optimizer.optimize(
@@ -100,6 +102,10 @@ def main() -> int:
             global_popsize=global_popsize,
             local_maxiter=local_maxiter,
         )
+        optimized["ai_used"] = problem.get("ai_used", False)
+        optimized["ai_error"] = problem.get("ai_error")
+        if problem.get("ai_constraints"):
+            optimized["ai_constraints"] = problem["ai_constraints"]
         roomplan_optimized_raw = export_optimized_layout_to_roomplan(raw_payload, optimized)
         roomplan_optimized = normalize_roomplan_for_ios_view(roomplan_optimized_raw)
         unity_roomplan_optimized = normalize_roomplan_for_unity(roomplan_optimized_raw)
