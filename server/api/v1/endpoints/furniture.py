@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from botocore.exceptions import ClientError
@@ -24,9 +25,15 @@ from server.schemas.furniture import (
     FurnitureModelDeleteResponse,
     FurnitureModelListResponse,
     FurnitureModelResponse,
+    FurnitureModelUsdzConversionResponse,
+    FurnitureModelUsdzUpdateRequest,
 )
 from server.services.auth_service import get_user_by_access_token
-from server.services.furniture_conversion import convert_furniture_usdc_to_glb
+from server.services.furniture_conversion import (
+    convert_furniture_glb_to_usdz,
+    convert_furniture_usdc_to_glb,
+)
+from server.core.config import settings
 from shared.db import SessionLocal
 from shared.models.furniture_model import FurnitureModel
 from shared.models.user import User
@@ -64,6 +71,7 @@ def _to_model_response(
         name=model.name,
         status=model.status,
         glb_url=generate_presigned_url_for_uri(model.glb_url) if model.status == "READY" else None,
+        usdz_url=generate_presigned_url_for_uri(model.usdz_url) if model.status == "READY" else None,
         upload_url=upload_url,
         upload_content_type=USDC_CONTENT_TYPE if upload_url else None,
         upload_s3_key=upload_s3_key,
@@ -88,11 +96,45 @@ def _output_glb_key(current_user: User, model_key: str) -> str:
     return f"{_furniture_key_prefix(current_user, model_key)}.glb"
 
 
+def _output_usdz_key(current_user: User, model_key: str) -> str:
+    return f"{_furniture_key_prefix(current_user, model_key)}.usdz"
+
+
 def _key_from_s3_uri(uri: str | None) -> str | None:
     parsed = parse_s3_uri(uri)
     if parsed is None:
         return None
     return parsed[1]
+
+
+def _normalize_s3_key(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("S3 경로가 비어 있습니다.")
+
+    parsed_s3 = parse_s3_uri(raw)
+    if parsed_s3 is not None:
+        bucket, key = parsed_s3
+        if bucket != settings.s3_bucket_name:
+            raise ValueError("현재 S3 버킷의 파일만 사용할 수 있습니다.")
+        return key
+
+    parsed_url = urlparse(raw)
+    if parsed_url.scheme in {"http", "https"}:
+        host = parsed_url.netloc
+        path = unquote(parsed_url.path.lstrip("/"))
+
+        virtual_host_prefix = f"{settings.s3_bucket_name}."
+        if host.startswith(virtual_host_prefix):
+            return path
+
+        path_style_prefix = f"{settings.s3_bucket_name}/"
+        if path.startswith(path_style_prefix):
+            return path.removeprefix(path_style_prefix)
+
+        raise ValueError("현재 S3 버킷의 URL만 사용할 수 있습니다.")
+
+    return raw.lstrip("/")
 
 
 @router.post("/models/register", response_model=FurnitureModelResponse, summary="내 가구 등록")
@@ -165,6 +207,85 @@ async def complete_furniture_model_upload(
 
     model.status = "READY"
     model.glb_url = build_s3_uri(output_key)
+    db.commit()
+    db.refresh(model)
+    return _to_model_response(model)
+
+
+@router.post(
+    "/models/{model_id}/convert-usdz",
+    response_model=FurnitureModelUsdzConversionResponse,
+    summary="내 가구 GLB를 USDZ로 변환",
+)
+async def convert_furniture_model_to_usdz(
+    model_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    model = db.get(FurnitureModel, model_id)
+    if model is None or model.status == "DELETED":
+        raise HTTPException(status_code=404, detail="가구 모델을 찾을 수 없습니다.")
+    if model.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="변환할 수 없는 가구 모델입니다.")
+    if model.status != "READY":
+        raise HTTPException(status_code=400, detail="GLB 변환이 완료된 가구만 USDZ로 변환할 수 있습니다.")
+
+    source_key = _key_from_s3_uri(model.glb_url)
+    if not source_key:
+        raise HTTPException(status_code=400, detail="변환할 GLB 경로가 없습니다.")
+
+    output_key = _output_usdz_key(current_user, model.model_key)
+
+    if not await object_exists(source_key):
+        raise HTTPException(status_code=400, detail="변환할 GLB 파일을 찾을 수 없습니다.")
+
+    try:
+        await convert_furniture_glb_to_usdz(source_key, output_key)
+    except (subprocess.SubprocessError, TimeoutError, ClientError, OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail=f"가구 USDZ 변환에 실패했습니다: {exc}") from exc
+
+    model.usdz_url = build_s3_uri(output_key)
+    db.commit()
+    db.refresh(model)
+
+    return FurnitureModelUsdzConversionResponse(
+        model_id=model.id,
+        model_key=model.model_key,
+        status=model.status,
+        glb_url=generate_presigned_url_for_uri(model.glb_url),
+        usdz_url=generate_presigned_url_for_uri(model.usdz_url),
+        usdz_s3_key=output_key,
+    )
+
+
+@router.patch(
+    "/models/{model_id}/usdz",
+    response_model=FurnitureModelResponse,
+    summary="내 가구 USDZ 경로 갱신",
+)
+async def update_furniture_model_usdz_url(
+    model_id: int,
+    request: FurnitureModelUsdzUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    model = db.get(FurnitureModel, model_id)
+    if model is None or model.status == "DELETED":
+        raise HTTPException(status_code=404, detail="가구 모델을 찾을 수 없습니다.")
+    if model.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="수정할 수 없는 가구 모델입니다.")
+
+    try:
+        usdz_key = _normalize_s3_key(request.usdz_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not usdz_key.endswith(".usdz"):
+        raise HTTPException(status_code=400, detail="USDZ 파일 경로만 등록할 수 있습니다.")
+    if not await object_exists(usdz_key):
+        raise HTTPException(status_code=400, detail="등록할 USDZ 파일을 찾을 수 없습니다.")
+
+    model.usdz_url = build_s3_uri(usdz_key)
     db.commit()
     db.refresh(model)
     return _to_model_response(model)
