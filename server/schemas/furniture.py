@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 class FurnitureModelCreateRequest(BaseModel):
     name: str | None = Field(default=None, max_length=100)
-    model_filename: str = Field(default="model.glb", min_length=1, max_length=255)
+    model_filename: str = Field(default="model.usdc", min_length=1, max_length=255)
     width: float = Field(..., gt=0)
     depth: float = Field(..., gt=0)
     height: float = Field(..., gt=0)
