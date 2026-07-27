@@ -7,8 +7,6 @@ import tempfile
 from pathlib import Path
 import subprocess
 
-import boto3
-
 from build_room_shell_glb import build_room_shell_glb
 
 
@@ -91,6 +89,8 @@ def main() -> int:
         else:
             run_usd2gltf(input_file, output_file)
     else:
+        import boto3
+
         bucket = require(args.bucket, "bucket")
         s3 = boto3.client("s3")
         input_key = args.input_s3_key

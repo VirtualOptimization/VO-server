@@ -31,4 +31,5 @@ jobs:
             EOF
             source .venv/bin/activate
             pip install -r requirements.txt -q
+            bash scripts/setup_gltf2usdz.sh
             sudo systemctl restart vo-server

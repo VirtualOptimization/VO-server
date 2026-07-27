@@ -27,6 +27,7 @@ class FurnitureModel(Base):
     furniture_type: Mapped[str | None] = mapped_column(String(50))
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="READY")
     glb_url: Mapped[str | None] = mapped_column(Text)
+    usdz_url: Mapped[str | None] = mapped_column(Text)
     width: Mapped[float] = mapped_column(nullable=False)
     depth: Mapped[float] = mapped_column(nullable=False)
     height: Mapped[float] = mapped_column(nullable=False)
