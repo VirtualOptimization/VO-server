@@ -14,6 +14,8 @@ from server.schemas.room_view import (
     FurnitureCatalogResponse,
     MyRoomListItem,
     MyRoomListResponse,
+    RoomNameUpdateRequest,
+    RoomNameUpdateResponse,
     RoomSummaryResponse,
     RoomVersionItem,
     RoomVersionsResponse,
@@ -95,6 +97,7 @@ def get_my_rooms(current_user: User = Depends(get_current_user)):
             items.append(
                 MyRoomListItem(
                     room_id=room.id,
+                    name=room.name,
                     created_at=room.created_at,
                     has_original=bool(summary["has_original"]),
                     has_optimized=bool(summary["has_optimized"]),
@@ -105,6 +108,29 @@ def get_my_rooms(current_user: User = Depends(get_current_user)):
         return MyRoomListResponse(rooms=items)
     finally:
         db.close()
+
+
+# ── PATCH /rooms/{room_id}  (방 이름 수정) ───────────────────────────────────
+
+@router.patch("/{room_id}", response_model=RoomNameUpdateResponse)
+def update_room_name(
+    room_id: int,
+    payload: RoomNameUpdateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    db = SessionLocal()
+    try:
+        room = db.query(Room).filter(Room.id == room_id, Room.user_id == current_user.id).first()
+        if room is None:
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
+
+        room.name = payload.name.strip() if payload.name and payload.name.strip() else None
+        db.commit()
+        db.refresh(room)
+        return RoomNameUpdateResponse(room_id=room.id, name=room.name)
+    finally:
+        db.close()
+
 
 # ── GET /rooms/{room_id}/versions/{version_id} ───────────────────────────────
 

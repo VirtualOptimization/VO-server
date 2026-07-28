@@ -32,6 +32,7 @@ from server.schemas.scan import (
 from shared.db import SessionLocal
 from shared.models.room import Room
 from shared.models.user import User
+from shared.models.version import Version
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -62,12 +63,14 @@ def _create_upload_session(
     include_room_empty_usdz: bool,
     user_id: int | None = None,
     owner_segment: str | None = None,
+    name: str | None = None,
 ) -> int:
     db = SessionLocal()
     try:
         confirm_code = _generate_unique_confirm_code(db)
         room = Room(
             user_id=user_id,
+            name=name.strip() if name and name.strip() else None,
             confirm_code=confirm_code,
             status="PENDING",
         )
@@ -102,14 +105,14 @@ def _mark_upload_completed(room_id: int, uploaded_keys: list[str], pipeline_star
         db.close()
 
 
-def _get_room_owner_segment(room_id: int, user_id: int) -> str | None:
+def _get_room_context(room_id: int, user_id: int) -> tuple[str | None, str | None]:
     db = SessionLocal()
     try:
         room = db.query(Room).filter(Room.id == room_id, Room.user_id == user_id).first()
         if room is None:
             raise ValueError(f"Room not found: {room_id}")
         user = db.get(User, room.user_id)
-        return _user_s3_segment(user)
+        return _user_s3_segment(user), room.name
     finally:
         db.close()
 
@@ -145,6 +148,60 @@ def _build_pipeline_input(
             "glb": f"{raw_prefix}/output.glb",
         },
     }
+
+
+def _ensure_original_version(
+    room_id: int,
+    raw_json_key: str,
+    unity_room_data_key: str,
+    room_name: str | None,
+) -> None:
+    db = SessionLocal()
+    try:
+        room = db.get(Room, room_id)
+        if room is None:
+            raise ValueError(f"Room not found: {room_id}")
+
+        original_s3_url = build_s3_uri(raw_json_key)
+        unity_s3_url = build_s3_uri(unity_room_data_key)
+        original_json_data = {
+            "source": "ios_upload",
+            "room_data_json": original_s3_url,
+            "unity_room_data_json": unity_s3_url,
+        }
+
+        original = (
+            db.query(Version)
+            .filter(
+                Version.room_id == room_id,
+                Version.version_type == "ORIGINAL",
+                Version.version_no == 0,
+            )
+            .first()
+        )
+        if original:
+            current_json_data = original.json_data if isinstance(original.json_data, dict) else {}
+            original.s3_json_url = original_s3_url
+            original.version_name = room_name
+            original.json_data = {**current_json_data, **original_json_data}
+        else:
+            db.add(
+                Version(
+                    room_id=room_id,
+                    parent_version_id=None,
+                    version_type="ORIGINAL",
+                    version_no=0,
+                    version_name=room_name,
+                    s3_json_url=original_s3_url,
+                    json_data=original_json_data,
+                )
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 async def _create_origin_unity_json(raw_prefix: str) -> str:
@@ -185,6 +242,7 @@ async def start_scan_upload(
         include_room_empty_usdz=request.include_room_empty_usdz,
         user_id=current_user.id,
         owner_segment=owner_segment,
+        name=request.name,
     )
     raw_prefix = _raw_prefix(str(room_id), owner_segment)
     generated_prefix = _generated_prefix(str(room_id), owner_segment)
@@ -231,7 +289,7 @@ async def complete_scan_upload(
         raise HTTPException(status_code=422, detail="uploaded_keys는 비어 있을 수 없습니다.")
 
     try:
-        owner_segment = _get_room_owner_segment(room_id, current_user.id)
+        owner_segment, room_name = _get_room_context(room_id, current_user.id)
     except ValueError:
         raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
     raw_prefix = _raw_prefix(str(room_id), owner_segment)
@@ -266,6 +324,7 @@ async def complete_scan_upload(
         db_check.close()
 
     room_id = await asyncio.to_thread(_mark_upload_completed, room_id, payload.uploaded_keys, False)
+    await asyncio.to_thread(_ensure_original_version, room_id, required_json_key, unity_room_data_key, room_name)
     processed_keys = [*payload.uploaded_keys, unity_room_data_key]
     pipeline_input = _build_pipeline_input(room_id, processed_keys, owner_segment)
 
