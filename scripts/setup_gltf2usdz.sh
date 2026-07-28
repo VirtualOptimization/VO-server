@@ -4,6 +4,17 @@ set -euo pipefail
 REPO_DIR="${GLTF2USDZ_REPO_DIR:-$HOME/gltf2usdz.online}"
 BUN_BIN="${BUN_BINARY:-$HOME/.bun/bin/bun}"
 
+if ! command -v unzip >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "Installing unzip..."
+    sudo apt-get update
+    sudo apt-get install -y unzip
+  else
+    echo "unzip is required to install Bun, but apt-get was not found" >&2
+    exit 1
+  fi
+fi
+
 if ! command -v bun >/dev/null 2>&1 && [ ! -x "$BUN_BIN" ]; then
   echo "Installing Bun..."
   curl -fsSL https://bun.sh/install | bash
