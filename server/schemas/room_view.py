@@ -10,6 +10,15 @@ class RoomSummaryResponse(BaseModel):
     status: str
 
 
+class RoomNameUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=100)
+
+
+class RoomNameUpdateResponse(BaseModel):
+    room_id: int
+    name: str | None = None
+
+
 class RoomVersionItem(BaseModel):
     version_id: int
     version_type: str
@@ -31,6 +40,7 @@ class RoomVersionsResponse(BaseModel):
 
 class MyRoomListItem(BaseModel):
     room_id: int
+    name: str | None = None
     created_at: datetime | None = None
     has_original: bool
     has_optimized: bool

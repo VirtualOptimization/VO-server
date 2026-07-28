@@ -21,6 +21,7 @@ class Room(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     confirm_code: Mapped[str] = mapped_column(String(6), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="PENDING")
     room_shell_usdc_url: Mapped[str | None] = mapped_column(Text)

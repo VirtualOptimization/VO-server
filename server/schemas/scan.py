@@ -68,6 +68,7 @@ class PresignedUploadTarget(BaseModel):
 
 
 class ScanUploadStartRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=100)
     include_room_usdz: bool = True
     include_room_empty_usdz: bool = False
 
