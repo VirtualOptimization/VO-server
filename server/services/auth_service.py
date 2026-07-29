@@ -14,13 +14,14 @@ from sqlalchemy.orm import Session
 from server.core.config import settings
 from server.core.security import decode_access_token, hash_secret, verify_secret
 from server.schemas.auth import SignupRequest
+from server.services.email_service import send_email_verification_code
 from shared.models.email_verification_code import EmailVerificationCode
 from shared.models.refresh_token import RefreshToken
 from shared.models.user import User
 
 logger = logging.getLogger(__name__)
 
-EMAIL_CODE_EXPIRE_SECONDS = 10 * 60
+EMAIL_CODE_EXPIRE_SECONDS = 5 * 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -71,8 +72,7 @@ def create_email_verification_code(db: Session, email: str) -> tuple[str, int]:
     db.add(verification)
     db.commit()
 
-    # Local placeholder for future SMTP/SES integration.
-    logger.info("Email verification code created for %s: %s", normalized_email, code)
+    send_email_verification_code(normalized_email, code, EMAIL_CODE_EXPIRE_SECONDS)
     return code, EMAIL_CODE_EXPIRE_SECONDS
 
 
@@ -147,7 +147,7 @@ def create_user_after_email_verification(db: Session, request: SignupRequest) ->
 
 
 def should_return_debug_code() -> bool:
-    return settings.env == "local"
+    return settings.email_verification_debug
 
 
 def authenticate_user(db: Session, login_id: str, password: str) -> User:

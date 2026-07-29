@@ -32,6 +32,16 @@ class Settings(BaseSettings):
         default=10080,
         validation_alias="ACCESS_TOKEN_EXPIRE_MINUTES",
     )
+    smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
+    smtp_username: str = Field(default="", validation_alias="SMTP_USERNAME")
+    smtp_password: str = Field(default="", validation_alias="SMTP_PASSWORD")
+    smtp_from_email: str = Field(default="", validation_alias="SMTP_FROM_EMAIL")
+    smtp_from_name: str = Field(default="V-O", validation_alias="SMTP_FROM_NAME")
+    email_verification_debug: bool = Field(
+        default=False,
+        validation_alias="EMAIL_VERIFICATION_DEBUG",
+    )
     api_docs_enabled: bool = Field(default=True, validation_alias="API_DOCS_ENABLED")
 
     model_config = SettingsConfigDict(
