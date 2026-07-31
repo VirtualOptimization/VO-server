@@ -33,6 +33,17 @@ router = APIRouter()
 
 MAX_VERSION_COUNT = 5
 BASE_VERSION_COUNT = 2
+OLD_CATALOG_GLB_PATH = "/assets/roomplan-catalog/v1/glb/"
+NEW_CATALOG_GLB_PATH = "/asset/"
+
+
+def _catalog_glb_uri(model: FurnitureModel) -> str | None:
+    """공용 카탈로그 모델은 새 S3 asset 경로로 응답한다."""
+    if not model.glb_url:
+        return None
+    if model.user_id is None:
+        return model.glb_url.replace(OLD_CATALOG_GLB_PATH, NEW_CATALOG_GLB_PATH)
+    return model.glb_url
 
 
 def _unity_layout_uri(version: Version) -> str | None:
@@ -180,7 +191,7 @@ def get_furniture_catalog():
                     model_key=model.model_key,
                     name=model.name,
                     furniture_type=model.furniture_type,
-                    glb_url=generate_presigned_url_for_uri(model.glb_url),
+                    glb_url=generate_presigned_url_for_uri(_catalog_glb_uri(model)),
                     width=float(model.width),
                     depth=float(model.depth),
                     height=float(model.height),
