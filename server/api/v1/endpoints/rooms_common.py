@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
 from server.core.s3 import generate_presigned_url, get_json, head_object
@@ -11,11 +12,25 @@ from server.core.s3 import generate_presigned_url, get_json, head_object
 logger = logging.getLogger(__name__)
 
 RAW_ROOT_PREFIX = "scans"
-CATALOG_PREFIX = "assets/roomplan-catalog/v1/usdc"
+CATALOG_PREFIX = "asset"
 MODEL_CONTENT_TYPE = "application/octet-stream"
 USDZ_CONTENT_TYPE = "model/vnd.usdz+zip"
 JSON_CONTENT_TYPE = "application/json"
 URL_EXPIRATION_SECONDS = 3600
+
+CATALOG_CATEGORY_DIRS = {
+    "bed": "Bed",
+    "chair": "Chair",
+    "sofa": "Sofa",
+    "storage": "Storage",
+    "table": "Table",
+}
+
+CATALOG_VARIANT_BY_FILENAME = {
+    "DefaultChair": "Default",
+    "DefaultTable": "Default",
+    "shelf_vertical": "Shelf",
+}
 
 
 def _safe_s3_segment(value: str | None, fallback: str) -> str:
@@ -46,9 +61,14 @@ def _generated_prefix(room_ref: str, owner_segment: str | None = None) -> str:
 
 
 def _catalog_model_key(category: str, model_filename: str) -> str:
-    """modelFileName + category → 카탈로그 S3 key"""
-    base_name = model_filename.removesuffix(".rooms.usdc")
-    return f"{CATALOG_PREFIX}/{category.capitalize()}/{base_name}/{base_name}.rooms.usdc"
+    """modelFileName + category → 카탈로그 GLB S3 key"""
+    category_dir = CATALOG_CATEGORY_DIRS.get(category.lower(), category.capitalize())
+    path = PurePosixPath(model_filename.replace("\\", "/"))
+    filename = path.name
+    base_name = filename.removesuffix(".rooms.usdc")
+    variant = CATALOG_VARIANT_BY_FILENAME.get(base_name, path.parent.name if path.parent.name else base_name)
+    glb_name = base_name.replace("_lShaped", "_lshaped")
+    return f"{CATALOG_PREFIX}/{category_dir}/{variant}/{glb_name}.rooms.glb"
 
 
 async def _get_catalog_model_urls(raw_prefix: str) -> dict[str, str]:
