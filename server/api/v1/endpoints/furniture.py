@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -17,6 +18,7 @@ from server.core.s3 import (
     build_s3_uri,
     generate_presigned_put_url,
     generate_presigned_url_for_uri,
+    get_s3_client,
     object_exists,
     parse_s3_uri,
 )
@@ -137,6 +139,26 @@ def _normalize_s3_key(value: str) -> str:
     return raw.lstrip("/")
 
 
+def _get_owned_furniture_model(db: Session, model_id: int, current_user: User) -> FurnitureModel:
+    model = db.get(FurnitureModel, model_id)
+    if model is None or model.status == "DELETED":
+        raise HTTPException(status_code=404, detail="가구 모델을 찾을 수 없습니다.")
+    if model.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="접근할 수 없는 가구 모델입니다.")
+    return model
+
+
+def _stream_s3_body(body, chunk_size: int = 1024 * 1024):
+    try:
+        while True:
+            chunk = body.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        body.close()
+
+
 @router.post("/models/register", response_model=FurnitureModelResponse, summary="내 가구 등록")
 async def create_furniture_model(
     request: FurnitureModelCreateRequest,
@@ -210,6 +232,46 @@ async def complete_furniture_model_upload(
     db.commit()
     db.refresh(model)
     return _to_model_response(model)
+
+
+@router.get(
+    "/models/{model_id}/glb",
+    summary="내 가구 GLB 파일 스트리밍",
+)
+def stream_furniture_model_glb(
+    model_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    model = _get_owned_furniture_model(db, model_id, current_user)
+    if model.status != "READY":
+        raise HTTPException(status_code=400, detail="GLB 변환이 완료된 가구만 조회할 수 있습니다.")
+
+    parsed = parse_s3_uri(model.glb_url)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail="가구 GLB 경로가 올바르지 않습니다.")
+
+    bucket, key = parsed
+    try:
+        response = get_s3_client().get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            raise HTTPException(status_code=404, detail="가구 GLB 파일을 찾을 수 없습니다.") from exc
+        raise HTTPException(status_code=500, detail="가구 GLB 파일 조회에 실패했습니다.") from exc
+
+    headers = {
+        "Content-Disposition": f'inline; filename="{model.model_key}.glb"',
+    }
+    content_length = response.get("ContentLength")
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
+
+    return StreamingResponse(
+        _stream_s3_body(response["Body"]),
+        media_type="model/gltf-binary",
+        headers=headers,
+    )
 
 
 @router.post(
