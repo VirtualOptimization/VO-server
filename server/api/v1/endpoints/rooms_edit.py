@@ -6,7 +6,6 @@ import math
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
-from sqlalchemy.orm import joinedload
 
 from server.api.v1.deps import get_current_user
 from server.api.v1.endpoints.rooms_common import _scan_root, _user_s3_segment
@@ -375,7 +374,6 @@ async def create_user_edited_version(
     try:
         room = (
             db.query(Room)
-            .options(joinedload(Room.user))
             .filter(Room.id == room_id, Room.user_id == current_user.id)
             .with_for_update()
             .first()
