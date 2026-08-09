@@ -23,6 +23,7 @@ from server.schemas.room_view import (
 )
 from server.schemas.scan import VersionAssetsResponse
 from shared.db import SessionLocal
+from shared.models.furniture_material_asset import FurnitureMaterialAsset
 from shared.models.furniture_model import FurnitureModel
 from shared.models.room import Room
 from shared.models.user import User
@@ -46,6 +47,52 @@ def _catalog_glb_uri(model: FurnitureModel) -> str | None:
     return model.glb_url
 
 
+def _material_asset_model_key(model_key: str, material_preset_id: str) -> str:
+    model_segment = _safe_s3_segment(model_key, "model")
+    preset_segment = _safe_s3_segment(material_preset_id, "material")
+    return f"{model_segment}_{preset_segment}"
+
+
+def _get_version_material_asset_urls(
+    db,
+    version_id: int | None,
+    user_id: int,
+) -> tuple[dict[str, str], dict[str, dict[str, str | int | None]]]:
+    if version_id is None:
+        return {}, {}
+
+    rows = (
+        db.query(FurnitureMaterialAsset, FurnitureModel)
+        .join(FurnitureModel, FurnitureMaterialAsset.base_model_id == FurnitureModel.id)
+        .filter(
+            FurnitureMaterialAsset.version_id == version_id,
+            FurnitureMaterialAsset.user_id == user_id,
+            FurnitureMaterialAsset.status == "READY",
+        )
+        .all()
+    )
+
+    model_urls: dict[str, str] = {}
+    material_asset_urls: dict[str, dict[str, str | int | None]] = {}
+    for asset, model in rows:
+        material_model_key = _material_asset_model_key(model.model_key, asset.material_preset_id)
+        glb_url = generate_presigned_url_for_uri(asset.glb_url)
+        usdz_url = generate_presigned_url_for_uri(asset.usdz_url)
+        if glb_url:
+            model_urls[material_model_key] = glb_url
+        material_asset_urls[asset.furniture_instance_id] = {
+            "base_model_id": model.id,
+            "model_key": model.model_key,
+            "material_model_key": material_model_key,
+            "material_preset_id": asset.material_preset_id,
+            "material_name": asset.material_name,
+            "glb_url": glb_url,
+            "usdz_url": usdz_url,
+        }
+
+    return model_urls, material_asset_urls
+
+
 def _unity_layout_uri(version: Version) -> str | None:
     json_data = version.json_data if isinstance(version.json_data, dict) else {}
     unity_uri = (
@@ -61,7 +108,10 @@ def _unity_layout_uri(version: Version) -> str | None:
     return None
 
 
-def _to_version_detail_response(version: Version) -> VersionDetailResponse:
+def _to_version_detail_response(
+    version: Version,
+    material_asset_urls: dict[str, dict[str, str | int | None]] | None = None,
+) -> VersionDetailResponse:
     return VersionDetailResponse(
         version_id=version.id,
         room_id=version.room_id,
@@ -75,6 +125,7 @@ def _to_version_detail_response(version: Version) -> VersionDetailResponse:
         layout_json_url=generate_presigned_url_for_uri(version.s3_json_url),
         unity_layout_json_url=generate_presigned_url_for_uri(_unity_layout_uri(version)),
         json_data=version.json_data,
+        material_asset_urls=material_asset_urls or {},
     )
 
 
@@ -169,7 +220,12 @@ def get_room_version_detail(
         if version is None:
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
-        return _to_version_detail_response(version)
+        _, material_asset_urls = _get_version_material_asset_urls(
+            db,
+            version.id,
+            current_user.id,
+        )
+        return _to_version_detail_response(version, material_asset_urls=material_asset_urls)
     finally:
         db.close()
 
@@ -324,6 +380,19 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
             .first()
         )
         owner_segment = _user_s3_segment(room.user) if room else None
+        optimized_version = None
+        if room:
+            optimized_version = (
+                db.query(Version)
+                .filter(Version.room_id == room.id, Version.version_type == "OPTIMIZED")
+                .order_by(Version.version_no.desc(), Version.id.desc())
+                .first()
+            )
+        material_model_urls, material_asset_urls = _get_version_material_asset_urls(
+            db,
+            optimized_version.id if optimized_version else None,
+            current_user.id,
+        )
     finally:
         db.close()
 
@@ -351,6 +420,7 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
         raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
 
     model_urls = await _get_catalog_model_urls(raw)
+    model_urls.update(material_model_urls)
 
     return VersionAssetsResponse(
         usdz_url=generate_presigned_url(full_key) if full_exists else None,
@@ -359,4 +429,5 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
         data_url=generate_presigned_url(data_key),
         unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
         model_urls=model_urls,
+        material_asset_urls=material_asset_urls,
     )

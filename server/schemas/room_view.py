@@ -87,6 +87,7 @@ class VersionDetailResponse(BaseModel):
     layout_json_url: str | None = None
     unity_layout_json_url: str | None = None
     json_data: dict[str, Any] | None = None
+    material_asset_urls: dict[str, Any] = Field(default_factory=dict)
 
 
 class UserEditedVersionCreateRequest(BaseModel):
