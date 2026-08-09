@@ -110,6 +110,16 @@ class ScanDetailResponse(BaseModel):
     versions: list[VersionSummary]
 
 
+class VersionMaterialAssetResponse(BaseModel):
+    base_model_id: int
+    model_key: str
+    material_model_key: str
+    material_preset_id: str
+    material_name: str | None = None
+    glb_url: str | None = None
+    usdz_url: str | None = None
+
+
 class VersionAssetsResponse(BaseModel):
     usdz_url: str | None = None       # Room.usdz
     usdz_empty_url: str | None = None # Room_empty.usdz
@@ -117,3 +127,4 @@ class VersionAssetsResponse(BaseModel):
     data_url: str                     # 가구 위치 JSON (origin or optimized)
     unity_data_url: str | None = None # Unity 정규화 좌표계 가구 위치 JSON
     model_urls: dict[str, str]        # { "chair_01.usdc": "catalog GLB presigned_url", ... }
+    material_asset_urls: dict[str, VersionMaterialAssetResponse] = Field(default_factory=dict)

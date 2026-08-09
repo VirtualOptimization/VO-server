@@ -46,6 +46,44 @@ def _catalog_glb_uri(model: FurnitureModel) -> str | None:
     return model.glb_url
 
 
+def _get_version_material_asset_urls(
+    version: Version | None,
+) -> tuple[dict[str, str], dict[str, dict[str, str | int | None]]]:
+    if version is None:
+        return {}, {}
+
+    json_data = version.json_data if isinstance(version.json_data, dict) else {}
+    raw_material_assets = json_data.get("material_assets") or {}
+    if not isinstance(raw_material_assets, dict):
+        return {}, {}
+
+    model_urls: dict[str, str] = {}
+    material_asset_urls: dict[str, dict[str, str | int | None]] = {}
+    for furniture_instance_id, asset in raw_material_assets.items():
+        if not isinstance(asset, dict) or asset.get("status") != "READY":
+            continue
+
+        material_model_key = asset.get("material_model_key")
+        if not isinstance(material_model_key, str) or not material_model_key:
+            continue
+
+        glb_url = generate_presigned_url_for_uri(asset.get("glb"))
+        usdz_url = generate_presigned_url_for_uri(asset.get("usdz"))
+        if glb_url:
+            model_urls[material_model_key] = glb_url
+        material_asset_urls[str(furniture_instance_id)] = {
+            "base_model_id": asset.get("base_model_id"),
+            "model_key": asset.get("model_key"),
+            "material_model_key": material_model_key,
+            "material_preset_id": asset.get("material_preset_id"),
+            "material_name": asset.get("material_name"),
+            "glb_url": glb_url,
+            "usdz_url": usdz_url,
+        }
+
+    return model_urls, material_asset_urls
+
+
 def _unity_layout_uri(version: Version) -> str | None:
     json_data = version.json_data if isinstance(version.json_data, dict) else {}
     unity_uri = (
@@ -61,7 +99,10 @@ def _unity_layout_uri(version: Version) -> str | None:
     return None
 
 
-def _to_version_detail_response(version: Version) -> VersionDetailResponse:
+def _to_version_detail_response(
+    version: Version,
+    material_asset_urls: dict[str, dict[str, str | int | None]] | None = None,
+) -> VersionDetailResponse:
     return VersionDetailResponse(
         version_id=version.id,
         room_id=version.room_id,
@@ -75,6 +116,7 @@ def _to_version_detail_response(version: Version) -> VersionDetailResponse:
         layout_json_url=generate_presigned_url_for_uri(version.s3_json_url),
         unity_layout_json_url=generate_presigned_url_for_uri(_unity_layout_uri(version)),
         json_data=version.json_data,
+        material_asset_urls=material_asset_urls or {},
     )
 
 
@@ -169,7 +211,8 @@ def get_room_version_detail(
         if version is None:
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
-        return _to_version_detail_response(version)
+        _, material_asset_urls = _get_version_material_asset_urls(version)
+        return _to_version_detail_response(version, material_asset_urls=material_asset_urls)
     finally:
         db.close()
 
@@ -324,6 +367,15 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
             .first()
         )
         owner_segment = _user_s3_segment(room.user) if room else None
+        optimized_version = None
+        if room:
+            optimized_version = (
+                db.query(Version)
+                .filter(Version.room_id == room.id, Version.version_type == "OPTIMIZED")
+                .order_by(Version.version_no.desc(), Version.id.desc())
+                .first()
+            )
+        material_model_urls, material_asset_urls = _get_version_material_asset_urls(optimized_version)
     finally:
         db.close()
 
@@ -351,6 +403,7 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
         raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
 
     model_urls = await _get_catalog_model_urls(raw)
+    model_urls.update(material_model_urls)
 
     return VersionAssetsResponse(
         usdz_url=generate_presigned_url(full_key) if full_exists else None,
@@ -359,4 +412,5 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
         data_url=generate_presigned_url(data_key),
         unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
         model_urls=model_urls,
+        material_asset_urls=material_asset_urls,
     )

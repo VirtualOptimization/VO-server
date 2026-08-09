@@ -51,3 +51,38 @@ class FurnitureModelUsdzConversionResponse(BaseModel):
     glb_url: str | None
     usdz_url: str
     usdz_s3_key: str
+
+
+class FurnitureMaterialAssetRegisterRequest(BaseModel):
+    room_id: int
+    version_id: int
+    furniture_instance_id: str = Field(..., min_length=1, max_length=100)
+    material_preset_id: str = Field(..., min_length=1, max_length=100)
+    material_name: str | None = Field(default=None, max_length=100)
+
+
+class FurnitureMaterialAssetCompleteRequest(BaseModel):
+    room_id: int
+    version_id: int
+    furniture_instance_id: str = Field(..., min_length=1, max_length=100)
+    material_preset_id: str = Field(..., min_length=1, max_length=100)
+
+
+class FurnitureMaterialAssetResponse(BaseModel):
+    material_asset_key: str
+    status: str
+    base_model_id: int
+    model_key: str
+    material_model_key: str
+    room_id: int
+    version_id: int
+    furniture_instance_id: str
+    material_preset_id: str
+    material_name: str | None
+    glb_url: str | None
+    usdz_url: str | None
+    upload_url: str | None = None
+    upload_content_type: str | None = None
+    upload_s3_key: str | None = None
+    glb_s3_key: str
+    usdz_s3_key: str
