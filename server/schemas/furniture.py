@@ -61,8 +61,15 @@ class FurnitureMaterialAssetRegisterRequest(BaseModel):
     material_name: str | None = Field(default=None, max_length=100)
 
 
+class FurnitureMaterialAssetCompleteRequest(BaseModel):
+    room_id: int
+    version_id: int
+    furniture_instance_id: str = Field(..., min_length=1, max_length=100)
+    material_preset_id: str = Field(..., min_length=1, max_length=100)
+
+
 class FurnitureMaterialAssetResponse(BaseModel):
-    asset_id: int
+    material_asset_key: str
     status: str
     base_model_id: int
     model_key: str
@@ -79,5 +86,3 @@ class FurnitureMaterialAssetResponse(BaseModel):
     upload_s3_key: str | None = None
     glb_s3_key: str
     usdz_s3_key: str
-    created_at: datetime
-    updated_at: datetime

@@ -23,6 +23,7 @@ from server.core.s3 import (
     parse_s3_uri,
 )
 from server.schemas.furniture import (
+    FurnitureMaterialAssetCompleteRequest,
     FurnitureMaterialAssetRegisterRequest,
     FurnitureMaterialAssetResponse,
     FurnitureModelCreateRequest,
@@ -39,7 +40,6 @@ from server.services.furniture_conversion import (
 )
 from server.core.config import settings
 from shared.db import SessionLocal
-from shared.models.furniture_material_asset import FurnitureMaterialAsset
 from shared.models.furniture_model import FurnitureModel
 from shared.models.room import Room
 from shared.models.user import User
@@ -180,7 +180,7 @@ def _get_base_asset_model(db: Session, model_id: int) -> FurnitureModel:
 
 def _resolve_material_version_context(
     db: Session,
-    request: FurnitureMaterialAssetRegisterRequest,
+    request: FurnitureMaterialAssetRegisterRequest | FurnitureMaterialAssetCompleteRequest,
     current_user: User,
 ) -> tuple[Room, Version]:
     room_id = request.room_id
@@ -199,51 +199,82 @@ def _resolve_material_version_context(
     return room, version
 
 
+def _material_asset_key(version_id: int, furniture_instance_id: str, material_model_key: str) -> str:
+    instance_segment = _safe_s3_segment(furniture_instance_id, "instance")
+    return f"v{version_id}_{instance_segment}_{material_model_key}"
+
+
+def _version_json_data(version: Version) -> dict:
+    return dict(version.json_data) if isinstance(version.json_data, dict) else {}
+
+
+def _get_material_asset_metadata(version: Version, furniture_instance_id: str) -> dict:
+    json_data = _version_json_data(version)
+    material_assets = json_data.get("material_assets") or {}
+    if not isinstance(material_assets, dict):
+        return {}
+    asset = material_assets.get(furniture_instance_id) or {}
+    return dict(asset) if isinstance(asset, dict) else {}
+
+
 def _to_material_asset_response(
-    asset: FurnitureMaterialAsset,
     model: FurnitureModel,
+    version_id: int,
+    room_id: int,
+    furniture_instance_id: str,
+    material_preset_id: str,
+    material_name: str | None,
+    status: str,
     glb_s3_key: str,
     usdz_s3_key: str,
     upload_url: str | None = None,
 ) -> FurnitureMaterialAssetResponse:
+    material_model_key = _material_asset_model_key(model.model_key, material_preset_id)
     return FurnitureMaterialAssetResponse(
-        asset_id=asset.id,
-        status=asset.status,
+        material_asset_key=_material_asset_key(version_id, furniture_instance_id, material_model_key),
+        status=status,
         base_model_id=model.id,
         model_key=model.model_key,
-        material_model_key=_material_asset_model_key(model.model_key, asset.material_preset_id),
-        room_id=asset.room_id,
-        version_id=asset.version_id,
-        furniture_instance_id=asset.furniture_instance_id,
-        material_preset_id=asset.material_preset_id,
-        material_name=asset.material_name,
-        glb_url=generate_presigned_url_for_uri(asset.glb_url) if asset.glb_url else None,
-        usdz_url=generate_presigned_url_for_uri(asset.usdz_url) if asset.usdz_url else None,
+        material_model_key=material_model_key,
+        room_id=room_id,
+        version_id=version_id,
+        furniture_instance_id=furniture_instance_id,
+        material_preset_id=material_preset_id,
+        material_name=material_name,
+        glb_url=generate_presigned_url_for_uri(build_s3_uri(glb_s3_key)),
+        usdz_url=generate_presigned_url_for_uri(build_s3_uri(usdz_s3_key)),
         upload_url=upload_url,
         upload_content_type=GLB_CONTENT_TYPE if upload_url else None,
         upload_s3_key=glb_s3_key if upload_url else None,
         glb_s3_key=glb_s3_key,
         usdz_s3_key=usdz_s3_key,
-        created_at=asset.created_at,
-        updated_at=asset.updated_at,
     )
 
 
 def _sync_material_asset_version_metadata(
     version: Version,
-    asset: FurnitureMaterialAsset,
     model: FurnitureModel,
+    room_id: int,
+    furniture_instance_id: str,
+    material_preset_id: str,
+    material_name: str | None,
+    status: str,
+    glb_s3_key: str,
+    usdz_s3_key: str,
 ) -> None:
-    json_data = dict(version.json_data) if isinstance(version.json_data, dict) else {}
+    json_data = _version_json_data(version)
     material_assets = dict(json_data.get("material_assets") or {})
-    material_assets[asset.furniture_instance_id] = {
+    material_assets[furniture_instance_id] = {
+        "status": status,
+        "room_id": room_id,
+        "version_id": version.id,
         "base_model_id": model.id,
         "model_key": model.model_key,
-        "material_model_key": _material_asset_model_key(model.model_key, asset.material_preset_id),
-        "material_preset_id": asset.material_preset_id,
-        "material_name": asset.material_name,
-        "glb": asset.glb_url,
-        "usdz": asset.usdz_url,
+        "material_model_key": _material_asset_model_key(model.model_key, material_preset_id),
+        "material_preset_id": material_preset_id,
+        "material_name": material_name,
+        "glb": build_s3_uri(glb_s3_key),
+        "usdz": build_s3_uri(usdz_s3_key),
     }
     json_data["material_assets"] = material_assets
     version.json_data = json_data
@@ -354,94 +385,112 @@ async def register_furniture_material_asset(
     glb_s3_key = f"{asset_prefix}.glb"
     usdz_s3_key = f"{asset_prefix}.usdz"
 
-    asset = (
-        db.query(FurnitureMaterialAsset)
-        .filter(
-            FurnitureMaterialAsset.user_id == current_user.id,
-            FurnitureMaterialAsset.room_id == room.id,
-            FurnitureMaterialAsset.version_id == version.id,
-            FurnitureMaterialAsset.furniture_instance_id == request.furniture_instance_id,
-            FurnitureMaterialAsset.base_model_id == model.id,
-        )
-        .one_or_none()
+    _sync_material_asset_version_metadata(
+        version,
+        model,
+        room_id=room.id,
+        furniture_instance_id=request.furniture_instance_id,
+        material_preset_id=request.material_preset_id,
+        material_name=request.material_name,
+        status="UPLOADING",
+        glb_s3_key=glb_s3_key,
+        usdz_s3_key=usdz_s3_key,
     )
-
-    if asset is None:
-        asset = FurnitureMaterialAsset(
-            user_id=current_user.id,
-            room_id=room.id,
-            version_id=version.id,
-            furniture_instance_id=request.furniture_instance_id,
-            base_model_id=model.id,
-        )
-        db.add(asset)
-
-    asset.material_preset_id = request.material_preset_id
-    asset.material_name = request.material_name
-    asset.glb_url = build_s3_uri(glb_s3_key)
-    asset.usdz_url = build_s3_uri(usdz_s3_key)
-    asset.status = "UPLOADING"
-
     db.commit()
-    db.refresh(asset)
 
     upload_url = await generate_presigned_put_url(glb_s3_key, GLB_CONTENT_TYPE)
     return _to_material_asset_response(
-        asset,
         model,
-        glb_s3_key,
-        usdz_s3_key,
+        version_id=version.id,
+        room_id=room.id,
+        furniture_instance_id=request.furniture_instance_id,
+        material_preset_id=request.material_preset_id,
+        material_name=request.material_name,
+        status="UPLOADING",
+        glb_s3_key=glb_s3_key,
+        usdz_s3_key=usdz_s3_key,
         upload_url=upload_url,
     )
 
 
 @router.post(
-    "/material-assets/{asset_id}/complete",
+    "/models/{model_id}/material-assets/complete",
     response_model=FurnitureMaterialAssetResponse,
     summary="기본 가구 텍스처 적용 GLB 업로드 완료 및 USDZ 변환",
 )
 async def complete_furniture_material_asset_upload(
-    asset_id: int,
+    model_id: int,
+    request: FurnitureMaterialAssetCompleteRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    asset = db.get(FurnitureMaterialAsset, asset_id)
-    if asset is None:
-        raise HTTPException(status_code=404, detail="텍스처 적용 가구 asset을 찾을 수 없습니다.")
-    if asset.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="변환할 수 없는 텍스처 적용 가구 asset입니다.")
+    model = _get_base_asset_model(db, model_id)
+    room, version = _resolve_material_version_context(db, request, current_user)
 
-    model = db.get(FurnitureModel, asset.base_model_id)
-    if model is None:
-        raise HTTPException(status_code=404, detail="기본 가구 모델을 찾을 수 없습니다.")
+    material_model_key = _material_asset_model_key(model.model_key, request.material_preset_id)
+    asset_prefix = _version_asset_prefix(version, material_model_key)
+    glb_s3_key = f"{asset_prefix}.glb"
+    usdz_s3_key = f"{asset_prefix}.usdz"
+    existing = _get_material_asset_metadata(version, request.furniture_instance_id)
+    material_name = existing.get("material_name") if isinstance(existing.get("material_name"), str) else None
 
-    glb_s3_key = _key_from_s3_uri(asset.glb_url)
-    usdz_s3_key = _key_from_s3_uri(asset.usdz_url)
-    if not glb_s3_key or not usdz_s3_key:
-        raise HTTPException(status_code=400, detail="텍스처 적용 가구 asset 경로가 올바르지 않습니다.")
     if not await object_exists(glb_s3_key):
         raise HTTPException(status_code=400, detail="업로드된 GLB 파일을 찾을 수 없습니다.")
 
-    asset.status = "PROCESSING"
+    _sync_material_asset_version_metadata(
+        version,
+        model,
+        room_id=room.id,
+        furniture_instance_id=request.furniture_instance_id,
+        material_preset_id=request.material_preset_id,
+        material_name=material_name,
+        status="PROCESSING",
+        glb_s3_key=glb_s3_key,
+        usdz_s3_key=usdz_s3_key,
+    )
     db.commit()
 
     try:
         await convert_furniture_glb_to_usdz(glb_s3_key, usdz_s3_key)
     except (subprocess.SubprocessError, TimeoutError, ClientError, OSError, ValueError, RuntimeError) as exc:
-        asset.status = "FAILED"
+        _sync_material_asset_version_metadata(
+            version,
+            model,
+            room_id=room.id,
+            furniture_instance_id=request.furniture_instance_id,
+            material_preset_id=request.material_preset_id,
+            material_name=material_name,
+            status="FAILED",
+            glb_s3_key=glb_s3_key,
+            usdz_s3_key=usdz_s3_key,
+        )
         db.commit()
         raise HTTPException(status_code=500, detail=f"텍스처 적용 가구 USDZ 변환에 실패했습니다: {exc}") from exc
 
-    version = db.get(Version, asset.version_id)
-    if version is None:
-        raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
-
-    asset.status = "READY"
-    _sync_material_asset_version_metadata(version, asset, model)
+    _sync_material_asset_version_metadata(
+        version,
+        model,
+        room_id=room.id,
+        furniture_instance_id=request.furniture_instance_id,
+        material_preset_id=request.material_preset_id,
+        material_name=material_name,
+        status="READY",
+        glb_s3_key=glb_s3_key,
+        usdz_s3_key=usdz_s3_key,
+    )
     db.commit()
-    db.refresh(asset)
 
-    return _to_material_asset_response(asset, model, glb_s3_key, usdz_s3_key)
+    return _to_material_asset_response(
+        model,
+        version_id=version.id,
+        room_id=room.id,
+        furniture_instance_id=request.furniture_instance_id,
+        material_preset_id=request.material_preset_id,
+        material_name=material_name,
+        status="READY",
+        glb_s3_key=glb_s3_key,
+        usdz_s3_key=usdz_s3_key,
+    )
 
 
 @router.get(

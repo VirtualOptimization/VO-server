@@ -39,9 +39,4 @@ class FurnitureModel(Base):
     )
 
     furniture_items: Mapped[list["FurnitureItem"]] = relationship(back_populates="model")
-    material_assets: Mapped[list["FurnitureMaterialAsset"]] = relationship(
-        back_populates="base_model",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
     user: Mapped["User | None"] = relationship(back_populates="furniture_models")
