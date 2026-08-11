@@ -32,9 +32,12 @@ from server.schemas.furniture import (
     FurnitureModelResponse,
     FurnitureModelUsdzConversionResponse,
     FurnitureModelUsdzUpdateRequest,
+    TexturePresetListResponse,
+    TexturePresetResponse,
 )
 from server.services.auth_service import get_user_by_access_token
 from server.services.furniture_conversion import (
+    apply_furniture_texture_to_glb,
     convert_furniture_glb_to_usdz,
     convert_furniture_usdc_to_glb,
 )
@@ -42,6 +45,7 @@ from server.core.config import settings
 from shared.db import SessionLocal
 from shared.models.furniture_model import FurnitureModel
 from shared.models.room import Room
+from shared.models.texture_preset import TexturePreset
 from shared.models.user import User
 from shared.models.version import Version
 
@@ -178,6 +182,13 @@ def _get_base_asset_model(db: Session, model_id: int) -> FurnitureModel:
     return model
 
 
+def _get_texture_preset(db: Session, preset_key: str) -> TexturePreset:
+    preset = db.query(TexturePreset).filter(TexturePreset.preset_key == preset_key).one_or_none()
+    if preset is None:
+        raise HTTPException(status_code=404, detail="텍스처 preset을 찾을 수 없습니다.")
+    return preset
+
+
 def _resolve_material_version_context(
     db: Session,
     request: FurnitureMaterialAssetRegisterRequest | FurnitureMaterialAssetCompleteRequest,
@@ -251,6 +262,18 @@ def _to_material_asset_response(
     )
 
 
+def _to_texture_preset_response(preset: TexturePreset) -> TexturePresetResponse:
+    return TexturePresetResponse(
+        preset_id=preset.id,
+        preset_key=preset.preset_key,
+        name=preset.name,
+        texture_s3_key=preset.texture_s3_key,
+        texture_url=generate_presigned_url_for_uri(build_s3_uri(preset.texture_s3_key)),
+        created_at=preset.created_at,
+        updated_at=preset.updated_at,
+    )
+
+
 def _sync_material_asset_version_metadata(
     version: Version,
     model: FurnitureModel,
@@ -291,6 +314,37 @@ def _stream_s3_body(body, chunk_size: int = 1024 * 1024):
         body.close()
 
 
+def _stream_model_glb(model: FurnitureModel):
+    if model.status != "READY":
+        raise HTTPException(status_code=400, detail="GLB 변환이 완료된 가구만 조회할 수 있습니다.")
+
+    parsed = parse_s3_uri(model.glb_url)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail="가구 GLB 경로가 올바르지 않습니다.")
+
+    bucket, key = parsed
+    try:
+        response = get_s3_client().get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            raise HTTPException(status_code=404, detail="가구 GLB 파일을 찾을 수 없습니다.") from exc
+        raise HTTPException(status_code=500, detail="가구 GLB 파일 조회에 실패했습니다.") from exc
+
+    headers = {
+        "Content-Disposition": f'inline; filename="{model.model_key}.glb"',
+    }
+    content_length = response.get("ContentLength")
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
+
+    return StreamingResponse(
+        _stream_s3_body(response["Body"]),
+        media_type="model/gltf-binary",
+        headers=headers,
+    )
+
+
 @router.post("/models/register", response_model=FurnitureModelResponse, summary="내 가구 등록")
 async def create_furniture_model(
     request: FurnitureModelCreateRequest,
@@ -323,6 +377,19 @@ async def create_furniture_model(
     db.refresh(model)
     upload_url = await generate_presigned_put_url(source_key, USDC_CONTENT_TYPE)
     return _to_model_response(model, upload_url=upload_url, upload_s3_key=source_key)
+
+
+@router.get(
+    "/texture-presets",
+    response_model=TexturePresetListResponse,
+    summary="기본 가구 텍스처 preset 목록 조회",
+)
+def list_texture_presets(
+    _current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    presets = db.query(TexturePreset).order_by(TexturePreset.id.asc()).all()
+    return TexturePresetListResponse(presets=[_to_texture_preset_response(preset) for preset in presets])
 
 
 @router.post(
@@ -369,7 +436,7 @@ async def complete_furniture_model_upload(
 @router.post(
     "/models/{model_id}/material-assets/register",
     response_model=FurnitureMaterialAssetResponse,
-    summary="기본 가구 텍스처 적용 GLB 업로드 세션 생성",
+    summary="기본 가구 텍스처 적용 asset 생성 준비",
 )
 async def register_furniture_material_asset(
     model_id: int,
@@ -378,7 +445,9 @@ async def register_furniture_material_asset(
     db: Session = Depends(get_db),
 ):
     model = _get_base_asset_model(db, model_id)
+    preset = _get_texture_preset(db, request.material_preset_id)
     room, version = _resolve_material_version_context(db, request, current_user)
+    material_name = request.material_name or preset.name
 
     material_model_key = _material_asset_model_key(model.model_key, request.material_preset_id)
     asset_prefix = _version_asset_prefix(version, material_model_key)
@@ -391,32 +460,30 @@ async def register_furniture_material_asset(
         room_id=room.id,
         furniture_instance_id=request.furniture_instance_id,
         material_preset_id=request.material_preset_id,
-        material_name=request.material_name,
-        status="UPLOADING",
+        material_name=material_name,
+        status="PENDING",
         glb_s3_key=glb_s3_key,
         usdz_s3_key=usdz_s3_key,
     )
     db.commit()
 
-    upload_url = await generate_presigned_put_url(glb_s3_key, GLB_CONTENT_TYPE)
     return _to_material_asset_response(
         model,
         version_id=version.id,
         room_id=room.id,
         furniture_instance_id=request.furniture_instance_id,
         material_preset_id=request.material_preset_id,
-        material_name=request.material_name,
-        status="UPLOADING",
+        material_name=material_name,
+        status="PENDING",
         glb_s3_key=glb_s3_key,
         usdz_s3_key=usdz_s3_key,
-        upload_url=upload_url,
     )
 
 
 @router.post(
     "/models/{model_id}/material-assets/complete",
     response_model=FurnitureMaterialAssetResponse,
-    summary="기본 가구 텍스처 적용 GLB 업로드 완료 및 USDZ 변환",
+    summary="기본 가구 텍스처 적용 GLB/USDZ 생성",
 )
 async def complete_furniture_material_asset_upload(
     model_id: int,
@@ -425,6 +492,7 @@ async def complete_furniture_material_asset_upload(
     db: Session = Depends(get_db),
 ):
     model = _get_base_asset_model(db, model_id)
+    preset = _get_texture_preset(db, request.material_preset_id)
     room, version = _resolve_material_version_context(db, request, current_user)
 
     material_model_key = _material_asset_model_key(model.model_key, request.material_preset_id)
@@ -432,10 +500,15 @@ async def complete_furniture_material_asset_upload(
     glb_s3_key = f"{asset_prefix}.glb"
     usdz_s3_key = f"{asset_prefix}.usdz"
     existing = _get_material_asset_metadata(version, request.furniture_instance_id)
-    material_name = existing.get("material_name") if isinstance(existing.get("material_name"), str) else None
+    material_name = existing.get("material_name") if isinstance(existing.get("material_name"), str) else preset.name
+    base_glb_s3_key = _key_from_s3_uri(model.glb_url)
 
-    if not await object_exists(glb_s3_key):
-        raise HTTPException(status_code=400, detail="업로드된 GLB 파일을 찾을 수 없습니다.")
+    if not base_glb_s3_key:
+        raise HTTPException(status_code=400, detail="기본 가구 GLB 경로가 없습니다.")
+    if not await object_exists(base_glb_s3_key):
+        raise HTTPException(status_code=400, detail="기본 가구 GLB 파일을 찾을 수 없습니다.")
+    if not await object_exists(preset.texture_s3_key):
+        raise HTTPException(status_code=400, detail="텍스처 preset 파일을 찾을 수 없습니다.")
 
     _sync_material_asset_version_metadata(
         version,
@@ -451,6 +524,7 @@ async def complete_furniture_material_asset_upload(
     db.commit()
 
     try:
+        await apply_furniture_texture_to_glb(base_glb_s3_key, preset.texture_s3_key, glb_s3_key)
         await convert_furniture_glb_to_usdz(glb_s3_key, usdz_s3_key)
     except (subprocess.SubprocessError, TimeoutError, ClientError, OSError, ValueError, RuntimeError) as exc:
         _sync_material_asset_version_metadata(
@@ -503,34 +577,7 @@ def stream_furniture_model_glb(
     db: Session = Depends(get_db),
 ):
     model = _get_owned_furniture_model(db, model_id, current_user)
-    if model.status != "READY":
-        raise HTTPException(status_code=400, detail="GLB 변환이 완료된 가구만 조회할 수 있습니다.")
-
-    parsed = parse_s3_uri(model.glb_url)
-    if parsed is None:
-        raise HTTPException(status_code=400, detail="가구 GLB 경로가 올바르지 않습니다.")
-
-    bucket, key = parsed
-    try:
-        response = get_s3_client().get_object(Bucket=bucket, Key=key)
-    except ClientError as exc:
-        error_code = exc.response.get("Error", {}).get("Code")
-        if error_code in {"404", "NoSuchKey", "NotFound"}:
-            raise HTTPException(status_code=404, detail="가구 GLB 파일을 찾을 수 없습니다.") from exc
-        raise HTTPException(status_code=500, detail="가구 GLB 파일 조회에 실패했습니다.") from exc
-
-    headers = {
-        "Content-Disposition": f'inline; filename="{model.model_key}.glb"',
-    }
-    content_length = response.get("ContentLength")
-    if content_length is not None:
-        headers["Content-Length"] = str(content_length)
-
-    return StreamingResponse(
-        _stream_s3_body(response["Body"]),
-        media_type="model/gltf-binary",
-        headers=headers,
-    )
+    return _stream_model_glb(model)
 
 
 @router.post(

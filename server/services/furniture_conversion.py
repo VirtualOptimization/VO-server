@@ -42,6 +42,34 @@ async def convert_furniture_usdc_to_glb(source_key: str, output_key: str) -> Non
     await asyncio.to_thread(_run_furniture_conversion_sync, source_key, output_key)
 
 
+def _run_furniture_texture_apply_sync(source_key: str, texture_key: str, output_key: str) -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "S3_BUCKET_NAME": settings.s3_bucket_name,
+            "INPUT_S3_KEY": source_key,
+            "TEXTURE_S3_KEY": texture_key,
+            "OUTPUT_S3_KEY": output_key,
+            "PYTHONPATH": str(REPO_ROOT),
+        }
+    )
+    subprocess.run(
+        [sys.executable, "workers/converter/apply_glb_texture.py"],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        timeout=settings.local_pipeline_timeout_seconds,
+    )
+
+
+async def apply_furniture_texture_to_glb(source_key: str, texture_key: str, output_key: str) -> None:
+    """Apply a texture image from S3 to a base furniture GLB and upload a new GLB."""
+    if not settings.s3_bucket_name:
+        raise ValueError("S3_BUCKET_NAME is not configured")
+
+    await asyncio.to_thread(_run_furniture_texture_apply_sync, source_key, texture_key, output_key)
+
+
 def _run_furniture_usdz_conversion_sync(source_key: str, output_key: str) -> None:
     env = os.environ.copy()
     env.update(
