@@ -86,3 +86,17 @@ class FurnitureMaterialAssetResponse(BaseModel):
     upload_s3_key: str | None = None
     glb_s3_key: str
     usdz_s3_key: str
+
+
+class TexturePresetResponse(BaseModel):
+    preset_id: int
+    preset_key: str
+    name: str
+    texture_s3_key: str
+    texture_url: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TexturePresetListResponse(BaseModel):
+    presets: list[TexturePresetResponse]
