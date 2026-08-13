@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import logging
 
+import json 
+
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import Session, joinedload
 
 from server.api.v1.deps import get_current_user
 from server.api.v1.endpoints.rooms_common import _get_catalog_model_urls, _resolve_prefixes, _user_s3_segment
-from server.core.s3 import generate_presigned_url, generate_presigned_url_for_uri, head_object
+from server.core.s3 import generate_presigned_url, generate_presigned_url_for_uri, head_object, get_s3_client
+from server.core.config import settings
 from server.schemas.room_view import (
     FurnitureCatalogItemResponse,
     FurnitureCatalogResponse,
@@ -27,6 +30,7 @@ from shared.models.furniture_model import FurnitureModel
 from shared.models.room import Room
 from shared.models.user import User
 from shared.models.version import Version
+
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -129,6 +133,46 @@ def _version_state_summary(versions: list[Version]) -> dict[str, int | bool]:
         "user_edited_count": user_edited_count,
     }
 
+
+def _get_room_objects_with_model_ids(db: Session, unity_data_key: str) -> list[dict]:
+    """unity_data_key JSON을 읽어와 가구 인스턴스별 model_id를 매핑한 objects 목록을 반환한다."""
+    try:
+        s3_client = get_s3_client()
+        response = s3_client.get_object(Bucket=settings.s3_bucket_name, Key=unity_data_key)
+        content = response["Body"].read().decode("utf-8")
+        unity_json = json.loads(content)
+    except Exception as e:
+        logger.warning(f"Failed to read or parse unity json at {unity_data_key}: {e}")
+        return []
+
+    raw_objects = unity_json.get("objects") or []
+    if not isinstance(raw_objects, list):
+        return []
+
+    # 고유 model_key 추출 후 DB에서 한 번에 조회 (IN Query)
+    model_keys = {
+        obj.get("modelKey") or obj.get("model_key") 
+        for obj in raw_objects 
+        if isinstance(obj, dict) and (obj.get("modelKey") or obj.get("model_key"))
+    }
+    
+    models = db.query(FurnitureModel).filter(FurnitureModel.model_key.in_(model_keys)).all()
+    model_map = {m.model_key: m.id for m in models}
+
+    objects_result = []
+    for obj in raw_objects:
+        if not isinstance(obj, dict):
+            continue
+        model_key = obj.get("modelKey") or obj.get("model_key")
+        identifier = obj.get("identifier")
+        
+        objects_result.append({
+            "identifier": identifier,
+            "model_key": model_key,
+            "model_id": model_map.get(model_key),  # DB 매핑 model_id
+        })
+
+    return objects_result
 
 # ── GET /rooms  (로그인 사용자 공간 목록) ─────────────────────────────────────
 
@@ -307,7 +351,7 @@ def get_room_versions(room_id: int, current_user: User = Depends(get_current_use
         db.close()
 
 
-# ── GET /rooms/{room_id}/origin  (다운로드) ──────────────────────────────────
+# ── GET /rooms/{room_id}/origin (다운로드) ──────────────────────────────────
 
 @router.get("/{room_id}/origin", response_model=VersionAssetsResponse)
 async def get_origin_assets(room_id: int, current_user: User = Depends(get_current_user)):
@@ -320,41 +364,47 @@ async def get_origin_assets(room_id: int, current_user: User = Depends(get_curre
             .first()
         )
         owner_segment = _user_s3_segment(room.user) if room else None
+
+        prefixes = await _resolve_prefixes(str(room_id), owner_segment)
+        if prefixes is None:
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
+
+        raw, _ = prefixes
+        data_key = f"{raw}/room_data.json"
+        unity_data_key = f"{raw}/room_data.unity.json"
+        full_key  = f"{raw}/Room.usdz"
+        empty_key = f"{raw}/Room_empty.usdz"
+        glb_key = f"{raw}/output.glb"
+
+        full_exists = await head_object(full_key) is not None
+        empty_exists = await head_object(empty_key) is not None
+        glb_exists = await head_object(glb_key) is not None
+        unity_data_exists = await head_object(unity_data_key) is not None
+
+        if not full_exists and not empty_exists and not glb_exists:
+            raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
+
+        model_urls = await _get_catalog_model_urls(raw)
+
+        # [추가] unity json에서 objects 및 model_id 매핑 추출 (동기 호출)
+        objects = []
+        if unity_data_exists:
+            objects = _get_room_objects_with_model_ids(db, unity_data_key)
+
+        return VersionAssetsResponse(
+            usdz_url=generate_presigned_url(full_key) if full_exists else None,
+            usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
+            glb_url=generate_presigned_url(glb_key) if glb_exists else None,
+            data_url=generate_presigned_url(data_key),
+            unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
+            model_urls=model_urls,
+            objects=objects,  # <- [추가]
+        )
     finally:
         db.close()
 
-    prefixes = await _resolve_prefixes(str(room_id), owner_segment)
-    if prefixes is None:
-        raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
 
-    raw, _ = prefixes
-    data_key = f"{raw}/room_data.json"
-    unity_data_key = f"{raw}/room_data.unity.json"
-    full_key  = f"{raw}/Room.usdz"
-    empty_key = f"{raw}/Room_empty.usdz"
-    glb_key = f"{raw}/output.glb"
-
-    full_exists = await head_object(full_key) is not None
-    empty_exists = await head_object(empty_key) is not None
-    glb_exists = await head_object(glb_key) is not None
-    unity_data_exists = await head_object(unity_data_key) is not None
-
-    if not full_exists and not empty_exists and not glb_exists:
-        raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
-
-    model_urls = await _get_catalog_model_urls(raw)
-
-    return VersionAssetsResponse(
-        usdz_url=generate_presigned_url(full_key) if full_exists else None,
-        usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
-        glb_url=generate_presigned_url(glb_key) if glb_exists else None,
-        data_url=generate_presigned_url(data_key),
-        unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
-        model_urls=model_urls,
-    )
-
-
-# ── GET /rooms/{room_id}/optimized  (다운로드) ───────────────────────────────
+# ── GET /rooms/{room_id}/optimized (다운로드) ───────────────────────────────
 
 @router.get("/{room_id}/optimized", response_model=VersionAssetsResponse)
 async def get_optimized_assets(room_id: int, current_user: User = Depends(get_current_user)):
@@ -376,41 +426,47 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
                 .first()
             )
         material_model_urls, material_asset_urls = _get_version_material_asset_urls(optimized_version)
+
+        prefixes = await _resolve_prefixes(str(room_id), owner_segment)
+        if prefixes is None:
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
+
+        raw, gen = prefixes
+        data_key = f"{gen}/room_data.roomplan_optimized.json"
+        unity_data_key = f"{gen}/room_data.roomplan_optimized.unity.json"
+
+        if await head_object(data_key) is None:
+            raise HTTPException(status_code=404, detail="최적화 데이터가 아직 없습니다.")
+        unity_data_exists = await head_object(unity_data_key) is not None
+
+        full_key  = f"{raw}/Room.usdz"
+        empty_key = f"{raw}/Room_empty.usdz"
+        glb_key = f"{raw}/output.glb"
+
+        full_exists = await head_object(full_key) is not None
+        empty_exists = await head_object(empty_key) is not None
+        glb_exists = await head_object(glb_key) is not None
+
+        if not full_exists and not empty_exists and not glb_exists:
+            raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
+
+        model_urls = await _get_catalog_model_urls(raw)
+        model_urls.update(material_model_urls)
+
+        # [추가] unity json에서 objects 및 model_id 매핑 추출 (동기 호출)
+        objects = []
+        if unity_data_exists:
+            objects = _get_room_objects_with_model_ids(db, unity_data_key)
+
+        return VersionAssetsResponse(
+            usdz_url=generate_presigned_url(full_key) if full_exists else None,
+            usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
+            glb_url=generate_presigned_url(glb_key) if glb_exists else None,
+            data_url=generate_presigned_url(data_key),
+            unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
+            model_urls=model_urls,
+            material_asset_urls=material_asset_urls,
+            objects=objects,  # <- [추가]
+        )
     finally:
         db.close()
-
-    prefixes = await _resolve_prefixes(str(room_id), owner_segment)
-    if prefixes is None:
-        raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
-
-    raw, gen = prefixes
-    data_key = f"{gen}/room_data.roomplan_optimized.json"
-    unity_data_key = f"{gen}/room_data.roomplan_optimized.unity.json"
-
-    if await head_object(data_key) is None:
-        raise HTTPException(status_code=404, detail="최적화 데이터가 아직 없습니다.")
-    unity_data_exists = await head_object(unity_data_key) is not None
-
-    full_key  = f"{raw}/Room.usdz"
-    empty_key = f"{raw}/Room_empty.usdz"
-    glb_key = f"{raw}/output.glb"
-
-    full_exists = await head_object(full_key) is not None
-    empty_exists = await head_object(empty_key) is not None
-    glb_exists = await head_object(glb_key) is not None
-
-    if not full_exists and not empty_exists and not glb_exists:
-        raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
-
-    model_urls = await _get_catalog_model_urls(raw)
-    model_urls.update(material_model_urls)
-
-    return VersionAssetsResponse(
-        usdz_url=generate_presigned_url(full_key) if full_exists else None,
-        usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
-        glb_url=generate_presigned_url(glb_key) if glb_exists else None,
-        data_url=generate_presigned_url(data_key),
-        unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
-        model_urls=model_urls,
-        material_asset_urls=material_asset_urls,
-    )

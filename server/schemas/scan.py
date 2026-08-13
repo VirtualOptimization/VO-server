@@ -128,3 +128,4 @@ class VersionAssetsResponse(BaseModel):
     unity_data_url: str | None = None # Unity 정규화 좌표계 가구 위치 JSON
     model_urls: dict[str, str]        # { "chair_01.usdc": "catalog GLB presigned_url", ... }
     material_asset_urls: dict[str, VersionMaterialAssetResponse] = Field(default_factory=dict)
+    objects: list[dict[str, Any]] = []  # 기본값 빈 리스트
