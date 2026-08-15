@@ -37,6 +37,7 @@ from server.schemas.furniture import (
 )
 from server.services.auth_service import get_user_by_access_token
 from server.services.furniture_conversion import (
+    FurnitureConversionError,
     apply_furniture_texture_to_glb,
     convert_furniture_glb_to_usdz,
     convert_furniture_usdc_to_glb,
@@ -421,10 +422,10 @@ async def complete_furniture_model_upload(
 
     try:
         await convert_furniture_usdc_to_glb(source_key, output_key)
-    except (subprocess.SubprocessError, TimeoutError, ClientError, OSError, ValueError) as exc:
+    except (FurnitureConversionError, ClientError, OSError, ValueError) as exc:
         model.status = "FAILED"
         db.commit()
-        raise HTTPException(status_code=500, detail=f"가구 GLB 변환에 실패했습니다: {exc}") from exc
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     model.status = "READY"
     model.glb_url = build_s3_uri(output_key)

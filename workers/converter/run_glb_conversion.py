@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import tempfile
+import zipfile
 from pathlib import Path
 import subprocess
 
@@ -44,6 +45,17 @@ def run_usd2gltf(input_file: str, output_file: str) -> None:
     subprocess.run(command, check=True)
     
     print("--- USDZ -> GLB conversion done ---")
+
+
+def normalize_usd_input_extension(input_file: str) -> str:
+    """Correct an old `.usdc` key when the uploaded bytes are a USDZ archive."""
+    path = Path(input_file)
+    if path.suffix.lower() == ".usdz" or not zipfile.is_zipfile(path):
+        return input_file
+    corrected = path.with_suffix(".usdz")
+    path.rename(corrected)
+    print(f"Detected USDZ archive; using normalized input filename: {corrected}")
+    return str(corrected)
 
 
 def run_room_data_to_glb(
@@ -87,6 +99,7 @@ def main() -> int:
                 floor_thickness=args.floor_thickness,
             )
         else:
+            input_file = normalize_usd_input_extension(input_file)
             run_usd2gltf(input_file, output_file)
     else:
         import boto3
@@ -114,6 +127,7 @@ def main() -> int:
                 input_key = require(input_key, "input_s3_key")
                 print(f"Downloading {input_key} to {input_file}...")
                 s3.download_file(bucket, input_key, input_file)
+                input_file = normalize_usd_input_extension(input_file)
                 run_usd2gltf(input_file, output_file)
 
             if not args.skip_upload:
