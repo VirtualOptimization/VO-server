@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -37,8 +38,16 @@ def run_usd2gltf(input_file: str, output_file: str) -> None:
     print(f"Input file: {input_file}")
     print(f"Output file: {output_file}")
     
+    # systemd's PATH does not include `.venv/bin`, even though this script is
+    # launched by the virtual-environment Python. Resolve the console script
+    # beside that interpreter instead of relying on a global `usd2gltf`.
+    usd2gltf_bin = Path(sys.executable).with_name("usd2gltf")
+    if not usd2gltf_bin.is_file():
+        raise RuntimeError(
+            f"usd2gltf is not installed next to the active Python: {usd2gltf_bin}"
+        )
     command = [
-        "usd2gltf",
+        str(usd2gltf_bin),
         "-i", input_file,
         "-o", output_file
     ]
