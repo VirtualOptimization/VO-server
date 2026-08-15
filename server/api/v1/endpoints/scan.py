@@ -20,12 +20,21 @@ from server.api.v1.endpoints.rooms_common import (
     _user_s3_segment,
 )
 from server.core.config import settings
-from server.core.s3 import build_s3_uri, generate_presigned_put_url, get_json, object_exists, upload_json
+from server.core.s3 import (
+    build_s3_uri,
+    delete_objects,
+    generate_presigned_put_url,
+    get_json,
+    list_keys,
+    object_exists,
+    upload_json,
+)
 from server.services.local_scan_pipeline import run_local_scan_pipeline
 from server.schemas.scan import (
     PresignedUploadTarget,
     ScanUploadCompleteRequest,
     ScanUploadCompleteResponse,
+    ScanCancelResponse,
     ScanUploadStartRequest,
     ScanUploadStartResponse,
 )
@@ -36,6 +45,8 @@ from shared.models.version import Version
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+INCOMPLETE_SCAN_STATUSES = {"PENDING", "UPLOADED", "FAILED"}
 
 
 # ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
@@ -347,3 +358,53 @@ async def complete_scan_upload(
         uploaded_keys=processed_keys, pipeline_started=pipeline_started,
         execution_arn=execution_arn, pipeline_input=pipeline_input,
     )
+
+
+@router.delete("/{room_id}", response_model=ScanCancelResponse, summary="미완료 방 스캔 취소")
+async def cancel_incomplete_scan(
+    room_id: int,
+    current_user: User = Depends(get_current_user),
+):
+    """Delete an abandoned scan session and every S3 object created for it.
+
+    A room row is created before file upload so that an interrupted upload can
+    be tracked.  Only incomplete sessions are cancellable: deleting a room
+    while the pipeline is processing would race with its worker.
+    """
+    db = SessionLocal()
+    try:
+        room = db.query(Room).filter(Room.id == room_id, Room.user_id == current_user.id).first()
+        if room is None:
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
+        if room.status not in INCOMPLETE_SCAN_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail="완료되었거나 처리 중인 방 스캔은 취소할 수 없습니다.",
+            )
+
+        owner_segment = _user_s3_segment(current_user)
+        prefixes = (
+            _raw_prefix(str(room.id), owner_segment),
+            _generated_prefix(str(room.id), owner_segment),
+        )
+        keys = await asyncio.to_thread(
+            lambda: [key for prefix in prefixes for key in list_keys(prefix)]
+        )
+        if keys:
+            await asyncio.to_thread(delete_objects, keys)
+
+        db.delete(room)
+        db.commit()
+        return ScanCancelResponse(
+            room_id=room_id,
+            status="CANCELLED",
+            deleted_s3_object_count=len(keys),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to cancel scan room_id=%s", room_id)
+        raise HTTPException(status_code=500, detail="미완료 스캔을 취소하지 못했습니다.") from exc
+    finally:
+        db.close()
