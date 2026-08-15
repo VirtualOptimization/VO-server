@@ -38,16 +38,14 @@ def run_usd2gltf(input_file: str, output_file: str) -> None:
     print(f"Input file: {input_file}")
     print(f"Output file: {output_file}")
     
-    # systemd's PATH does not include `.venv/bin`, even though this script is
-    # launched by the virtual-environment Python. Resolve the console script
-    # beside that interpreter instead of relying on a global `usd2gltf`.
-    usd2gltf_bin = Path(sys.executable).with_name("usd2gltf")
-    if not usd2gltf_bin.is_file():
-        raise RuntimeError(
-            f"usd2gltf is not installed next to the active Python: {usd2gltf_bin}"
-        )
+    # Use the active virtual-environment Python, rather than a bare
+    # ``usd2gltf`` command.  systemd's PATH does not include `.venv/bin`.
+    # The compatibility runner also resolves UV names connected through a
+    # material interface, which usd2gltf 0.3.5 otherwise reads as None.
+    compat_runner = Path(__file__).with_name("run_usd2gltf_compat.py")
     command = [
-        str(usd2gltf_bin),
+        sys.executable,
+        str(compat_runner),
         "-i", input_file,
         "-o", output_file
     ]
