@@ -97,6 +97,14 @@ class ScanUploadCompleteResponse(BaseModel):
     pipeline_input: dict[str, Any]
 
 
+class ScanCancelResponse(BaseModel):
+    """Response returned after an incomplete scan session is discarded."""
+
+    room_id: int
+    status: str
+    deleted_s3_object_count: int
+
+
 # ── BE-B: 조회 / 다운로드 ────────────────────────────────────────────────────
 
 class VersionSummary(BaseModel):

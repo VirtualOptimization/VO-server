@@ -183,7 +183,10 @@ def get_my_rooms(current_user: User = Depends(get_current_user)):
         rooms = (
             db.query(Room)
             .options(joinedload(Room.versions))
-            .filter(Room.user_id == current_user.id)
+            .filter(
+                Room.user_id == current_user.id,
+                Room.status == "COMPLETED",
+            )
             .order_by(Room.updated_at.desc(), Room.created_at.desc(), Room.id.desc())
             .all()
         )
