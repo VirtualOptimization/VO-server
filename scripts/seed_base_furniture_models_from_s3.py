@@ -3,6 +3,9 @@
 Expected S3 layout:
     asset/{Category}/{Variant}/{ModelName}.rooms.glb
 
+DB model_key layout:
+    {Category}/{Variant}/{ModelName}.rooms.usdc
+
 Example:
     .venv/bin/python scripts/seed_base_furniture_models_from_s3.py \
         --bucket project7-65-sydney-vo-s3 \
@@ -122,10 +125,16 @@ def strip_prefix_parts(key: str, prefix: str) -> tuple[str, ...]:
     return key_parts
 
 
-def model_key_from_filename(filename: str) -> str:
-    if filename.endswith(".rooms.glb"):
-        return filename.removesuffix(".rooms.glb") + ".rooms.usdc"
-    return filename.removesuffix(".glb")
+def model_key_from_relative_parts(rel_parts: tuple[str, ...]) -> str:
+    """Build a unique model key that mirrors the RoomPlan catalog path.
+
+    File names are duplicated across several RoomPlan catalog folders, so using
+    only the file name would collapse multiple catalog entries into one DB row.
+    """
+    relative_path = PurePosixPath(*rel_parts).as_posix()
+    if relative_path.endswith(".rooms.glb"):
+        return relative_path.removesuffix(".rooms.glb") + ".rooms.usdc"
+    return relative_path.removesuffix(".glb")
 
 
 def display_name_from_filename(filename: str) -> str:
@@ -138,7 +147,7 @@ def catalog_model_from_key(*, bucket: str, prefix: str, key: str) -> CatalogMode
     filename = PurePosixPath(key).name
 
     return CatalogModel(
-        model_key=model_key_from_filename(filename),
+        model_key=model_key_from_relative_parts(rel_parts),
         name=display_name_from_filename(filename),
         furniture_type=CATEGORY_TYPE_MAP.get(category, category.lower() if category else None),
         glb_url=f"s3://{bucket}/{key}",
