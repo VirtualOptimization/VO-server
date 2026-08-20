@@ -90,12 +90,20 @@ class VersionDetailResponse(BaseModel):
     material_asset_urls: dict[str, Any] = Field(default_factory=dict)
 
 
+class UserEditedVersionMaterialChange(BaseModel):
+    furniture_instance_id: str = Field(..., min_length=1, max_length=100)
+    model_id: int
+    material_preset_id: str = Field(..., min_length=1, max_length=100)
+    material_name: str | None = Field(default=None, max_length=100)
+
+
 class UserEditedVersionCreateRequest(BaseModel):
     parent_version_id: int
     version_name: str | None = None
     json_data: dict[str, Any] | None = None
     objects: list[dict[str, Any]] = Field(default_factory=list)
     ios_objects: list[dict[str, Any]] | None = None
+    material_changes: list[UserEditedVersionMaterialChange] = Field(default_factory=list)
 
 
 class UserEditedVersionCreateResponse(BaseModel):
