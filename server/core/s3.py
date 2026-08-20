@@ -90,6 +90,21 @@ async def upload_bytes(key: str, data: bytes, content_type: str = "application/o
     return build_s3_uri(key)
 
 
+async def copy_object(source_key: str, target_key: str) -> str:
+    """같은 버킷 안에서 S3 객체를 복사하고 target s3 URI를 반환한다."""
+    if not settings.s3_bucket_name:
+        raise ValueError("S3_BUCKET_NAME is not configured")
+
+    await asyncio.to_thread(
+        get_s3_client().copy_object,
+        Bucket=settings.s3_bucket_name,
+        CopySource={"Bucket": settings.s3_bucket_name, "Key": source_key},
+        Key=target_key,
+    )
+
+    return build_s3_uri(target_key)
+
+
 async def head_object(key: str) -> dict | None:
     """S3 객체 메타데이터를 반환한다. 없으면 None."""
     try:
