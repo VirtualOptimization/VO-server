@@ -10,9 +10,18 @@ CATEGORY_MAPPING = {
     "storage": "shelf",
 }
 
+CATALOG_CATEGORY_DIRS = {
+    "bed": "Bed",
+    "chair": "Chair",
+    "sofa": "Sofa",
+    "storage": "Storage",
+    "table": "Table",
+}
+
 DEFAULT_MODEL_VARIANT_BY_FILENAME = {
     "DefaultChair": "Default",
     "DefaultTable": "Default",
+    "shelf_vertical": "Shelf",
 }
 
 
@@ -37,23 +46,22 @@ def infer_catalog_model_key(category: str, model_file_name: str | None) -> str |
     if not model_file_name:
         return None
 
-    normalized_category = map_roomplan_category(category)
+    category_dir = CATALOG_CATEGORY_DIRS.get(category.lower(), category.capitalize())
     path = PurePosixPath(model_file_name.replace("\\", "/"))
-    parts = [part for part in path.parts if part not in {"", ".", "Resources", "Models"}]
+    filename = path.name
+    base_name = filename.removesuffix(".rooms.usdc").removesuffix(".usdc")
+    variant = DEFAULT_MODEL_VARIANT_BY_FILENAME.get(
+        base_name,
+        path.parent.name if path.parent.name else base_name,
+    )
 
-    if len(parts) >= 3:
-        variant = parts[-2]
-    else:
-        variant = path.name
-        if variant.endswith(".usdc"):
-            variant = variant[:-5]
-        if variant.endswith(".rooms"):
-            variant = variant[:-6]
-        variant = DEFAULT_MODEL_VARIANT_BY_FILENAME.get(variant, variant)
-
-    if not variant:
+    if not base_name or not variant:
         return None
-    return f"{normalized_category}:{variant}"
+
+    # S3 catalog GLB names use this lowercase variant, and DB keys mirror it
+    # with the .rooms.usdc source extension.
+    model_name = base_name.replace("_lShaped", "_lshaped")
+    return f"{category_dir}/{variant}/{model_name}.rooms.usdc"
 
 
 def build_optimizer_metadata(category: str) -> dict[str, Any]:
