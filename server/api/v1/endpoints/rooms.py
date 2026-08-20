@@ -6,6 +6,7 @@ import logging
 import json 
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from server.api.v1.deps import get_current_user
@@ -134,6 +135,37 @@ def _version_state_summary(versions: list[Version]) -> dict[str, int | bool]:
     }
 
 
+def _catalog_model_db_aliases(model: FurnitureModel) -> set[str]:
+    """Return DB/model JSON key variants that can refer to the same catalog model."""
+    model_key = model.model_key
+    filename = model_key.rsplit("/", 1)[-1]
+    stem = filename.removesuffix(".rooms.usdc").removesuffix(".usdc").removesuffix(".glb")
+    category_from_path = model_key.split("/", 1)[0].lower() if "/" in model_key else None
+    variant_from_path = model_key.split("/")[-2] if "/" in model_key and len(model_key.split("/")) >= 2 else None
+
+    category_aliases = {
+        alias
+        for alias in {
+            (model.furniture_type or "").strip().lower(),
+            category_from_path,
+        }
+        if alias
+    }
+    if "storage" in category_aliases:
+        category_aliases.add("shelf")
+    if "shelf" in category_aliases:
+        category_aliases.add("storage")
+
+    aliases = {model_key, filename, stem}
+    for category in category_aliases:
+        if stem:
+            aliases.add(f"{category}:{stem}")
+        if variant_from_path:
+            aliases.add(f"{category}:{variant_from_path}")
+
+    return {alias for alias in aliases if alias}
+
+
 def _get_room_objects_with_model_ids(db: Session, unity_data_key: str) -> list[dict]:
     """unity_data_key JSON을 읽어와 가구 인스턴스별 model_id를 매핑한 objects 목록을 반환한다."""
     try:
@@ -149,15 +181,27 @@ def _get_room_objects_with_model_ids(db: Session, unity_data_key: str) -> list[d
     if not isinstance(raw_objects, list):
         return []
 
-    # 고유 model_key 추출 후 DB에서 한 번에 조회 (IN Query)
     model_keys = {
         obj.get("modelKey") or obj.get("model_key") 
         for obj in raw_objects 
         if isinstance(obj, dict) and (obj.get("modelKey") or obj.get("model_key"))
     }
-    
-    models = db.query(FurnitureModel).filter(FurnitureModel.model_key.in_(model_keys)).all()
-    model_map = {m.model_key: m.id for m in models}
+
+    models = (
+        db.query(FurnitureModel)
+        .filter(
+            FurnitureModel.status != "DELETED",
+            or_(
+                FurnitureModel.user_id.is_(None),
+                FurnitureModel.model_key.in_(model_keys),
+            ),
+        )
+        .all()
+    )
+    model_map: dict[str, tuple[int, str]] = {}
+    for model in models:
+        for alias in _catalog_model_db_aliases(model):
+            model_map.setdefault(alias, (model.id, model.model_key))
 
     objects_result = []
     for obj in raw_objects:
@@ -165,11 +209,12 @@ def _get_room_objects_with_model_ids(db: Session, unity_data_key: str) -> list[d
             continue
         model_key = obj.get("modelKey") or obj.get("model_key")
         identifier = obj.get("identifier")
+        matched_model = model_map.get(model_key)
         
         objects_result.append({
             "identifier": identifier,
-            "model_key": model_key,
-            "model_id": model_map.get(model_key),  # DB 매핑 model_id
+            "model_key": matched_model[1] if matched_model else model_key,
+            "model_id": matched_model[0] if matched_model else None,
         })
 
     return objects_result

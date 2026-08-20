@@ -32,7 +32,6 @@ CATALOG_VARIANT_BY_FILENAME = {
     "shelf_vertical": "Shelf",
 }
 
-
 def _safe_s3_segment(value: str | None, fallback: str) -> str:
     source = value or fallback
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", source).strip("._-")
@@ -71,6 +70,16 @@ def _catalog_model_key(category: str, model_filename: str) -> str:
     return f"{CATALOG_PREFIX}/{category_dir}/{variant}/{glb_name}.rooms.glb"
 
 
+def _catalog_db_model_key(category: str, model_filename: str) -> str:
+    """modelFileName + category → furniture_models.model_key"""
+    return (
+        _catalog_model_key(category, model_filename)
+        .removeprefix(f"{CATALOG_PREFIX}/")
+        .removesuffix(".rooms.glb")
+        + ".rooms.usdc"
+    )
+
+
 async def _get_catalog_model_urls(raw_prefix: str) -> dict[str, str]:
     """room_data.json을 읽어 카탈로그 presigned URL 맵 반환"""
     try:
@@ -81,7 +90,8 @@ async def _get_catalog_model_urls(raw_prefix: str) -> dict[str, str]:
             category = obj.get("category", "")
             if model_filename and category:
                 key = _catalog_model_key(category, model_filename)
-                model_urls[model_filename] = generate_presigned_url(key)
+                presigned_url = generate_presigned_url(key)
+                model_urls[_catalog_db_model_key(category, model_filename)] = presigned_url
         return model_urls
     except Exception as e:
         logger.warning(f"카탈로그 모델 URL 조회 실패: {e}")
