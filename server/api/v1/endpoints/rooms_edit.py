@@ -24,10 +24,7 @@ from server.schemas.room_view import (
     UserEditedVersionCreateResponse,
     UserEditedVersionMaterialChange,
 )
-from server.services.furniture_conversion import (
-    apply_furniture_texture_to_glb,
-    convert_furniture_glb_to_usdz,
-)
+from server.services.conversion_tasks import TASK_MATERIAL_ASSET, enqueue_conversion_task
 from server.services.transform.unity_roomplan import (
     denormalize_roomplan_from_unity,
     fix_unity_transforms_from_rotation,
@@ -495,12 +492,12 @@ async def _copy_parent_material_assets(
     return copied_assets
 
 
-async def _generate_material_asset(
+async def _prepare_material_asset(
     db,
     room: Room,
     edit_prefix: str,
     change: UserEditedVersionMaterialChange,
-) -> dict:
+) -> tuple[dict, dict]:
     model = db.get(FurnitureModel, change.model_id)
     if model is None or model.status == "DELETED":
         raise HTTPException(status_code=404, detail="가구 모델을 찾을 수 없습니다.")
@@ -528,11 +525,8 @@ async def _generate_material_asset(
     usdz_key = f"{edit_prefix}/assets/{material_model_key}.usdz"
     material_name = change.material_name or preset.name
 
-    await apply_furniture_texture_to_glb(base_glb_key, preset.texture_s3_key, glb_key)
-    await convert_furniture_glb_to_usdz(glb_key, usdz_key)
-
-    return {
-        "status": "READY",
+    asset = {
+        "status": "PROCESSING",
         "room_id": room.id,
         "version_id": None,
         "base_model_id": model.id,
@@ -543,6 +537,22 @@ async def _generate_material_asset(
         "glb": build_s3_uri(glb_key),
         "usdz": build_s3_uri(usdz_key),
     }
+    task_spec = {
+        "source_key": base_glb_key,
+        "texture_key": preset.texture_s3_key,
+        "output_glb_key": glb_key,
+        "output_usdz_key": usdz_key,
+        "payload": {
+            "furniture_instance_id": change.furniture_instance_id,
+            "room_id": room.id,
+            "base_model_id": model.id,
+            "model_key": model.model_key,
+            "material_model_key": material_model_key,
+            "material_preset_id": preset.preset_key,
+            "material_name": material_name,
+        },
+    }
+    return asset, task_spec
 
 
 # ── POST /rooms/{room_id}/versions ───────────────────────────────────────────
@@ -655,13 +665,16 @@ async def create_user_edited_version(
             edit_prefix=edit_prefix,
             overridden_identifiers=overridden_identifiers,
         )
+        material_task_specs = []
         for change in payload.material_changes:
-            material_assets[change.furniture_instance_id] = await _generate_material_asset(
+            material_asset, task_spec = await _prepare_material_asset(
                 db,
                 room,
                 edit_prefix,
                 change,
             )
+            material_assets[change.furniture_instance_id] = material_asset
+            material_task_specs.append(task_spec)
 
         if material_assets:
             _apply_material_assets_to_layout(unity_layout, material_assets)
@@ -698,6 +711,18 @@ async def create_user_edited_version(
                 **version_json_data,
                 "material_assets": _material_assets_with_version_id(material_assets, version.id),
             }
+
+        for task_spec in material_task_specs:
+            enqueue_conversion_task(
+                db,
+                task_type=TASK_MATERIAL_ASSET,
+                source_key=task_spec["source_key"],
+                texture_key=task_spec["texture_key"],
+                output_glb_key=task_spec["output_glb_key"],
+                output_usdz_key=task_spec["output_usdz_key"],
+                version_id=version.id,
+                payload={**task_spec["payload"], "version_id": version.id},
+            )
 
         db.commit()
         db.refresh(version)
