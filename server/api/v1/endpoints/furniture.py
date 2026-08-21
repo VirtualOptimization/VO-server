@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -33,10 +32,10 @@ from server.schemas.furniture import (
     TexturePresetResponse,
 )
 from server.services.auth_service import get_user_by_access_token
-from server.services.furniture_conversion import (
-    FurnitureConversionError,
-    convert_furniture_glb_to_usdz,
-    convert_furniture_usdc_to_glb,
+from server.services.conversion_tasks import (
+    TASK_FURNITURE_GLB_TO_USDZ,
+    TASK_FURNITURE_USDC_TO_GLB,
+    enqueue_conversion_task,
 )
 from server.core.config import settings
 from shared.db import SessionLocal
@@ -280,15 +279,14 @@ async def complete_furniture_model_upload(
     model.status = "PROCESSING"
     db.commit()
 
-    try:
-        await convert_furniture_usdc_to_glb(source_key, output_key)
-    except (FurnitureConversionError, ClientError, OSError, ValueError) as exc:
-        model.status = "FAILED"
-        db.commit()
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    model.status = "READY"
     model.glb_url = build_s3_uri(output_key)
+    enqueue_conversion_task(
+        db,
+        task_type=TASK_FURNITURE_USDC_TO_GLB,
+        source_key=source_key,
+        output_glb_key=output_key,
+        furniture_model_id=model.id,
+    )
     db.commit()
     db.refresh(model)
     return _to_model_response(model)
@@ -334,10 +332,13 @@ async def convert_furniture_model_to_usdz(
     if not await object_exists(source_key):
         raise HTTPException(status_code=400, detail="변환할 GLB 파일을 찾을 수 없습니다.")
 
-    try:
-        await convert_furniture_glb_to_usdz(source_key, output_key)
-    except (subprocess.SubprocessError, TimeoutError, ClientError, OSError, ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=500, detail=f"가구 USDZ 변환에 실패했습니다: {exc}") from exc
+    enqueue_conversion_task(
+        db,
+        task_type=TASK_FURNITURE_GLB_TO_USDZ,
+        source_key=source_key,
+        output_usdz_key=output_key,
+        furniture_model_id=model.id,
+    )
 
     model.usdz_url = build_s3_uri(output_key)
     db.commit()
@@ -346,7 +347,7 @@ async def convert_furniture_model_to_usdz(
     return FurnitureModelUsdzConversionResponse(
         model_id=model.id,
         model_key=model.model_key,
-        status=model.status,
+        status="PROCESSING",
         glb_url=generate_presigned_url_for_uri(model.glb_url),
         usdz_url=generate_presigned_url_for_uri(model.usdz_url),
         usdz_s3_key=output_key,

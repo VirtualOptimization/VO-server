@@ -49,7 +49,7 @@ class FurnitureModelUsdzConversionResponse(BaseModel):
     model_key: str
     status: str
     glb_url: str | None
-    usdz_url: str
+    usdz_url: str | None
     usdz_s3_key: str
 
 
