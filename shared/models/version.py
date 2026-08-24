@@ -31,6 +31,7 @@ class Version(Base):
         ForeignKey("versions.id", ondelete="SET NULL")
     )
     version_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="READY")
     version_no: Mapped[int] = mapped_column(nullable=False, server_default="0")
     s3_json_url: Mapped[str | None] = mapped_column(Text)
     converted_glb_url: Mapped[str | None] = mapped_column(Text)
@@ -48,4 +49,3 @@ class Version(Base):
     furniture_items: Mapped[list["FurnitureItem"]] = relationship(
         back_populates="version", cascade="all, delete-orphan", passive_deletes=True
     )
-

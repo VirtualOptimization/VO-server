@@ -697,6 +697,7 @@ async def create_user_edited_version(
             room_id=room.id,
             parent_version_id=parent_version.id,
             version_type="USER_EDITED",
+            status="PENDING" if material_task_specs else "READY",
             version_no=next_version_no,
             version_name=version_name,
             s3_json_url=ios_s3_url,
@@ -734,6 +735,7 @@ async def create_user_edited_version(
             version_type=version.version_type,
             version_no=version.version_no,
             version_name=version.version_name,
+            status=version.status,
             created_at=version.created_at,
         )
 
