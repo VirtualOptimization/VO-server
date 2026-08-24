@@ -14,7 +14,10 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from server.core.s3 import build_s3_uri
+from botocore.exceptions import ClientError
+
+from server.core.config import settings
+from server.core.s3 import build_s3_uri, get_s3_client
 from server.services.conversion_tasks import (
     TASK_FURNITURE_GLB_TO_USDZ,
     TASK_FURNITURE_USDC_TO_GLB,
@@ -62,6 +65,7 @@ def _mark_done(db: Session, task: ConversionTask) -> None:
     task.finished_at = _utcnow()
     task.error_message = None
     db.commit()
+    _refresh_related_version_status(db, task)
 
 
 def _mark_failed(db: Session, task: ConversionTask, exc: BaseException) -> None:
@@ -70,6 +74,39 @@ def _mark_failed(db: Session, task: ConversionTask, exc: BaseException) -> None:
     task.error_message = str(exc)[:4000]
     _mark_related_model_failed(db, task)
     _mark_related_material_failed(db, task, str(exc))
+    db.commit()
+    _refresh_related_version_status(db, task)
+
+
+def _refresh_related_version_status(db: Session, task: ConversionTask) -> None:
+    """Keep a version's asset status in sync with its queued material conversions."""
+    if task.version_id is None:
+        return
+
+    version = db.get(Version, task.version_id)
+    if version is None:
+        return
+
+    statuses = [
+        status
+        for (status,) in (
+            db.query(ConversionTask.status)
+            .filter(
+                ConversionTask.version_id == version.id,
+                ConversionTask.task_type == TASK_MATERIAL_ASSET,
+            )
+            .all()
+        )
+    ]
+    if not statuses:
+        return
+
+    if "FAILED" in statuses:
+        version.status = "FAILED"
+    elif any(status in {"PENDING", "RUNNING"} for status in statuses):
+        version.status = "PENDING"
+    elif all(status == "DONE" for status in statuses):
+        version.status = "READY"
     db.commit()
 
 
@@ -109,17 +146,30 @@ def _mark_related_material_failed(db: Session, task: ConversionTask, message: st
     version.json_data = json_data
 
 
+def _mark_furniture_glb_ready(db: Session, task: ConversionTask) -> None:
+    if task.furniture_model_id is None or not task.output_glb_key:
+        return
+
+    model = db.get(FurnitureModel, task.furniture_model_id)
+    if model is not None and model.status != "DELETED":
+        model.status = "READY"
+        model.glb_url = build_s3_uri(task.output_glb_key)
+
+
+def _mark_furniture_usdz_ready(db: Session, task: ConversionTask) -> None:
+    if task.furniture_model_id is None or not task.output_usdz_key:
+        return
+
+    model = db.get(FurnitureModel, task.furniture_model_id)
+    if model is not None and model.status != "DELETED":
+        model.usdz_url = build_s3_uri(task.output_usdz_key)
+
+
 def _complete_furniture_glb_task(db: Session, task: ConversionTask) -> None:
     if not task.source_key or not task.output_glb_key:
         raise ValueError("FURNITURE_USDC_TO_GLB task requires source_key and output_glb_key")
 
     _run_furniture_conversion_sync(task.source_key, task.output_glb_key)
-
-    if task.furniture_model_id is not None:
-        model = db.get(FurnitureModel, task.furniture_model_id)
-        if model is not None and model.status != "DELETED":
-            model.status = "READY"
-            model.glb_url = build_s3_uri(task.output_glb_key)
 
 
 def _complete_furniture_usdz_task(db: Session, task: ConversionTask) -> None:
@@ -128,11 +178,6 @@ def _complete_furniture_usdz_task(db: Session, task: ConversionTask) -> None:
 
     _run_furniture_usdz_conversion_sync(task.source_key, task.output_usdz_key)
 
-    if task.furniture_model_id is not None:
-        model = db.get(FurnitureModel, task.furniture_model_id)
-        if model is not None and model.status != "DELETED":
-            model.usdz_url = build_s3_uri(task.output_usdz_key)
-
 
 def _complete_material_asset_task(db: Session, task: ConversionTask) -> None:
     if not task.source_key or not task.texture_key or not task.output_glb_key or not task.output_usdz_key:
@@ -140,7 +185,6 @@ def _complete_material_asset_task(db: Session, task: ConversionTask) -> None:
 
     _run_furniture_texture_apply_sync(task.source_key, task.texture_key, task.output_glb_key)
     _run_furniture_usdz_conversion_sync(task.output_glb_key, task.output_usdz_key)
-    _mark_material_asset_ready(db, task)
 
 
 def _mark_material_asset_ready(db: Session, task: ConversionTask) -> None:
@@ -174,6 +218,75 @@ def _mark_material_asset_ready(db: Session, task: ConversionTask) -> None:
     version.json_data = json_data
 
 
+def _expected_output_keys(task: ConversionTask) -> list[str]:
+    if task.task_type == TASK_FURNITURE_USDC_TO_GLB:
+        return [task.output_glb_key] if task.output_glb_key else []
+    if task.task_type == TASK_FURNITURE_GLB_TO_USDZ:
+        return [task.output_usdz_key] if task.output_usdz_key else []
+    if task.task_type == TASK_MATERIAL_ASSET:
+        return [key for key in (task.output_glb_key, task.output_usdz_key) if key]
+    return []
+
+
+def _outputs_exist(task: ConversionTask) -> bool:
+    """Return whether all artifacts required by a task are already in S3."""
+    keys = _expected_output_keys(task)
+    if not keys or not settings.s3_bucket_name:
+        return False
+
+    s3 = get_s3_client()
+    try:
+        for key in keys:
+            s3.head_object(Bucket=settings.s3_bucket_name, Key=key)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+    return True
+
+
+def _apply_completed_task_result(db: Session, task: ConversionTask) -> None:
+    """Persist DB state for a task whose output was produced successfully."""
+    if task.task_type == TASK_FURNITURE_USDC_TO_GLB:
+        _mark_furniture_glb_ready(db, task)
+    elif task.task_type == TASK_FURNITURE_GLB_TO_USDZ:
+        _mark_furniture_usdz_ready(db, task)
+    elif task.task_type == TASK_MATERIAL_ASSET:
+        _mark_material_asset_ready(db, task)
+    else:
+        raise ValueError(f"Unsupported conversion task type: {task.task_type}")
+
+
+def _reconcile_finished_running_tasks(db: Session) -> int:
+    """Finalize interrupted tasks when their expected S3 output already exists.
+
+    The converter uploads its result before this worker writes DONE. Therefore a
+    process interruption in that narrow window used to leave tasks RUNNING
+    forever even though the conversion itself was successful.
+    """
+    tasks = (
+        db.query(ConversionTask)
+        .filter(ConversionTask.status == "RUNNING")
+        .order_by(ConversionTask.started_at.asc(), ConversionTask.id.asc())
+        .with_for_update(skip_locked=True)
+        .all()
+    )
+    reconciled = 0
+    for task in tasks:
+        try:
+            if not _outputs_exist(task):
+                continue
+            _apply_completed_task_result(db, task)
+            _mark_done(db, task)
+            logger.info("conversion_task_reconciled id=%s type=%s", task.id, task.task_type)
+            reconciled += 1
+        except Exception:  # noqa: BLE001 - leave task RUNNING for a later retry if reconciliation cannot verify it
+            logger.exception("conversion_task_reconcile_failed id=%s type=%s", task.id, task.task_type)
+            db.rollback()
+    return reconciled
+
+
 def _execute_task(db: Session, task: ConversionTask) -> None:
     logger.info("conversion_task_started id=%s type=%s", task.id, task.task_type)
     if task.task_type == TASK_FURNITURE_USDC_TO_GLB:
@@ -185,15 +298,17 @@ def _execute_task(db: Session, task: ConversionTask) -> None:
     else:
         raise ValueError(f"Unsupported conversion task type: {task.task_type}")
 
+    _apply_completed_task_result(db, task)
     _mark_done(db, task)
     logger.info("conversion_task_done id=%s type=%s", task.id, task.task_type)
 
 
 def run_once() -> bool:
     with SessionLocal() as db:
+        reconciled = _reconcile_finished_running_tasks(db)
         task = _claim_next_task(db)
         if task is None:
-            return False
+            return reconciled > 0
 
         try:
             _execute_task(db, task)

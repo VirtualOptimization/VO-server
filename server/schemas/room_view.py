@@ -24,6 +24,7 @@ class RoomVersionItem(BaseModel):
     version_type: str
     version_no: int
     version_name: str | None = None
+    status: str = "READY"
     created_at: datetime | None = None
     is_latest: bool
     can_delete: bool
@@ -81,6 +82,7 @@ class VersionDetailResponse(BaseModel):
     version_type: str
     version_no: int
     version_name: str | None = None
+    status: str = "READY"
     created_at: datetime | None = None
     room_shell_url: str | None = None
     converted_glb_url: str | None = None
@@ -113,4 +115,5 @@ class UserEditedVersionCreateResponse(BaseModel):
     version_type: str
     version_no: int
     version_name: str | None = None
+    status: str = "READY"
     created_at: datetime | None = None
