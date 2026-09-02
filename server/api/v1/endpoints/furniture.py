@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Security
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from server.api.v1.endpoints.rooms_common import _safe_s3_segment
@@ -22,6 +23,8 @@ from server.core.s3 import (
     parse_s3_uri,
 )
 from server.schemas.furniture import (
+    BaseFurnitureMaterialAssetListResponse,
+    BaseFurnitureMaterialAssetResponse,
     FurnitureModelCreateRequest,
     FurnitureModelDeleteResponse,
     FurnitureModelListResponse,
@@ -40,6 +43,7 @@ from server.services.conversion_tasks import (
 from server.core.config import settings
 from shared.db import SessionLocal
 from shared.models.furniture_model import FurnitureModel
+from shared.models.furniture_material_asset import FurnitureMaterialAsset
 from shared.models.texture_preset import TexturePreset
 from shared.models.user import User
 
@@ -156,10 +160,28 @@ def _to_texture_preset_response(preset: TexturePreset) -> TexturePresetResponse:
         preset_id=preset.id,
         preset_key=preset.preset_key,
         name=preset.name,
+        source=preset.source,
         texture_s3_key=preset.texture_s3_key,
         texture_url=generate_presigned_url_for_uri(build_s3_uri(preset.texture_s3_key)),
         created_at=preset.created_at,
         updated_at=preset.updated_at,
+    )
+
+
+def _to_base_material_asset_response(
+    asset: FurnitureMaterialAsset,
+    preset: TexturePreset,
+) -> BaseFurnitureMaterialAssetResponse:
+    return BaseFurnitureMaterialAssetResponse(
+        material_asset_id=asset.id,
+        model_id=asset.furniture_model_id,
+        preset_id=preset.id,
+        preset_key=preset.preset_key,
+        preset_name=preset.name,
+        status=asset.status,
+        glb_url=generate_presigned_url_for_uri(asset.glb_url) if asset.status == "READY" else None,
+        usdz_url=generate_presigned_url_for_uri(asset.usdz_url) if asset.status == "READY" else None,
+        error_message=asset.error_message,
     )
 
 
@@ -248,8 +270,42 @@ def list_texture_presets(
     _current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    presets = db.query(TexturePreset).order_by(TexturePreset.id.asc()).all()
+    presets = (
+        db.query(TexturePreset)
+        .filter(or_(TexturePreset.user_id.is_(None), TexturePreset.user_id == _current_user.id))
+        .order_by(TexturePreset.id.asc())
+        .all()
+    )
     return TexturePresetListResponse(presets=[_to_texture_preset_response(preset) for preset in presets])
+
+
+@router.get(
+    "/models/{model_id}/material-assets",
+    response_model=BaseFurnitureMaterialAssetListResponse,
+    summary="기본 가구의 텍스처 적용 모델 목록 조회",
+)
+def list_base_furniture_material_assets(
+    model_id: int,
+    _current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    model = db.get(FurnitureModel, model_id)
+    if model is None or model.status == "DELETED":
+        raise HTTPException(status_code=404, detail="가구 모델을 찾을 수 없습니다.")
+    if model.user_id is not None:
+        raise HTTPException(status_code=400, detail="기본 가구 모델만 텍스처 asset을 조회할 수 있습니다.")
+
+    rows = (
+        db.query(FurnitureMaterialAsset, TexturePreset)
+        .join(TexturePreset, TexturePreset.id == FurnitureMaterialAsset.texture_preset_id)
+        .filter(FurnitureMaterialAsset.furniture_model_id == model.id)
+        .order_by(TexturePreset.id.asc())
+        .all()
+    )
+    return BaseFurnitureMaterialAssetListResponse(
+        model_id=model.id,
+        assets=[_to_base_material_asset_response(asset, preset) for asset, preset in rows],
+    )
 
 
 @router.post(

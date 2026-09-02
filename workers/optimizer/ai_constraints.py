@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import ssl
 import urllib.error
 import urllib.request
 from typing import Any
+
+import certifi
 
 
 SUPPORTED_PROVIDER = "gemini"
@@ -82,7 +85,8 @@ def generate_gemini_constraints(problem: dict[str, Any]) -> dict[str, Any]:
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl_context) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
