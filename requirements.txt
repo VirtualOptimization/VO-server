@@ -10,6 +10,7 @@ psycopg[binary]
 asyncpg
 boto3
 botocore
+certifi
 numpy
 scipy
 redis

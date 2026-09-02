@@ -33,6 +33,7 @@ from server.services.transform.unity_roomplan import (
 )
 from shared.db import SessionLocal
 from shared.models.furniture_model import FurnitureModel
+from shared.models.furniture_material_asset import FurnitureMaterialAsset
 from shared.models.room import Room
 from shared.models.texture_preset import TexturePreset
 from shared.models.user import User
@@ -464,6 +465,12 @@ async def _copy_parent_material_assets(
         if not isinstance(asset, dict) or asset.get("status") != "READY":
             continue
 
+        # Shared base-model variants are immutable and reusable. A new user-edit
+        # version only keeps their reference instead of copying identical files.
+        if asset.get("scope") == "BASE_PRESET":
+            copied_assets[furniture_instance_id] = {**asset, "version_id": None}
+            continue
+
         material_model_key = asset.get("material_model_key")
         if not isinstance(material_model_key, str) or not material_model_key:
             continue
@@ -495,9 +502,10 @@ async def _copy_parent_material_assets(
 async def _prepare_material_asset(
     db,
     room: Room,
+    current_user: User,
     edit_prefix: str,
     change: UserEditedVersionMaterialChange,
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict | None]:
     model = db.get(FurnitureModel, change.model_id)
     if model is None or model.status == "DELETED":
         raise HTTPException(status_code=404, detail="가구 모델을 찾을 수 없습니다.")
@@ -511,22 +519,81 @@ async def _prepare_material_asset(
     )
     if preset is None:
         raise HTTPException(status_code=404, detail="텍스처 preset을 찾을 수 없습니다.")
-
-    base_glb_key = _key_from_s3_uri(model.glb_url)
-    if not base_glb_key:
-        raise HTTPException(status_code=400, detail="기본 가구 GLB 경로가 없습니다.")
-    if not await object_exists(base_glb_key):
-        raise HTTPException(status_code=400, detail="기본 가구 GLB 파일을 찾을 수 없습니다.")
-    if not await object_exists(preset.texture_s3_key):
-        raise HTTPException(status_code=400, detail="텍스처 preset 파일을 찾을 수 없습니다.")
+    if preset.user_id is not None and preset.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="다른 사용자가 생성한 텍스처는 적용할 수 없습니다.")
 
     material_model_key = _material_asset_model_key(model.model_key, preset.preset_key)
-    glb_key = f"{edit_prefix}/assets/{material_model_key}.glb"
-    usdz_key = f"{edit_prefix}/assets/{material_model_key}.usdz"
     material_name = change.material_name or preset.name
 
+    # Shared presets are pre-generated for every base model. Generated user
+    # presets stay on-demand because pre-building every possible combination is
+    # wasteful and their output belongs to this user's edited version.
+    if preset.user_id is not None:
+        base_glb_key = _key_from_s3_uri(model.glb_url)
+        if not base_glb_key:
+            raise HTTPException(status_code=400, detail="기본 가구 GLB 경로가 없습니다.")
+        if not await object_exists(base_glb_key):
+            raise HTTPException(status_code=400, detail="기본 가구 GLB 파일을 찾을 수 없습니다.")
+        if not await object_exists(preset.texture_s3_key):
+            raise HTTPException(status_code=400, detail="사용자 텍스처 파일을 찾을 수 없습니다.")
+
+        glb_key = f"{edit_prefix}/assets/{material_model_key}.glb"
+        usdz_key = f"{edit_prefix}/assets/{material_model_key}.usdz"
+        asset = {
+            "status": "PROCESSING",
+            "scope": "USER_GENERATED",
+            "room_id": room.id,
+            "version_id": None,
+            "base_model_id": model.id,
+            "model_key": model.model_key,
+            "material_model_key": material_model_key,
+            "material_preset_id": preset.preset_key,
+            "material_name": material_name,
+            "glb": build_s3_uri(glb_key),
+            "usdz": build_s3_uri(usdz_key),
+        }
+        task_spec = {
+            "source_key": base_glb_key,
+            "texture_key": preset.texture_s3_key,
+            "output_glb_key": glb_key,
+            "output_usdz_key": usdz_key,
+            "payload": {
+                "furniture_instance_id": change.furniture_instance_id,
+                "room_id": room.id,
+                "base_model_id": model.id,
+                "model_key": model.model_key,
+                "material_model_key": material_model_key,
+                "material_preset_id": preset.preset_key,
+                "material_name": material_name,
+            },
+        }
+        return asset, task_spec
+
+    base_asset = (
+        db.query(FurnitureMaterialAsset)
+        .filter(
+            FurnitureMaterialAsset.furniture_model_id == model.id,
+            FurnitureMaterialAsset.texture_preset_id == preset.id,
+        )
+        .one_or_none()
+    )
+    if base_asset is None:
+        raise HTTPException(
+            status_code=409,
+            detail="선택한 기본 가구 텍스처 asset이 아직 준비되지 않았습니다.",
+        )
+    if base_asset.status != "READY":
+        raise HTTPException(
+            status_code=409,
+            detail=f"선택한 기본 가구 텍스처 asset 준비 상태: {base_asset.status}",
+        )
+    if not base_asset.glb_url or not base_asset.usdz_url:
+        raise HTTPException(status_code=500, detail="완료된 텍스처 asset 경로가 없습니다.")
+
     asset = {
-        "status": "PROCESSING",
+        "status": "READY",
+        "scope": "BASE_PRESET",
+        "material_asset_id": base_asset.id,
         "room_id": room.id,
         "version_id": None,
         "base_model_id": model.id,
@@ -534,25 +601,10 @@ async def _prepare_material_asset(
         "material_model_key": material_model_key,
         "material_preset_id": preset.preset_key,
         "material_name": material_name,
-        "glb": build_s3_uri(glb_key),
-        "usdz": build_s3_uri(usdz_key),
+        "glb": base_asset.glb_url,
+        "usdz": base_asset.usdz_url,
     }
-    task_spec = {
-        "source_key": base_glb_key,
-        "texture_key": preset.texture_s3_key,
-        "output_glb_key": glb_key,
-        "output_usdz_key": usdz_key,
-        "payload": {
-            "furniture_instance_id": change.furniture_instance_id,
-            "room_id": room.id,
-            "base_model_id": model.id,
-            "model_key": model.model_key,
-            "material_model_key": material_model_key,
-            "material_preset_id": preset.preset_key,
-            "material_name": material_name,
-        },
-    }
-    return asset, task_spec
+    return asset, None
 
 
 # ── POST /rooms/{room_id}/versions ───────────────────────────────────────────
@@ -670,11 +722,13 @@ async def create_user_edited_version(
             material_asset, task_spec = await _prepare_material_asset(
                 db,
                 room,
+                current_user,
                 edit_prefix,
                 change,
             )
             material_assets[change.furniture_instance_id] = material_asset
-            material_task_specs.append(task_spec)
+            if task_spec is not None:
+                material_task_specs.append(task_spec)
 
         if material_assets:
             _apply_material_assets_to_layout(unity_layout, material_assets)
