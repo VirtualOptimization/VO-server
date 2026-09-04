@@ -83,25 +83,3 @@ class BaseFurnitureMaterialAssetResponse(BaseModel):
 class BaseFurnitureMaterialAssetListResponse(BaseModel):
     model_id: int
     assets: list[BaseFurnitureMaterialAssetResponse]
-
-
-class MaterialChatRequest(BaseModel):
-    model_id: int
-    message: str = Field(..., min_length=2, max_length=500)
-
-
-class MaterialChatResponse(BaseModel):
-    status: str
-    message: str
-    job_id: int | None = None
-    model_id: int
-    material_type: str | None = None
-    material_name: str | None = None
-    material_preset_id: str | None = None
-    preview_url: str | None = None
-    image_prompt: str | None = None
-
-
-class MaterialChatJobResponse(MaterialChatResponse):
-    created_at: datetime
-    updated_at: datetime

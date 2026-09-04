@@ -6,7 +6,6 @@ from shared.models.email_verification_code import EmailVerificationCode
 from shared.models.furniture_item import FurnitureItem
 from shared.models.furniture_material_asset import FurnitureMaterialAsset
 from shared.models.furniture_model import FurnitureModel
-from shared.models.material_chat_job import MaterialChatJob
 from shared.models.refresh_token import RefreshToken
 from shared.models.room import Room
 from shared.models.texture_preset import TexturePreset
@@ -25,5 +24,4 @@ __all__ = [
     "FurnitureMaterialAsset",
     "FurnitureItem",
     "TexturePreset",
-    "MaterialChatJob",
 ]

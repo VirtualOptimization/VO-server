@@ -42,22 +42,6 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="EMAIL_VERIFICATION_DEBUG",
     )
-    material_chat_enabled: bool = Field(default=False, validation_alias="MATERIAL_CHAT_ENABLED")
-    gemini_api_key: str = Field(default="", validation_alias="GEMINI_API_KEY")
-    material_chat_per_minute: int = Field(default=3, validation_alias="MATERIAL_CHAT_PER_MINUTE")
-    material_chat_per_day: int = Field(default=20, validation_alias="MATERIAL_CHAT_PER_DAY")
-    gemini_material_text_model: str = Field(
-        default="gemini-3.5-flash-lite",
-        validation_alias="GEMINI_MATERIAL_TEXT_MODEL",
-    )
-    gemini_material_image_model: str = Field(
-        default="gemini-2.5-flash-image",
-        validation_alias="GEMINI_MATERIAL_IMAGE_MODEL",
-    )
-    material_chat_timeout_seconds: int = Field(
-        default=30,
-        validation_alias="MATERIAL_CHAT_TIMEOUT_SECONDS",
-    )
     api_docs_enabled: bool = Field(default=True, validation_alias="API_DOCS_ENABLED")
 
     model_config = SettingsConfigDict(
