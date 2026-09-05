@@ -10,7 +10,6 @@ import argparse
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -19,21 +18,16 @@ from botocore.exceptions import ClientError
 from server.core.config import settings
 from server.core.s3 import build_s3_uri, get_s3_client
 from server.services.conversion_tasks import (
-    TASK_BASE_MATERIAL_ASSET,
     TASK_FURNITURE_GLB_TO_USDZ,
     TASK_FURNITURE_USDC_TO_GLB,
-    TASK_MATERIAL_ASSET,
 )
 from server.services.furniture_conversion import (
     _run_furniture_conversion_sync,
-    _run_furniture_texture_apply_sync,
     _run_furniture_usdz_conversion_sync,
 )
 from shared.db import SessionLocal
 from shared.models.conversion_task import ConversionTask
 from shared.models.furniture_model import FurnitureModel
-from shared.models.furniture_material_asset import FurnitureMaterialAsset
-from shared.models.version import Version
 
 logger = logging.getLogger("conversion_task_worker")
 
@@ -67,7 +61,6 @@ def _mark_done(db: Session, task: ConversionTask) -> None:
     task.finished_at = _utcnow()
     task.error_message = None
     db.commit()
-    _refresh_related_version_status(db, task)
 
 
 def _mark_failed(db: Session, task: ConversionTask, exc: BaseException) -> None:
@@ -75,41 +68,6 @@ def _mark_failed(db: Session, task: ConversionTask, exc: BaseException) -> None:
     task.finished_at = _utcnow()
     task.error_message = str(exc)[:4000]
     _mark_related_model_failed(db, task)
-    _mark_related_material_failed(db, task, str(exc))
-    _mark_base_material_asset_failed(db, task, str(exc))
-    db.commit()
-    _refresh_related_version_status(db, task)
-
-
-def _refresh_related_version_status(db: Session, task: ConversionTask) -> None:
-    """Keep a version's asset status in sync with its queued material conversions."""
-    if task.version_id is None:
-        return
-
-    version = db.get(Version, task.version_id)
-    if version is None:
-        return
-
-    statuses = [
-        status
-        for (status,) in (
-            db.query(ConversionTask.status)
-            .filter(
-                ConversionTask.version_id == version.id,
-                ConversionTask.task_type == TASK_MATERIAL_ASSET,
-            )
-            .all()
-        )
-    ]
-    if not statuses:
-        return
-
-    if "FAILED" in statuses:
-        version.status = "FAILED"
-    elif any(status in {"PENDING", "RUNNING"} for status in statuses):
-        version.status = "PENDING"
-    elif all(status == "DONE" for status in statuses):
-        version.status = "READY"
     db.commit()
 
 
@@ -121,48 +79,6 @@ def _mark_related_model_failed(db: Session, task: ConversionTask) -> None:
     model = db.get(FurnitureModel, task.furniture_model_id)
     if model is not None and model.status != "DELETED":
         model.status = "FAILED"
-
-
-def _mark_related_material_failed(db: Session, task: ConversionTask, message: str) -> None:
-    if task.task_type != TASK_MATERIAL_ASSET or task.version_id is None:
-        return
-
-    payload = task.payload or {}
-    furniture_instance_id = payload.get("furniture_instance_id")
-    if not isinstance(furniture_instance_id, str) or not furniture_instance_id:
-        return
-
-    version = db.get(Version, task.version_id)
-    if version is None:
-        return
-
-    json_data = dict(version.json_data or {})
-    material_assets = dict(json_data.get("material_assets") or {})
-    asset = dict(material_assets.get(furniture_instance_id) or {})
-    if not asset:
-        return
-
-    asset["status"] = "FAILED"
-    asset["error_message"] = message[:1000]
-    material_assets[furniture_instance_id] = asset
-    json_data["material_assets"] = material_assets
-    version.json_data = json_data
-
-
-def _base_material_asset_for_task(db: Session, task: ConversionTask) -> FurnitureMaterialAsset | None:
-    if task.task_type != TASK_BASE_MATERIAL_ASSET:
-        return None
-    asset_id = (task.payload or {}).get("material_asset_id")
-    if not isinstance(asset_id, int):
-        return None
-    return db.get(FurnitureMaterialAsset, asset_id)
-
-
-def _mark_base_material_asset_failed(db: Session, task: ConversionTask, message: str) -> None:
-    asset = _base_material_asset_for_task(db, task)
-    if asset is not None:
-        asset.status = "FAILED"
-        asset.error_message = message[:1000]
 
 
 def _mark_furniture_glb_ready(db: Session, task: ConversionTask) -> None:
@@ -198,68 +114,11 @@ def _complete_furniture_usdz_task(db: Session, task: ConversionTask) -> None:
     _run_furniture_usdz_conversion_sync(task.source_key, task.output_usdz_key)
 
 
-def _complete_material_asset_task(db: Session, task: ConversionTask) -> None:
-    if not task.source_key or not task.texture_key or not task.output_glb_key or not task.output_usdz_key:
-        raise ValueError("MATERIAL_ASSET task requires source, texture, GLB output, and USDZ output")
-
-    _run_furniture_texture_apply_sync(task.source_key, task.texture_key, task.output_glb_key)
-    _run_furniture_usdz_conversion_sync(task.output_glb_key, task.output_usdz_key)
-
-
-def _complete_base_material_asset_task(db: Session, task: ConversionTask) -> None:
-    _complete_material_asset_task(db, task)
-
-
-def _mark_material_asset_ready(db: Session, task: ConversionTask) -> None:
-    if task.version_id is None:
-        return
-
-    payload: dict[str, Any] = task.payload or {}
-    furniture_instance_id = payload.get("furniture_instance_id")
-    if not isinstance(furniture_instance_id, str) or not furniture_instance_id:
-        return
-
-    version = db.get(Version, task.version_id)
-    if version is None:
-        return
-
-    json_data = dict(version.json_data or {})
-    material_assets = dict(json_data.get("material_assets") or {})
-    asset = dict(material_assets.get(furniture_instance_id) or {})
-    asset.update(
-        {
-            **{k: v for k, v in payload.items() if k != "furniture_instance_id"},
-            "status": "READY",
-            "version_id": version.id,
-            "glb": build_s3_uri(task.output_glb_key),
-            "usdz": build_s3_uri(task.output_usdz_key),
-        }
-    )
-    asset.pop("error_message", None)
-    material_assets[furniture_instance_id] = asset
-    json_data["material_assets"] = material_assets
-    version.json_data = json_data
-
-
-def _mark_base_material_asset_ready(db: Session, task: ConversionTask) -> None:
-    asset = _base_material_asset_for_task(db, task)
-    if asset is None:
-        return
-    if not task.output_glb_key or not task.output_usdz_key:
-        raise ValueError("BASE_MATERIAL_ASSET task requires GLB and USDZ outputs")
-    asset.status = "READY"
-    asset.glb_url = build_s3_uri(task.output_glb_key)
-    asset.usdz_url = build_s3_uri(task.output_usdz_key)
-    asset.error_message = None
-
-
 def _expected_output_keys(task: ConversionTask) -> list[str]:
     if task.task_type == TASK_FURNITURE_USDC_TO_GLB:
         return [task.output_glb_key] if task.output_glb_key else []
     if task.task_type == TASK_FURNITURE_GLB_TO_USDZ:
         return [task.output_usdz_key] if task.output_usdz_key else []
-    if task.task_type in {TASK_MATERIAL_ASSET, TASK_BASE_MATERIAL_ASSET}:
-        return [key for key in (task.output_glb_key, task.output_usdz_key) if key]
     return []
 
 
@@ -287,10 +146,6 @@ def _apply_completed_task_result(db: Session, task: ConversionTask) -> None:
         _mark_furniture_glb_ready(db, task)
     elif task.task_type == TASK_FURNITURE_GLB_TO_USDZ:
         _mark_furniture_usdz_ready(db, task)
-    elif task.task_type == TASK_MATERIAL_ASSET:
-        _mark_material_asset_ready(db, task)
-    elif task.task_type == TASK_BASE_MATERIAL_ASSET:
-        _mark_base_material_asset_ready(db, task)
     else:
         raise ValueError(f"Unsupported conversion task type: {task.task_type}")
 
@@ -330,10 +185,6 @@ def _execute_task(db: Session, task: ConversionTask) -> None:
         _complete_furniture_glb_task(db, task)
     elif task.task_type == TASK_FURNITURE_GLB_TO_USDZ:
         _complete_furniture_usdz_task(db, task)
-    elif task.task_type == TASK_MATERIAL_ASSET:
-        _complete_material_asset_task(db, task)
-    elif task.task_type == TASK_BASE_MATERIAL_ASSET:
-        _complete_base_material_asset_task(db, task)
     else:
         raise ValueError(f"Unsupported conversion task type: {task.task_type}")
 

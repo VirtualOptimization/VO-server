@@ -51,35 +51,3 @@ class FurnitureModelUsdzConversionResponse(BaseModel):
     glb_url: str | None
     usdz_url: str | None
     usdz_s3_key: str
-
-
-class TexturePresetResponse(BaseModel):
-    preset_id: int
-    preset_key: str
-    name: str
-    source: str
-    texture_s3_key: str
-    texture_url: str | None
-    created_at: datetime
-    updated_at: datetime
-
-
-class TexturePresetListResponse(BaseModel):
-    presets: list[TexturePresetResponse]
-
-
-class BaseFurnitureMaterialAssetResponse(BaseModel):
-    material_asset_id: int
-    model_id: int
-    preset_id: int
-    preset_key: str
-    preset_name: str
-    status: str
-    glb_url: str | None
-    usdz_url: str | None
-    error_message: str | None = None
-
-
-class BaseFurnitureMaterialAssetListResponse(BaseModel):
-    model_id: int
-    assets: list[BaseFurnitureMaterialAssetResponse]
