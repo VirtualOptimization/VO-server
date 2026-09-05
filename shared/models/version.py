@@ -46,6 +46,3 @@ class Version(Base):
         remote_side="Version.id", back_populates="child_versions"
     )
     child_versions: Mapped[list["Version"]] = relationship(back_populates="parent_version")
-    furniture_items: Mapped[list["FurnitureItem"]] = relationship(
-        back_populates="version", cascade="all, delete-orphan", passive_deletes=True
-    )

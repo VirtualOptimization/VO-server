@@ -38,5 +38,4 @@ class FurnitureModel(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
-    furniture_items: Mapped[list["FurnitureItem"]] = relationship(back_populates="model")
     user: Mapped["User | None"] = relationship(back_populates="furniture_models")
