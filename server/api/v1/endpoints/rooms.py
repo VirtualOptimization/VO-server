@@ -51,44 +51,6 @@ def _catalog_glb_uri(model: FurnitureModel) -> str | None:
     return model.glb_url
 
 
-def _get_version_material_asset_urls(
-    version: Version | None,
-) -> tuple[dict[str, str], dict[str, dict[str, str | int | None]]]:
-    if version is None:
-        return {}, {}
-
-    json_data = version.json_data if isinstance(version.json_data, dict) else {}
-    raw_material_assets = json_data.get("material_assets") or {}
-    if not isinstance(raw_material_assets, dict):
-        return {}, {}
-
-    model_urls: dict[str, str] = {}
-    material_asset_urls: dict[str, dict[str, str | int | None]] = {}
-    for furniture_instance_id, asset in raw_material_assets.items():
-        if not isinstance(asset, dict) or asset.get("status") != "READY":
-            continue
-
-        material_model_key = asset.get("material_model_key")
-        if not isinstance(material_model_key, str) or not material_model_key:
-            continue
-
-        glb_url = generate_presigned_url_for_uri(asset.get("glb"))
-        usdz_url = generate_presigned_url_for_uri(asset.get("usdz"))
-        if glb_url:
-            model_urls[material_model_key] = glb_url
-        material_asset_urls[str(furniture_instance_id)] = {
-            "base_model_id": asset.get("base_model_id"),
-            "model_key": asset.get("model_key"),
-            "material_model_key": material_model_key,
-            "material_preset_id": asset.get("material_preset_id"),
-            "material_name": asset.get("material_name"),
-            "glb_url": glb_url,
-            "usdz_url": usdz_url,
-        }
-
-    return model_urls, material_asset_urls
-
-
 def _unity_layout_uri(version: Version) -> str | None:
     json_data = version.json_data if isinstance(version.json_data, dict) else {}
     unity_uri = (
@@ -104,10 +66,7 @@ def _unity_layout_uri(version: Version) -> str | None:
     return None
 
 
-def _to_version_detail_response(
-    version: Version,
-    material_asset_urls: dict[str, dict[str, str | int | None]] | None = None,
-) -> VersionDetailResponse:
+def _to_version_detail_response(version: Version) -> VersionDetailResponse:
     return VersionDetailResponse(
         version_id=version.id,
         room_id=version.room_id,
@@ -122,7 +81,6 @@ def _to_version_detail_response(
         layout_json_url=generate_presigned_url_for_uri(version.s3_json_url),
         unity_layout_json_url=generate_presigned_url_for_uri(_unity_layout_uri(version)),
         json_data=version.json_data,
-        material_asset_urls=material_asset_urls or {},
     )
 
 
@@ -170,7 +128,6 @@ def _catalog_model_db_aliases(model: FurnitureModel) -> set[str]:
 def _get_room_objects_with_model_ids(
     db: Session,
     unity_data_key: str,
-    material_asset_urls: dict[str, dict[str, str | int | None]] | None = None,
 ) -> list[dict]:
     """unity_data_key JSON을 읽어와 가구 인스턴스별 model_id를 매핑한 objects 목록을 반환한다."""
     try:
@@ -208,7 +165,6 @@ def _get_room_objects_with_model_ids(
         for alias in _catalog_model_db_aliases(model):
             model_map.setdefault(alias, (model.id, model.model_key))
 
-    material_asset_urls = material_asset_urls or {}
     objects_result = []
     for obj in raw_objects:
         if not isinstance(obj, dict):
@@ -219,23 +175,13 @@ def _get_room_objects_with_model_ids(
         resolved_model_key = matched_model[1] if matched_model else model_key
         resolved_model_id = matched_model[0] if matched_model else None
 
-        result = {
-            "identifier": identifier,
-            "model_key": resolved_model_key,
-            "model_id": resolved_model_id,
-        }
-        if identifier is not None:
-            material_asset = material_asset_urls.get(str(identifier))
-            if material_asset:
-                material_model_key = material_asset.get("material_model_key")
-                if isinstance(material_model_key, str) and material_model_key:
-                    result["base_model_key"] = resolved_model_key
-                    result["model_key"] = material_model_key
-                    result["model_id"] = material_asset.get("base_model_id") or resolved_model_id
-                    result["material_model_key"] = material_model_key
-                    result["material_preset_id"] = material_asset.get("material_preset_id")
-
-        objects_result.append(result)
+        objects_result.append(
+            {
+                "identifier": identifier,
+                "model_key": resolved_model_key,
+                "model_id": resolved_model_id,
+            }
+        )
 
     return objects_result
 
@@ -323,8 +269,7 @@ def get_room_version_detail(
         if version is None:
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
-        _, material_asset_urls = _get_version_material_asset_urls(version)
-        return _to_version_detail_response(version, material_asset_urls=material_asset_urls)
+        return _to_version_detail_response(version)
     finally:
         db.close()
 
@@ -486,16 +431,6 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
             .first()
         )
         owner_segment = _user_s3_segment(room.user) if room else None
-        optimized_version = None
-        if room:
-            optimized_version = (
-                db.query(Version)
-                .filter(Version.room_id == room.id, Version.version_type == "OPTIMIZED")
-                .order_by(Version.version_no.desc(), Version.id.desc())
-                .first()
-            )
-        material_model_urls, material_asset_urls = _get_version_material_asset_urls(optimized_version)
-
         prefixes = await _resolve_prefixes(str(room_id), owner_segment)
         if prefixes is None:
             raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
@@ -520,16 +455,11 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
             raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
 
         model_urls = await _get_catalog_model_urls(raw)
-        model_urls.update(material_model_urls)
 
         # [추가] unity json에서 objects 및 model_id 매핑 추출 (동기 호출)
         objects = []
         if unity_data_exists:
-            objects = _get_room_objects_with_model_ids(
-                db,
-                unity_data_key,
-                material_asset_urls=material_asset_urls,
-            )
+            objects = _get_room_objects_with_model_ids(db, unity_data_key)
 
         return VersionAssetsResponse(
             usdz_url=generate_presigned_url(full_key) if full_exists else None,
@@ -538,7 +468,6 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
             data_url=generate_presigned_url(data_key),
             unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
             model_urls=model_urls,
-            material_asset_urls=material_asset_urls,
             objects=objects,  # <- [추가]
         )
     finally:

@@ -27,7 +27,6 @@ class ConversionTask(Base):
     task_type: Mapped[str] = mapped_column(String(50), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="PENDING")
     source_key: Mapped[str | None] = mapped_column(Text)
-    texture_key: Mapped[str | None] = mapped_column(Text)
     output_glb_key: Mapped[str | None] = mapped_column(Text)
     output_usdz_key: Mapped[str | None] = mapped_column(Text)
     furniture_model_id: Mapped[int | None] = mapped_column(

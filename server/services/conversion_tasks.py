@@ -12,8 +12,6 @@ ACTIVE_STATUSES = {"PENDING", "RUNNING"}
 
 TASK_FURNITURE_USDC_TO_GLB = "FURNITURE_USDC_TO_GLB"
 TASK_FURNITURE_GLB_TO_USDZ = "FURNITURE_GLB_TO_USDZ"
-TASK_MATERIAL_ASSET = "MATERIAL_ASSET"
-TASK_BASE_MATERIAL_ASSET = "BASE_MATERIAL_ASSET"
 
 
 def enqueue_conversion_task(
@@ -21,7 +19,6 @@ def enqueue_conversion_task(
     *,
     task_type: str,
     source_key: str | None = None,
-    texture_key: str | None = None,
     output_glb_key: str | None = None,
     output_usdz_key: str | None = None,
     furniture_model_id: int | None = None,
@@ -34,7 +31,6 @@ def enqueue_conversion_task(
         .filter(
             ConversionTask.task_type == task_type,
             ConversionTask.source_key == source_key,
-            ConversionTask.texture_key == texture_key,
             ConversionTask.output_glb_key == output_glb_key,
             ConversionTask.output_usdz_key == output_usdz_key,
             ConversionTask.furniture_model_id == furniture_model_id,
@@ -51,7 +47,6 @@ def enqueue_conversion_task(
         task_type=task_type,
         status="PENDING",
         source_key=source_key,
-        texture_key=texture_key,
         output_glb_key=output_glb_key,
         output_usdz_key=output_usdz_key,
         furniture_model_id=furniture_model_id,

@@ -10,21 +10,16 @@ from sqlalchemy import func
 from server.api.v1.deps import get_current_user
 from server.api.v1.endpoints.rooms_common import _scan_root, _user_s3_segment
 from server.core.s3 import (
-    build_s3_uri,
-    copy_object,
     delete_objects,
     get_json,
     list_keys,
-    object_exists,
     parse_s3_uri,
     upload_json,
 )
 from server.schemas.room_view import (
     UserEditedVersionCreateRequest,
     UserEditedVersionCreateResponse,
-    UserEditedVersionMaterialChange,
 )
-from server.services.conversion_tasks import TASK_MATERIAL_ASSET, enqueue_conversion_task
 from server.services.transform.unity_roomplan import (
     denormalize_roomplan_from_unity,
     fix_unity_transforms_from_rotation,
@@ -32,10 +27,7 @@ from server.services.transform.unity_roomplan import (
     normalize_roomplan_for_unity,
 )
 from shared.db import SessionLocal
-from shared.models.furniture_model import FurnitureModel
-from shared.models.furniture_material_asset import FurnitureMaterialAsset
 from shared.models.room import Room
-from shared.models.texture_preset import TexturePreset
 from shared.models.user import User
 from shared.models.version import Version
 
@@ -371,242 +363,6 @@ def _version_s3_prefix(version: Version) -> str | None:
     return f"{prefix}/"
 
 
-def _safe_material_segment(value: str | None, fallback: str) -> str:
-    raw = (value or "").strip()
-    if not raw:
-        raw = fallback
-    sanitized = "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in raw)
-    return sanitized.strip("._-") or fallback
-
-
-def _key_from_s3_uri(uri: str | None) -> str | None:
-    parsed = parse_s3_uri(uri)
-    if parsed is None:
-        return None
-    return parsed[1]
-
-
-def _material_asset_model_key(model_key: str, material_preset_id: str) -> str:
-    model_segment = _safe_material_segment(model_key, "model")
-    preset_segment = _safe_material_segment(material_preset_id, "material")
-    return f"{model_segment}_{preset_segment}"
-
-
-def _version_json_data(version: Version) -> dict:
-    return dict(version.json_data) if isinstance(version.json_data, dict) else {}
-
-
-def _layout_object_identifiers(layout: dict) -> set[str]:
-    objects = layout.get("objects")
-    if not isinstance(objects, list):
-        return set()
-    return {
-        str(item.get("identifier"))
-        for item in objects
-        if isinstance(item, dict) and item.get("identifier")
-    }
-
-
-def _apply_material_asset_to_layout(layout: dict, furniture_instance_id: str, asset: dict) -> None:
-    material_model_key = asset.get("material_model_key")
-    if not isinstance(material_model_key, str) or not material_model_key:
-        return
-
-    objects = layout.get("objects")
-    if not isinstance(objects, list):
-        return
-
-    for item in objects:
-        if not isinstance(item, dict) or str(item.get("identifier")) != furniture_instance_id:
-            continue
-
-        current_model_key = item.get("model_key") or item.get("modelKey")
-        base_model_key = asset.get("model_key") or current_model_key
-        if current_model_key and "base_model_key" not in item:
-            item["base_model_key"] = current_model_key
-        if base_model_key:
-            item["base_model_key"] = base_model_key
-        item["model_key"] = material_model_key
-        item["modelKey"] = material_model_key
-        item["material_model_key"] = material_model_key
-        item["material_preset_id"] = asset.get("material_preset_id")
-        item["material_name"] = asset.get("material_name")
-        return
-
-
-def _apply_material_assets_to_layout(layout: dict, material_assets: dict[str, dict]) -> None:
-    for furniture_instance_id, asset in material_assets.items():
-        if isinstance(asset, dict) and asset.get("status") == "READY":
-            _apply_material_asset_to_layout(layout, furniture_instance_id, asset)
-
-
-def _material_assets_with_version_id(material_assets: dict[str, dict], version_id: int) -> dict[str, dict]:
-    copied: dict[str, dict] = {}
-    for furniture_instance_id, asset in material_assets.items():
-        copied[furniture_instance_id] = {**asset, "version_id": version_id}
-    return copied
-
-
-async def _copy_parent_material_assets(
-    parent_version: Version,
-    target_identifiers: set[str],
-    edit_prefix: str,
-    overridden_identifiers: set[str],
-) -> dict[str, dict]:
-    parent_assets = _version_json_data(parent_version).get("material_assets") or {}
-    if not isinstance(parent_assets, dict):
-        return {}
-
-    copied_assets: dict[str, dict] = {}
-    for furniture_instance_id, asset in parent_assets.items():
-        furniture_instance_id = str(furniture_instance_id)
-        if furniture_instance_id not in target_identifiers or furniture_instance_id in overridden_identifiers:
-            continue
-        if not isinstance(asset, dict) or asset.get("status") != "READY":
-            continue
-
-        # Shared base-model variants are immutable and reusable. A new user-edit
-        # version only keeps their reference instead of copying identical files.
-        if asset.get("scope") == "BASE_PRESET":
-            copied_assets[furniture_instance_id] = {**asset, "version_id": None}
-            continue
-
-        material_model_key = asset.get("material_model_key")
-        if not isinstance(material_model_key, str) or not material_model_key:
-            continue
-
-        source_glb_key = _key_from_s3_uri(asset.get("glb"))
-        source_usdz_key = _key_from_s3_uri(asset.get("usdz"))
-        if not source_glb_key or not await object_exists(source_glb_key):
-            continue
-
-        target_glb_key = f"{edit_prefix}/assets/{material_model_key}.glb"
-        target_usdz_key = f"{edit_prefix}/assets/{material_model_key}.usdz"
-        await copy_object(source_glb_key, target_glb_key)
-
-        usdz_uri = None
-        if source_usdz_key and await object_exists(source_usdz_key):
-            usdz_uri = await copy_object(source_usdz_key, target_usdz_key)
-
-        copied_assets[furniture_instance_id] = {
-            **asset,
-            "status": "READY",
-            "version_id": None,
-            "glb": build_s3_uri(target_glb_key),
-            "usdz": usdz_uri,
-        }
-
-    return copied_assets
-
-
-async def _prepare_material_asset(
-    db,
-    room: Room,
-    current_user: User,
-    edit_prefix: str,
-    change: UserEditedVersionMaterialChange,
-) -> tuple[dict, dict | None]:
-    model = db.get(FurnitureModel, change.model_id)
-    if model is None or model.status == "DELETED":
-        raise HTTPException(status_code=404, detail="가구 모델을 찾을 수 없습니다.")
-    if model.user_id is not None:
-        raise HTTPException(status_code=400, detail="기본 가구 asset에만 텍스처를 적용할 수 있습니다.")
-
-    preset = (
-        db.query(TexturePreset)
-        .filter(TexturePreset.preset_key == change.material_preset_id)
-        .one_or_none()
-    )
-    if preset is None:
-        raise HTTPException(status_code=404, detail="텍스처 preset을 찾을 수 없습니다.")
-    if preset.user_id is not None and preset.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="다른 사용자가 생성한 텍스처는 적용할 수 없습니다.")
-
-    material_model_key = _material_asset_model_key(model.model_key, preset.preset_key)
-    material_name = change.material_name or preset.name
-
-    # Shared presets are pre-generated for every base model. Generated user
-    # presets stay on-demand because pre-building every possible combination is
-    # wasteful and their output belongs to this user's edited version.
-    if preset.user_id is not None:
-        base_glb_key = _key_from_s3_uri(model.glb_url)
-        if not base_glb_key:
-            raise HTTPException(status_code=400, detail="기본 가구 GLB 경로가 없습니다.")
-        if not await object_exists(base_glb_key):
-            raise HTTPException(status_code=400, detail="기본 가구 GLB 파일을 찾을 수 없습니다.")
-        if not await object_exists(preset.texture_s3_key):
-            raise HTTPException(status_code=400, detail="사용자 텍스처 파일을 찾을 수 없습니다.")
-
-        glb_key = f"{edit_prefix}/assets/{material_model_key}.glb"
-        usdz_key = f"{edit_prefix}/assets/{material_model_key}.usdz"
-        asset = {
-            "status": "PROCESSING",
-            "scope": "USER_GENERATED",
-            "room_id": room.id,
-            "version_id": None,
-            "base_model_id": model.id,
-            "model_key": model.model_key,
-            "material_model_key": material_model_key,
-            "material_preset_id": preset.preset_key,
-            "material_name": material_name,
-            "glb": build_s3_uri(glb_key),
-            "usdz": build_s3_uri(usdz_key),
-        }
-        task_spec = {
-            "source_key": base_glb_key,
-            "texture_key": preset.texture_s3_key,
-            "output_glb_key": glb_key,
-            "output_usdz_key": usdz_key,
-            "payload": {
-                "furniture_instance_id": change.furniture_instance_id,
-                "room_id": room.id,
-                "base_model_id": model.id,
-                "model_key": model.model_key,
-                "material_model_key": material_model_key,
-                "material_preset_id": preset.preset_key,
-                "material_name": material_name,
-            },
-        }
-        return asset, task_spec
-
-    base_asset = (
-        db.query(FurnitureMaterialAsset)
-        .filter(
-            FurnitureMaterialAsset.furniture_model_id == model.id,
-            FurnitureMaterialAsset.texture_preset_id == preset.id,
-        )
-        .one_or_none()
-    )
-    if base_asset is None:
-        raise HTTPException(
-            status_code=409,
-            detail="선택한 기본 가구 텍스처 asset이 아직 준비되지 않았습니다.",
-        )
-    if base_asset.status != "READY":
-        raise HTTPException(
-            status_code=409,
-            detail=f"선택한 기본 가구 텍스처 asset 준비 상태: {base_asset.status}",
-        )
-    if not base_asset.glb_url or not base_asset.usdz_url:
-        raise HTTPException(status_code=500, detail="완료된 텍스처 asset 경로가 없습니다.")
-
-    asset = {
-        "status": "READY",
-        "scope": "BASE_PRESET",
-        "material_asset_id": base_asset.id,
-        "room_id": room.id,
-        "version_id": None,
-        "base_model_id": model.id,
-        "model_key": model.model_key,
-        "material_model_key": material_model_key,
-        "material_preset_id": preset.preset_key,
-        "material_name": material_name,
-        "glb": base_asset.glb_url,
-        "usdz": base_asset.usdz_url,
-    }
-    return asset, None
-
-
 # ── POST /rooms/{room_id}/versions ───────────────────────────────────────────
 # Unity에서 수정한 가구 배치를 room_id 아래 새 USER_EDITED 버전으로 저장
 
@@ -664,11 +420,10 @@ async def create_user_edited_version(
         )
         has_ios_updates = payload.ios_objects is not None and len(payload.ios_objects) > 0
         has_unity_updates = bool(payload.objects)
-        has_material_changes = bool(payload.material_changes)
-        if not has_ios_updates and not has_unity_updates and not has_material_changes:
+        if not has_ios_updates and not has_unity_updates:
             raise HTTPException(
                 status_code=400,
-                detail="objects 또는 ios_objects 또는 material_changes 중 하나는 필요합니다.",
+                detail="objects 또는 ios_objects 중 하나는 필요합니다.",
             )
 
         version_name = payload.version_name or f"User Edit {next_version_no}"
@@ -699,41 +454,6 @@ async def create_user_edited_version(
         owner_segment = _user_s3_segment(room.user)
         edit_prefix = f"{_scan_root(str(room.id), owner_segment)}/user_edits/version_{next_version_no}"
 
-        target_identifiers = _layout_object_identifiers(unity_layout)
-        for change in payload.material_changes:
-            if change.furniture_instance_id not in target_identifiers:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unity JSON에서 identifier={change.furniture_instance_id} object를 찾을 수 없습니다.",
-                )
-
-        overridden_identifiers = {
-            change.furniture_instance_id
-            for change in payload.material_changes
-        }
-        material_assets = await _copy_parent_material_assets(
-            parent_version,
-            target_identifiers=target_identifiers,
-            edit_prefix=edit_prefix,
-            overridden_identifiers=overridden_identifiers,
-        )
-        material_task_specs = []
-        for change in payload.material_changes:
-            material_asset, task_spec = await _prepare_material_asset(
-                db,
-                room,
-                current_user,
-                edit_prefix,
-                change,
-            )
-            material_assets[change.furniture_instance_id] = material_asset
-            if task_spec is not None:
-                material_task_specs.append(task_spec)
-
-        if material_assets:
-            _apply_material_assets_to_layout(unity_layout, material_assets)
-            _apply_material_assets_to_layout(ios_layout, material_assets)
-
         ios_key = f"{edit_prefix}/layout.roomplan.json"
         unity_key = f"{edit_prefix}/layout.unity.json"
         ios_s3_url = await upload_json(ios_key, ios_layout)
@@ -751,7 +471,7 @@ async def create_user_edited_version(
             room_id=room.id,
             parent_version_id=parent_version.id,
             version_type="USER_EDITED",
-            status="PENDING" if material_task_specs else "READY",
+            status="READY",
             version_no=next_version_no,
             version_name=version_name,
             s3_json_url=ios_s3_url,
@@ -759,25 +479,6 @@ async def create_user_edited_version(
             json_data=version_json_data,
         )
         db.add(version)
-        db.flush()
-
-        if material_assets:
-            version.json_data = {
-                **version_json_data,
-                "material_assets": _material_assets_with_version_id(material_assets, version.id),
-            }
-
-        for task_spec in material_task_specs:
-            enqueue_conversion_task(
-                db,
-                task_type=TASK_MATERIAL_ASSET,
-                source_key=task_spec["source_key"],
-                texture_key=task_spec["texture_key"],
-                output_glb_key=task_spec["output_glb_key"],
-                output_usdz_key=task_spec["output_usdz_key"],
-                version_id=version.id,
-                payload={**task_spec["payload"], "version_id": version.id},
-            )
 
         db.commit()
         db.refresh(version)
