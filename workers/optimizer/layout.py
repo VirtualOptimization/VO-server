@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 from scipy.optimize import differential_evolution, minimize
 
+from workers.optimizer.bounds import center_axis_bounds
+
 
 @dataclass(frozen=True)
 class Anthropometrics:
@@ -1818,13 +1820,13 @@ class CanonicalLayoutOptimizer:
         bounds: list[tuple[float, float]] = []
         initial = []
         for furniture in self.furnitures:
-            half_w = float(furniture["extent"][0]) / 2.0
-            half_d = float(furniture["extent"][1]) / 2.0
+            x_bounds = center_axis_bounds(self.room_width, float(furniture["extent"][0]))
+            y_bounds = center_axis_bounds(self.room_depth, float(furniture["extent"][1]))
             center_z = float(furniture["pos"][2])
             bounds.extend(
                 [
-                    (half_w, self.room_width - half_w),
-                    (half_d, self.room_depth - half_d),
+                    x_bounds,
+                    y_bounds,
                     (center_z, center_z),
                     (0.0, 2.0 * math.pi),
                 ]
@@ -1838,9 +1840,11 @@ class CanonicalLayoutOptimizer:
                 ]
             )
 
-        original_initial = np.array(initial, dtype=float)
-        wall_initial = self._wall_anchored_initial(original_initial)
-        support_initial = self._chair_support_initial(wall_initial)
+        lower_bounds = np.array([lower for lower, _ in bounds], dtype=float)
+        upper_bounds = np.array([upper for _, upper in bounds], dtype=float)
+        original_initial = np.clip(np.array(initial, dtype=float), lower_bounds, upper_bounds)
+        wall_initial = np.clip(self._wall_anchored_initial(original_initial), lower_bounds, upper_bounds)
+        support_initial = np.clip(self._chair_support_initial(wall_initial), lower_bounds, upper_bounds)
 
         if use_global:
             result_global = differential_evolution(
