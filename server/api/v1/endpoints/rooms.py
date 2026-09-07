@@ -17,7 +17,13 @@ from server.api.v1.endpoints.rooms_common import (
     _resolve_prefixes,
     _user_s3_segment,
 )
-from server.core.s3 import generate_presigned_url, generate_presigned_url_for_uri, head_object, get_s3_client
+from server.core.s3 import (
+    generate_presigned_url,
+    generate_presigned_url_for_uri,
+    get_s3_client,
+    head_object,
+    parse_s3_uri,
+)
 from server.core.config import settings
 from server.schemas.room_view import (
     FurnitureCatalogItemResponse,
@@ -72,7 +78,15 @@ def _unity_layout_uri(version: Version) -> str | None:
     return None
 
 
-def _to_version_detail_response(version: Version) -> VersionDetailResponse:
+def _to_version_detail_response(
+    version: Version,
+    *,
+    usdz_empty_url: str | None = None,
+    model_urls: dict[str, str] | None = None,
+    model_usdz_urls: dict[str, str] | None = None,
+    objects: list[dict] | None = None,
+    ios_objects: list[dict] | None = None,
+) -> VersionDetailResponse:
     return VersionDetailResponse(
         version_id=version.id,
         room_id=version.room_id,
@@ -86,8 +100,23 @@ def _to_version_detail_response(version: Version) -> VersionDetailResponse:
         converted_glb_url=version.converted_glb_url,
         layout_json_url=generate_presigned_url_for_uri(version.s3_json_url),
         unity_layout_json_url=generate_presigned_url_for_uri(_unity_layout_uri(version)),
+        usdz_empty_url=usdz_empty_url,
+        model_urls=model_urls or {},
+        model_usdz_urls=model_usdz_urls or {},
+        objects=objects or [],
+        ios_objects=ios_objects or [],
         json_data=version.json_data,
     )
+
+
+def _key_from_s3_uri(uri: str | None) -> str | None:
+    parsed = parse_s3_uri(uri)
+    if parsed is None:
+        return None
+    bucket, key = parsed
+    if bucket != settings.s3_bucket_name:
+        return None
+    return key
 
 
 def _version_state_summary(versions: list[Version]) -> dict[str, int | bool]:
@@ -264,7 +293,7 @@ def update_room_name(
 # ── GET /rooms/{room_id}/versions/{version_id} ───────────────────────────────
 
 @router.get("/{room_id}/versions/{version_id}", response_model=VersionDetailResponse)
-def get_room_version_detail(
+async def get_room_version_detail(
     room_id: int,
     version_id: int,
     current_user: User = Depends(get_current_user),
@@ -274,7 +303,7 @@ def get_room_version_detail(
         version = (
             db.query(Version)
             .options(
-                joinedload(Version.room),
+                joinedload(Version.room).joinedload(Room.user),
             )
             .join(Room)
             .filter(
@@ -287,7 +316,30 @@ def get_room_version_detail(
         if version is None:
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
-        return _to_version_detail_response(version)
+        owner_segment = _user_s3_segment(version.room.user)
+        prefixes = await _resolve_prefixes(str(room_id), owner_segment)
+        if prefixes is None:
+            return _to_version_detail_response(version)
+
+        raw, _ = prefixes
+        empty_key = f"{raw}/Room_empty.usdz"
+        empty_exists = await head_object(empty_key) is not None
+        model_urls, model_usdz_urls = await _get_catalog_model_asset_urls(raw)
+
+        ios_key = _key_from_s3_uri(version.s3_json_url)
+        unity_key = _key_from_s3_uri(_unity_layout_uri(version))
+
+        ios_objects = _get_room_objects_with_model_ids(db, ios_key) if ios_key else []
+        objects = _get_room_objects_with_model_ids(db, unity_key) if unity_key else []
+
+        return _to_version_detail_response(
+            version,
+            usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
+            model_urls=model_urls,
+            model_usdz_urls=model_usdz_urls,
+            objects=_attach_model_asset_urls(objects, model_urls, model_usdz_urls),
+            ios_objects=_attach_model_asset_urls(ios_objects, model_urls, model_usdz_urls),
+        )
     finally:
         db.close()
 

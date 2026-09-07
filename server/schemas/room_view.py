@@ -88,6 +88,11 @@ class VersionDetailResponse(BaseModel):
     converted_glb_url: str | None = None
     layout_json_url: str | None = None
     unity_layout_json_url: str | None = None
+    usdz_empty_url: str | None = None
+    model_urls: dict[str, str] = Field(default_factory=dict)
+    model_usdz_urls: dict[str, str] = Field(default_factory=dict)
+    objects: list[dict[str, Any]] = Field(default_factory=list)
+    ios_objects: list[dict[str, Any]] = Field(default_factory=list)
     json_data: dict[str, Any] | None = None
 
 
