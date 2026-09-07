@@ -125,4 +125,6 @@ class VersionAssetsResponse(BaseModel):
     data_url: str                     # 가구 위치 JSON (origin or optimized)
     unity_data_url: str | None = None # Unity 정규화 좌표계 가구 위치 JSON
     model_urls: dict[str, str]        # { "chair_01.usdc": "catalog GLB presigned_url", ... }
-    objects: list[dict[str, Any]] = []  # 기본값 빈 리스트
+    model_usdz_urls: dict[str, str] = Field(default_factory=dict)  # iOS/RealityKit 개별 가구 USDZ
+    objects: list[dict[str, Any]] = Field(default_factory=list)      # Unity 좌표계 객체
+    ios_objects: list[dict[str, Any]] = Field(default_factory=list)  # RoomPlan/iOS 좌표계 객체

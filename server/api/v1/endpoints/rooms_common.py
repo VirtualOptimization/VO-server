@@ -81,21 +81,77 @@ def _catalog_db_model_key(category: str, model_filename: str) -> str:
 
 
 async def _get_catalog_model_urls(raw_prefix: str) -> dict[str, str]:
-    """room_data.json을 읽어 카탈로그 presigned URL 맵 반환"""
+    """room_data.json을 읽어 카탈로그 GLB presigned URL 맵을 반환한다."""
+    model_urls, _ = await _get_catalog_model_asset_urls(raw_prefix)
+    return model_urls
+
+
+async def _get_catalog_model_asset_urls(raw_prefix: str) -> tuple[dict[str, str], dict[str, str]]:
+    """방에 배치된 카탈로그 가구의 GLB·USDZ presigned URL 맵을 반환한다."""
     try:
         data = await get_json(f"{raw_prefix}/room_data.json")
-        model_urls: dict[str, str] = {}
+        catalog_assets: dict[str, tuple[str, str]] = {}
         for obj in data.get("objects", []):
             model_filename = obj.get("modelFileName")
             category = obj.get("category", "")
             if model_filename and category:
-                key = _catalog_model_key(category, model_filename)
-                presigned_url = generate_presigned_url(key)
-                model_urls[_catalog_db_model_key(category, model_filename)] = presigned_url
-        return model_urls
+                glb_key = _catalog_model_key(category, model_filename)
+                model_key = _catalog_db_model_key(category, model_filename)
+                catalog_assets[model_key] = (glb_key, glb_key.removesuffix(".glb") + ".usdz")
+
+        model_urls = {
+            model_key: generate_presigned_url(glb_key)
+            for model_key, (glb_key, _) in catalog_assets.items()
+        }
+
+        model_usdz_urls: dict[str, str] = {}
+        if catalog_assets:
+            asset_items = list(catalog_assets.items())
+            usdz_results = await asyncio.gather(
+                *(head_object(usdz_key) for _, (_, usdz_key) in asset_items)
+            )
+            model_usdz_urls = {
+                model_key: generate_presigned_url(usdz_key)
+                for (model_key, (_, usdz_key)), metadata in zip(asset_items, usdz_results)
+                if metadata is not None
+            }
+
+        return model_urls, model_usdz_urls
     except Exception as e:
         logger.warning(f"카탈로그 모델 URL 조회 실패: {e}")
-        return {}
+        return {}, {}
+
+
+def _find_model_asset_url(asset_urls: dict[str, str], model_key: str | None) -> str | None:
+    """정규화 전 파일명 키까지 고려해 모델 에셋 URL을 찾는다."""
+    if not model_key:
+        return None
+    if model_key in asset_urls:
+        return asset_urls[model_key]
+
+    filename = PurePosixPath(model_key.replace("\\", "/")).name
+    matches = [
+        url
+        for candidate_key, url in asset_urls.items()
+        if PurePosixPath(candidate_key).name == filename
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _attach_model_asset_urls(
+    objects: list[dict[str, Any]],
+    model_urls: dict[str, str],
+    model_usdz_urls: dict[str, str],
+) -> list[dict[str, Any]]:
+    """각 가구 객체에 클라이언트가 바로 사용할 GLB·USDZ URL을 추가한다."""
+    return [
+        {
+            **obj,
+            "glb_url": _find_model_asset_url(model_urls, obj.get("model_key")),
+            "usdz_url": _find_model_asset_url(model_usdz_urls, obj.get("model_key")),
+        }
+        for obj in objects
+    ]
 
 
 async def _resolve_prefixes(room_ref: str, owner_segment: str | None = None) -> tuple[str, str] | None:

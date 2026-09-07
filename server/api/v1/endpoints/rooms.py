@@ -10,7 +10,13 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from server.api.v1.deps import get_current_user
-from server.api.v1.endpoints.rooms_common import _get_catalog_model_urls, _resolve_prefixes, _user_s3_segment
+from server.api.v1.endpoints.rooms_common import (
+    _attach_model_asset_urls,
+    _catalog_db_model_key,
+    _get_catalog_model_asset_urls,
+    _resolve_prefixes,
+    _user_s3_segment,
+)
 from server.core.s3 import generate_presigned_url, generate_presigned_url_for_uri, head_object, get_s3_client
 from server.core.config import settings
 from server.schemas.room_view import (
@@ -143,10 +149,21 @@ def _get_room_objects_with_model_ids(
     if not isinstance(raw_objects, list):
         return []
 
+    def object_model_key(obj: dict) -> str | None:
+        model_key = obj.get("modelKey") or obj.get("model_key")
+        if model_key:
+            return model_key
+
+        model_filename = obj.get("modelFileName")
+        category = obj.get("category")
+        if model_filename and category:
+            return _catalog_db_model_key(category, model_filename)
+        return model_filename
+
     model_keys = {
-        obj.get("modelKey") or obj.get("model_key") 
-        for obj in raw_objects 
-        if isinstance(obj, dict) and (obj.get("modelKey") or obj.get("model_key"))
+        model_key
+        for obj in raw_objects
+        if isinstance(obj, dict) and (model_key := object_model_key(obj))
     }
 
     models = (
@@ -169,7 +186,7 @@ def _get_room_objects_with_model_ids(
     for obj in raw_objects:
         if not isinstance(obj, dict):
             continue
-        model_key = obj.get("modelKey") or obj.get("model_key")
+        model_key = object_model_key(obj)
         identifier = obj.get("identifier")
         matched_model = model_map.get(model_key)
         resolved_model_key = matched_model[1] if matched_model else model_key
@@ -177,6 +194,7 @@ def _get_room_objects_with_model_ids(
 
         objects_result.append(
             {
+                **obj,
                 "identifier": identifier,
                 "model_key": resolved_model_key,
                 "model_id": resolved_model_id,
@@ -398,12 +416,16 @@ async def get_origin_assets(room_id: int, current_user: User = Depends(get_curre
         if not full_exists and not empty_exists and not glb_exists:
             raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
 
-        model_urls = await _get_catalog_model_urls(raw)
+        model_urls, model_usdz_urls = await _get_catalog_model_asset_urls(raw)
 
-        # [추가] unity json에서 objects 및 model_id 매핑 추출 (동기 호출)
+        # Unity와 iOS가 각자의 좌표계로 바로 장면을 조립할 수 있게 둘 다 제공한다.
         objects = []
+        ios_objects = []
         if unity_data_exists:
             objects = _get_room_objects_with_model_ids(db, unity_data_key)
+            objects = _attach_model_asset_urls(objects, model_urls, model_usdz_urls)
+        ios_objects = _get_room_objects_with_model_ids(db, data_key)
+        ios_objects = _attach_model_asset_urls(ios_objects, model_urls, model_usdz_urls)
 
         return VersionAssetsResponse(
             usdz_url=generate_presigned_url(full_key) if full_exists else None,
@@ -412,7 +434,9 @@ async def get_origin_assets(room_id: int, current_user: User = Depends(get_curre
             data_url=generate_presigned_url(data_key),
             unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
             model_urls=model_urls,
-            objects=objects,  # <- [추가]
+            model_usdz_urls=model_usdz_urls,
+            objects=objects,
+            ios_objects=ios_objects,
         )
     finally:
         db.close()
@@ -454,12 +478,16 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
         if not full_exists and not empty_exists and not glb_exists:
             raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
 
-        model_urls = await _get_catalog_model_urls(raw)
+        model_urls, model_usdz_urls = await _get_catalog_model_asset_urls(raw)
 
-        # [추가] unity json에서 objects 및 model_id 매핑 추출 (동기 호출)
+        # Unity와 iOS가 각자의 좌표계로 바로 장면을 조립할 수 있게 둘 다 제공한다.
         objects = []
+        ios_objects = []
         if unity_data_exists:
             objects = _get_room_objects_with_model_ids(db, unity_data_key)
+            objects = _attach_model_asset_urls(objects, model_urls, model_usdz_urls)
+        ios_objects = _get_room_objects_with_model_ids(db, data_key)
+        ios_objects = _attach_model_asset_urls(ios_objects, model_urls, model_usdz_urls)
 
         return VersionAssetsResponse(
             usdz_url=generate_presigned_url(full_key) if full_exists else None,
@@ -468,7 +496,9 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
             data_url=generate_presigned_url(data_key),
             unity_data_url=generate_presigned_url(unity_data_key) if unity_data_exists else None,
             model_urls=model_urls,
-            objects=objects,  # <- [추가]
+            model_usdz_urls=model_usdz_urls,
+            objects=objects,
+            ios_objects=ios_objects,
         )
     finally:
         db.close()
