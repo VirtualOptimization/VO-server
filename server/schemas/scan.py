@@ -84,6 +84,8 @@ class ScanUploadStartResponse(BaseModel):
 
 class ScanUploadCompleteRequest(BaseModel):
     uploaded_keys: list[str] = Field(default_factory=list)
+    # false면 원본 버전만 확정하고 최적화 파이프라인은 건너뛴다 (그냥 "저장"만 하는 흐름용).
+    run_pipeline: bool = True
 
 
 class ScanUploadCompleteResponse(BaseModel):

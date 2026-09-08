@@ -339,6 +339,14 @@ async def complete_scan_upload(
     processed_keys = [*payload.uploaded_keys, unity_room_data_key]
     pipeline_input = _build_pipeline_input(room_id, processed_keys, owner_segment)
 
+    if not payload.run_pipeline:
+        return ScanUploadCompleteResponse(
+            message="scan saved (pipeline skipped)", room_id=room_id,
+            raw_prefix=raw_prefix, generated_prefix=generated_prefix,
+            uploaded_keys=processed_keys, pipeline_started=False,
+            execution_arn=None, pipeline_input={},
+        )
+
     is_local_pipeline = settings.scan_pipeline_mode.lower() == "local"
 
     if is_local_pipeline:
