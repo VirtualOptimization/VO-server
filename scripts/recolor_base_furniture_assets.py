@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -43,18 +42,42 @@ class PaletteColor:
     hex: str
 
 
-# Sampled from the supplied Pantone Spring/Summer 2026 palette image.
-PALETTE = (
-    PaletteColor("Teaberry", "#CB4755"),
-    PaletteColor("Tickled Pink", "#EFBCC1"),
-    PaletteColor("Amethyst Orchid", "#8C6EA4"),
-    PaletteColor("Amaranth", "#673F57"),
-    PaletteColor("Burnished Lilac", "#C3AFB1"),
-    PaletteColor("Dutch Canal", "#9DBADC"),
-    PaletteColor("Shale Green", "#778D74"),
-    PaletteColor("Pale Banana", "#F6E1A2"),
-    PaletteColor("Caramel", "#BB7F5B"),
-    PaletteColor("Mandarin Orange", "#DD7145"),
+CATEGORY_PALETTES = {
+    "chair": (
+        PaletteColor("Chair Sky 1", "#7FA6DC"),
+        PaletteColor("Chair Sky 2", "#A3BFE8"),
+        PaletteColor("Chair Sky 3", "#CEDDF2"),
+    ),
+    "sofa": (
+        PaletteColor("Sofa Green 1", "#77D69A"),
+        PaletteColor("Sofa Green 2", "#A1E4B8"),
+        PaletteColor("Sofa Green 3", "#D0F0D9"),
+    ),
+    "table": (
+        PaletteColor("Table Brown 1", "#B9894D"),
+        PaletteColor("Table Brown 2", "#C7A87A"),
+        PaletteColor("Table Brown 3", "#DDC9AA"),
+    ),
+    "storage": (
+        PaletteColor("Shelf Yellow 1", "#F4E256"),
+        PaletteColor("Shelf Yellow 2", "#F8ED8A"),
+        PaletteColor("Shelf Yellow 3", "#FCF6BE"),
+    ),
+}
+
+CATEGORY_ALIASES = {
+    "chair": "chair",
+    "sofa": "sofa",
+    "table": "table",
+    "desk": "table",
+    "storage": "storage",
+    "shelf": "storage",
+}
+
+FALLBACK_PALETTE = (
+    PaletteColor("Neutral Pastel 1", "#B8C6D9"),
+    PaletteColor("Neutral Pastel 2", "#C8D1DE"),
+    PaletteColor("Neutral Pastel 3", "#D8DEE7"),
 )
 
 
@@ -156,9 +179,57 @@ def color_group_from_key(key: str, prefix: str, scope: str) -> str:
 
 
 def assign_colors(types: list[str], seed: int) -> dict[str, PaletteColor]:
-    shuffled = list(PALETTE)
-    random.Random(seed).shuffle(shuffled)
-    return {name: shuffled[index % len(shuffled)] for index, name in enumerate(sorted(set(types)))}
+    del seed
+
+    color_by_group: dict[str, PaletteColor] = {}
+    groups_by_category: dict[str, list[str]] = {}
+    for group in sorted(set(types)):
+        category = category_from_group(group)
+        groups_by_category.setdefault(category, []).append(group)
+
+    for category, groups in groups_by_category.items():
+        palette = build_category_palette(category, len(groups))
+        for group, color in zip(groups, palette, strict=True):
+            color_by_group[group] = color
+
+    return color_by_group
+
+
+def category_from_group(group: str) -> str:
+    first_part = PurePosixPath(group).parts[0] if PurePosixPath(group).parts else group
+    return CATEGORY_ALIASES.get(first_part.lower(), first_part.lower())
+
+
+def build_category_palette(category: str, count: int) -> list[PaletteColor]:
+    base_palette = CATEGORY_PALETTES.get(category, FALLBACK_PALETTE)
+    if count <= len(base_palette):
+        return list(base_palette[:count])
+
+    anchors = [hex_to_rgb(color.hex) for color in base_palette]
+    colors: list[PaletteColor] = []
+    for index in range(count):
+        position = index / max(count - 1, 1)
+        scaled = position * (len(anchors) - 1)
+        left = min(int(scaled), len(anchors) - 2)
+        right = left + 1
+        t = scaled - left
+        rgb = tuple(
+            round(anchors[left][channel] * (1 - t) + anchors[right][channel] * t)
+            for channel in range(3)
+        )
+        colors.append(PaletteColor(f"{category.title()} Pastel {index + 1}", rgb_to_hex(rgb)))
+    return colors
+
+
+def hex_to_rgb(value: str) -> tuple[int, int, int]:
+    normalized = value.strip().removeprefix("#")
+    if len(normalized) != 6:
+        raise ValueError(f"invalid color value: {value}")
+    return tuple(int(normalized[index : index + 2], 16) for index in (0, 2, 4))
+
+
+def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return "#" + "".join(f"{max(0, min(255, channel)):02X}" for channel in rgb)
 
 
 def object_exists(s3, bucket: str, key: str) -> bool:
