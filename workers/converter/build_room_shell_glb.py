@@ -38,12 +38,14 @@ def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, floa
         center = floor_item["center"]
         dimensions = floor_item["dimensions"]
         transform = floor_item["transform"]
+        # A RoomPlan floor is a 2D surface: rows 0 and 1 span its plane, while
+        # row 2 is the normal. Using row 2 collapses one floor dimension.
         axis_x = np.array([transform[0][0], transform[0][2]], dtype=float)
-        axis_z = np.array([transform[2][0], transform[2][2]], dtype=float)
+        axis_y = np.array([transform[1][0], transform[1][2]], dtype=float)
         center_xz = np.array([center[0], center[2]], dtype=float)
         for sx in (-1.0, 1.0):
-            for sz in (-1.0, 1.0):
-                point = center_xz + axis_x * float(dimensions[0]) * 0.5 * sx + axis_z * float(dimensions[1]) * 0.5 * sz
+            for sy in (-1.0, 1.0):
+                point = center_xz + axis_x * float(dimensions[0]) * 0.5 * sx + axis_y * float(dimensions[1]) * 0.5 * sy
                 points.append(_rotate_xz(float(point[0]), float(point[1]), floor_theta))
 
     arr = np.array(points, dtype=float)
