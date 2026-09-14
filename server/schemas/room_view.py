@@ -66,6 +66,7 @@ class FurnitureCatalogItemResponse(BaseModel):
     name: str | None = None
     furniture_type: str | None = None
     glb_url: str | None = None
+    usdz_url: str | None = None
     width: float
     depth: float
     height: float

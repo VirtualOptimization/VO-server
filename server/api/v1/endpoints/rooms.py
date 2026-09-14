@@ -347,13 +347,30 @@ async def get_room_version_detail(
 # ── GET /rooms/catalog/models ────────────────────────────────────────────────
 
 @router.get("/catalog/models", response_model=FurnitureCatalogResponse)
-def get_furniture_catalog():
+async def get_furniture_catalog():
     db = SessionLocal()
     try:
-        models = db.query(FurnitureModel).order_by(
+        models = db.query(FurnitureModel).filter(
+            FurnitureModel.user_id.is_(None),
+        ).order_by(
             FurnitureModel.furniture_type,
             FurnitureModel.model_key,
         ).all()
+
+        # Only public catalog assets belong in this unauthenticated endpoint.
+        # Presign an existing USDZ, not a renamed GLB signed URL.
+        usdz_urls = {}
+        for model in models:
+            glb_uri = _catalog_glb_uri(model)
+            uri = model.usdz_url or (
+                glb_uri.removesuffix(".glb") + ".usdz"
+                if glb_uri and glb_uri.endswith(".glb") else None
+            )
+            parsed = parse_s3_uri(uri)
+            if parsed:
+                bucket, key = parsed
+                if bucket == settings.s3_bucket_name and await head_object(key):
+                    usdz_urls[model.model_key] = generate_presigned_url_for_uri(uri)
 
         return FurnitureCatalogResponse(
             items=[
@@ -362,6 +379,7 @@ def get_furniture_catalog():
                     name=model.name,
                     furniture_type=model.furniture_type,
                     glb_url=generate_presigned_url_for_uri(_catalog_glb_uri(model)),
+                    usdz_url=usdz_urls.get(model.model_key),
                     width=float(model.width),
                     depth=float(model.depth),
                     height=float(model.height),
