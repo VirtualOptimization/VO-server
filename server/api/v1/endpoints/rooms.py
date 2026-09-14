@@ -1,9 +1,10 @@
 """공간 조회 — 방 상태 / 버전 목록 / 버전 상세 / origin·optimized 에셋 다운로드"""
 from __future__ import annotations
 
+import asyncio
 import logging
 
-import json 
+import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import or_
@@ -13,6 +14,7 @@ from server.api.v1.deps import get_current_user
 from server.api.v1.endpoints.rooms_common import (
     _attach_model_asset_urls,
     _catalog_db_model_key,
+    _catalog_model_key,
     _get_catalog_model_asset_urls,
     _resolve_prefixes,
     _user_s3_segment,
@@ -26,6 +28,9 @@ from server.core.s3 import (
 )
 from server.core.config import settings
 from server.schemas.room_view import (
+    CatalogResolveRequest,
+    CatalogResolveResponse,
+    CatalogResolveResultItem,
     FurnitureCatalogItemResponse,
     FurnitureCatalogResponse,
     MyRoomListItem,
@@ -389,6 +394,29 @@ async def get_furniture_catalog():
         )
     finally:
         db.close()
+
+
+# ── POST /rooms/catalog/resolve ──────────────────────────────────────────────
+# furniture_models DB의 26개 안팎 목록은 수동으로 시딩된 큐레이션 목록이라, S3 asset/ 아래에
+# 실제로 존재하는 카탈로그 파일보다 적을 수 있다(예: RoomPlan이 고르는 "Unidentified_*" 변형이
+# DB엔 없지만 S3엔 있는 경우). 저장된 방의 origin/optimized 조회는 이미
+# _get_catalog_model_asset_urls()로 DB를 거치지 않고 S3 존재 여부를 직접 확인해서 이 문제가 없다.
+# 저장 전(스캔 직후 미리보기)에도 같은 방식을 쓸 수 있게, room_data.json 업로드 없이
+# category+modelFileName만으로 즉석에서 S3 확인하는 엔드포인트를 별도로 둔다.
+@router.post("/catalog/resolve", response_model=CatalogResolveResponse)
+async def resolve_catalog_models(request: CatalogResolveRequest):
+    async def resolve_one(item) -> CatalogResolveResultItem:
+        glb_key = _catalog_model_key(item.category, item.model_file_name)
+        usdz_key = glb_key.removesuffix(".glb") + ".usdz"
+        if await head_object(usdz_key):
+            return CatalogResolveResultItem(
+                identifier=item.identifier,
+                usdz_url=generate_presigned_url(usdz_key),
+            )
+        return CatalogResolveResultItem(identifier=item.identifier, usdz_url=None)
+
+    results = await asyncio.gather(*(resolve_one(item) for item in request.objects))
+    return CatalogResolveResponse(results=list(results))
 
 
 # ── GET /rooms/{room_id} ──────────────────────────────────────────────────────

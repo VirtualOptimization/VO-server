@@ -76,6 +76,25 @@ class FurnitureCatalogResponse(BaseModel):
     items: list[FurnitureCatalogItemResponse]
 
 
+class CatalogResolveRequestItem(BaseModel):
+    identifier: str
+    category: str
+    model_file_name: str
+
+
+class CatalogResolveRequest(BaseModel):
+    objects: list[CatalogResolveRequestItem]
+
+
+class CatalogResolveResultItem(BaseModel):
+    identifier: str
+    usdz_url: str | None = None
+
+
+class CatalogResolveResponse(BaseModel):
+    results: list[CatalogResolveResultItem]
+
+
 class VersionDetailResponse(BaseModel):
     version_id: int
     room_id: int
