@@ -1,12 +1,18 @@
 """Run the scan processing pipeline inside the FastAPI host.
 
 This replaces the Step Functions + ECS + Lambda path for low-cost deployments.
+
+Save (GLB shell conversion) and optimize (furniture layout) run as two
+independent background steps: saving a scan must not block on or fail because
+of optimization, and optimization is only triggered later when the user asks
+for it from the room-view screen.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -20,6 +26,8 @@ from shared.db import SessionLocal
 from shared.models.room import Room
 from shared.models.version import Version
 
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -41,11 +49,11 @@ def _run_python_script(script: str, env_updates: dict[str, str]) -> None:
     )
 
 
-def _mark_room_status(db: Session, room_id: int, status: str) -> None:
+def _mark_optimization_status(db: Session, room_id: int, status: str) -> None:
     room = db.get(Room, room_id)
     if not room:
         raise ValueError(f"Room not found: {room_id}")
-    room.status = status
+    room.optimization_status = status
     db.commit()
 
 
@@ -75,7 +83,7 @@ def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, A
     if not room:
         raise ValueError(f"Room not found: {room_id}")
 
-    room.status = "COMPLETED"
+    room.optimization_status = "COMPLETED"
 
     original_json_data = {
         "source": "ios_upload",
@@ -158,7 +166,36 @@ def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, A
     }
 
 
-def _run_local_scan_pipeline_sync(event: dict[str, Any]) -> dict[str, Any]:
+def _run_glb_conversion_sync(event: dict[str, Any]) -> dict[str, Any]:
+    """Build the room-shell GLB. Runs at save time; never touches optimization_status."""
+    bucket = event.get("bucket") or settings.s3_bucket_name
+    if not bucket:
+        raise ValueError("S3 bucket is missing. Set S3_BUCKET_NAME.")
+
+    inputs = event["inputs"]
+    outputs = event["outputs"]
+
+    _run_python_script(
+        "workers/converter/run_glb_conversion.py",
+        {
+            "S3_BUCKET_NAME": bucket,
+            "ROOM_DATA_S3_KEY": inputs["room_data_json"],
+            "INPUT_S3_KEY": inputs.get("room_usdz") or "",
+            "OUTPUT_S3_KEY": outputs["glb"],
+        },
+    )
+    return event
+
+
+async def run_glb_conversion_background(event: dict[str, Any]) -> None:
+    """Fire-and-forget GLB conversion for POST /complete. Failures are logged, not raised."""
+    try:
+        await asyncio.to_thread(_run_glb_conversion_sync, event)
+    except Exception:
+        logger.exception("GLB 변환 백그라운드 작업 실패 room_id=%s", event.get("room_id"))
+
+
+def _run_local_optimize_pipeline_sync(event: dict[str, Any]) -> dict[str, Any]:
     bucket = event.get("bucket") or settings.s3_bucket_name
     if not bucket:
         raise ValueError("S3 bucket is missing. Set S3_BUCKET_NAME.")
@@ -167,19 +204,7 @@ def _run_local_scan_pipeline_sync(event: dict[str, Any]) -> dict[str, Any]:
     outputs = event["outputs"]
     room_id = event["room_id"]
 
-    with SessionLocal() as db:
-        _mark_room_status(db, room_id, "PROCESSING")
-
     try:
-        _run_python_script(
-            "workers/converter/run_glb_conversion.py",
-            {
-                "S3_BUCKET_NAME": bucket,
-                "ROOM_DATA_S3_KEY": inputs["room_data_json"],
-                "INPUT_S3_KEY": inputs.get("room_usdz") or "",
-                "OUTPUT_S3_KEY": outputs["glb"],
-            },
-        )
         _run_python_script(
             "workers/optimizer/run_s3_optimizer.py",
             {
@@ -200,9 +225,14 @@ def _run_local_scan_pipeline_sync(event: dict[str, Any]) -> dict[str, Any]:
         return event
     except Exception:
         with SessionLocal() as db:
-            _mark_room_status(db, room_id, "FAILED")
+            _mark_optimization_status(db, room_id, "FAILED")
         raise
 
 
-async def run_local_scan_pipeline(event: dict[str, Any]) -> dict[str, Any]:
-    return await asyncio.to_thread(_run_local_scan_pipeline_sync, event)
+async def run_local_optimize_pipeline(event: dict[str, Any]) -> dict[str, Any]:
+    """Awaited from a FastAPI BackgroundTask by POST /optimize, after the response is sent."""
+    try:
+        return await asyncio.to_thread(_run_local_optimize_pipeline_sync, event)
+    except Exception:
+        logger.exception("최적화 파이프라인 실패 room_id=%s", event.get("room_id"))
+        raise

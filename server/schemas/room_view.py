@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class RoomSummaryResponse(BaseModel):
     room_id: int
     status: str
+    optimization_status: str
 
 
 class RoomNameUpdateRequest(BaseModel):

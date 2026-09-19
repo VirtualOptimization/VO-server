@@ -97,6 +97,11 @@ class ScanUploadCompleteResponse(BaseModel):
     pipeline_input: dict[str, Any]
 
 
+class OptimizeStartResponse(BaseModel):
+    room_id: int
+    optimization_status: str
+
+
 class ScanCancelResponse(BaseModel):
     """Response returned after an incomplete scan session is discarded."""
 
