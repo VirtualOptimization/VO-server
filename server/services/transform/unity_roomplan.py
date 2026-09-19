@@ -6,8 +6,6 @@ import json
 import math
 from typing import Any
 
-import numpy as np
-
 from .mappers import infer_catalog_model_key
 
 
@@ -131,17 +129,21 @@ def _floor_normalization_context(room_data: dict[str, Any]) -> tuple[float, floa
         center = floor_item["center"]
         dimensions = floor_item["dimensions"]
         transform = floor_item["transform"]
-        axis_x = np.array([transform[0][0], transform[0][2]], dtype=float)
-        axis_z = np.array([transform[2][0], transform[2][2]], dtype=float)
-        center_xz = np.array([center[0], center[2]], dtype=float)
+        # RoomPlan floors are 2D captured surfaces. Their two dimensions follow
+        # local transform rows 0 and 1; row 2 is the floor normal.
+        axis_x = (float(transform[0][0]), float(transform[0][2]))
+        axis_y = (float(transform[1][0]), float(transform[1][2]))
+        half_x = float(dimensions[0]) * 0.5
+        half_y = float(dimensions[1]) * 0.5
         for sx in (-1.0, 1.0):
-            for sz in (-1.0, 1.0):
-                point = center_xz + axis_x * float(dimensions[0]) * 0.5 * sx + axis_z * float(dimensions[1]) * 0.5 * sz
-                points.append(_rotate_xz(float(point[0]), float(point[1]), floor_theta))
+            for sy in (-1.0, 1.0):
+                point_x = float(center[0]) + axis_x[0] * half_x * sx + axis_y[0] * half_y * sy
+                point_z = float(center[2]) + axis_x[1] * half_x * sx + axis_y[1] * half_y * sy
+                points.append(_rotate_xz(point_x, point_z, floor_theta))
 
-    arr = np.array(points, dtype=float)
-    min_x, min_z = np.min(arr, axis=0)
-    return floor_theta, floor_y, float(min_x), float(min_z)
+    min_x = min(point[0] for point in points)
+    min_z = min(point[1] for point in points)
+    return floor_theta, floor_y, min_x, min_z
 
 
 def _normalize_point(point: list[float], floor_theta: float, floor_y: float, min_x: float, min_z: float) -> list[float]:

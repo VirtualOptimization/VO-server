@@ -208,6 +208,44 @@ def apply_ai_constraints(problem: dict[str, Any], constraints: dict[str, Any]) -
                 anchor_preferences[key] = bool(preference[key])
 
 
+def _neufert_guidance(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compact, model-friendly view of the Neufert rules already matched to this item.
+
+    apply_neufert_rules() attaches the raw matched rules (with page numbers, Turkish
+    evidence text, confidence scores) under placement_rules.neufert_rules before this
+    module ever runs. Sending that raw list as-is buries the one or two facts that
+    actually matter in noise the model has no instructions to use. This distills each
+    rule down to the object/relation/direction/distance the optimizer already derived
+    from it, plus a short evidence snippet for traceability.
+    """
+    rules = item.get("placement_rules", {}).get("neufert_rules", [])
+    guidance: list[dict[str, Any]] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        entry: dict[str, Any] = {
+            "object": rule.get("object"),
+            "relation": rule.get("relation"),
+            "direction": rule.get("direction"),
+        }
+        distance = rule.get("min_distance_m")
+        distance_kind = "min"
+        if distance is None:
+            distance = rule.get("recommended_distance_m")
+            distance_kind = "recommended"
+        if distance is not None:
+            try:
+                entry["distance_m"] = round(float(distance), 3)
+                entry["distance_kind"] = distance_kind
+            except (TypeError, ValueError):
+                pass
+        evidence = rule.get("evidence")
+        if isinstance(evidence, str) and evidence.strip():
+            entry["evidence"] = evidence.strip()[:140]
+        guidance.append(entry)
+    return guidance
+
+
 def _summarize_problem(problem: dict[str, Any]) -> dict[str, Any]:
     room = problem.get("room_metadata", {})
     fixed_elements = problem.get("fixed_elements", [])
@@ -246,7 +284,12 @@ def _summarize_problem(problem: dict[str, Any]) -> dict[str, Any]:
                 "back_vector_2d": _round_list(item.get("back_vector_2d", [])),
                 "nearest_walls": _nearest_walls(item, room),
                 "nearby_supports": _nearby_supports(item, supports) if item.get("type") == "chair" else [],
-                "placement_rules": item.get("placement_rules", {}),
+                "placement_rules": {
+                    key: value
+                    for key, value in item.get("placement_rules", {}).items()
+                    if key != "neufert_rules"
+                },
+                "neufert_guidance": _neufert_guidance(item),
             }
             for item in movable_items
         ],
@@ -335,7 +378,14 @@ def _build_prompt(summary: dict[str, Any]) -> str:
         "- Door swing/clearance areas are hard constraints. Keep furniture bodies and chair pull-out zones out of doors/openings.\n"
         "- Set back_to_wall only for storage, closet, shelf, cabinet, and bed. Do not set it for ordinary tables or chairs.\n"
         "- Assign a semantic role when it helps distinguish desk/table/storage/seating usage.\n"
-        "- Keep door/window access and walking paths in mind.\n\n"
+        "- Keep door/window access and walking paths in mind.\n"
+        "- Each furniture object may include a `neufert_guidance` list: rules already matched from the "
+        "Neufert architectural reference for this exact object. Treat these as authoritative over your own "
+        "generic assumptions about that object -- if guidance says an object should be against a wall, "
+        "parallel to another object, or oriented a certain way, reflect that in wall_preferences/"
+        "orientation_preferences/layout_priorities for that object_id, and mention it in the reason field. "
+        "An empty or missing `neufert_guidance` means no matched reference rule; fall back to general "
+        "best practice for that case.\n\n"
         f"Output schema example:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
         f"Input room summary:\n{json.dumps(summary, ensure_ascii=False)}"
     )
