@@ -34,6 +34,7 @@ class PenaltyWeights:
     rotation_snap: float = 25_000.0
     wall_anchor: float = 15_000.0
     body_collision: float = 50_000_000.0
+    open_floor_reward: float = 400.0
 
 
 class CanonicalLayoutOptimizer:
@@ -537,8 +538,9 @@ class CanonicalLayoutOptimizer:
         front = self._world_front(furniture, theta)
         lateral = np.array([-front[1], front[0]])
 
-        side_clearance = 0.6
-        foot_clearance = 0.4
+        placement_rules = furniture.get("placement_rules", {})
+        side_clearance = float(placement_rules.get("side_clearance", 0.6))
+        foot_clearance = float(placement_rules.get("front_clearance", 0.4))
         left_center = coords[:2] + lateral * (width / 2.0 + side_clearance / 2.0)
         right_center = coords[:2] - lateral * (width / 2.0 + side_clearance / 2.0)
         left_zone = self._obb_corners(left_center[0], left_center[1], side_clearance, depth, theta)
@@ -599,8 +601,11 @@ class CanonicalLayoutOptimizer:
 
     def _desk_penalty(self, furniture: dict[str, Any], coords: np.ndarray, corners: np.ndarray, all_obbs: list[np.ndarray], index: int) -> float:
         total = 0.0
-        front_zone, _ = self._activity_area(furniture, coords, depth_override=0.75)
-        side_zone, _ = self._activity_area(furniture, coords, width_override=max(float(furniture["extent"][0]), self.body.shoulder_width), depth_override=0.6)
+        placement_rules = furniture.get("placement_rules", {})
+        front_clearance = float(placement_rules.get("front_clearance", 0.75))
+        side_clearance = float(placement_rules.get("side_clearance", 0.6))
+        front_zone, _ = self._activity_area(furniture, coords, depth_override=front_clearance)
+        side_zone, _ = self._activity_area(furniture, coords, width_override=max(float(furniture["extent"][0]), self.body.shoulder_width), depth_override=side_clearance)
 
         if np.any(front_zone[:, 0] < 0) or np.any(front_zone[:, 0] > self.room_width) or np.any(front_zone[:, 1] < 0) or np.any(front_zone[:, 1] > self.room_depth):
             total += self.weights.high_med
@@ -723,7 +728,8 @@ class CanonicalLayoutOptimizer:
 
     def _closet_penalty(self, furniture: dict[str, Any], coords: np.ndarray, corners: np.ndarray, all_obbs: list[np.ndarray], index: int) -> float:
         total = 0.0
-        front_zone, front = self._activity_area(furniture, coords, depth_override=1.0)
+        front_clearance = float(furniture.get("placement_rules", {}).get("front_clearance", 1.0))
+        front_zone, front = self._activity_area(furniture, coords, depth_override=front_clearance)
 
         if np.any(front_zone[:, 0] < 0) or np.any(front_zone[:, 0] > self.room_width) or np.any(front_zone[:, 1] < 0) or np.any(front_zone[:, 1] > self.room_depth):
             total += self.weights.high_med
@@ -749,8 +755,11 @@ class CanonicalLayoutOptimizer:
 
     def _shelf_penalty(self, furniture: dict[str, Any], coords: np.ndarray, corners: np.ndarray, all_obbs: list[np.ndarray], index: int) -> float:
         total = 0.0
-        drawer_zone, _ = self._activity_area(furniture, coords, depth_override=0.4)
-        front_zone, _ = self._activity_area(furniture, coords, depth_override=0.8)
+        placement_rules = furniture.get("placement_rules", {})
+        drawer_clearance = float(placement_rules.get("drawer_clearance", 0.4))
+        front_clearance = float(placement_rules.get("front_clearance", 0.8))
+        drawer_zone, _ = self._activity_area(furniture, coords, depth_override=drawer_clearance)
+        front_zone, _ = self._activity_area(furniture, coords, depth_override=front_clearance)
 
         for zone, weight in ((drawer_zone, self.weights.high), (front_zone, self.weights.high_med)):
             if np.any(zone[:, 0] < 0) or np.any(zone[:, 0] > self.room_width) or np.any(zone[:, 1] < 0) or np.any(zone[:, 1] > self.room_depth):
@@ -1749,6 +1758,53 @@ class CanonicalLayoutOptimizer:
             )
         return coords.reshape(-1)
 
+    def _floor_occupancy_mask(self, coords: np.ndarray, cell_size: float) -> tuple[np.ndarray, float]:
+        """Vectorized boolean occupancy grid over the room floor (True = covered by furniture)."""
+        cols = max(1, int(round(self.room_width / cell_size)))
+        rows = max(1, int(round(self.room_depth / cell_size)))
+        xs = (np.arange(cols) + 0.5) * (self.room_width / cols)
+        ys = (np.arange(rows) + 0.5) * (self.room_depth / rows)
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        occupied = np.zeros_like(grid_x, dtype=bool)
+
+        for i, furniture in enumerate(self.furnitures):
+            cx, cy, _, theta = coords[i]
+            width, depth = float(furniture["extent"][0]), float(furniture["extent"][1])
+            c, s = math.cos(-float(theta)), math.sin(-float(theta))
+            dx = grid_x - cx
+            dy = grid_y - cy
+            local_x = dx * c - dy * s
+            local_y = dx * s + dy * c
+            occupied |= (np.abs(local_x) <= width / 2.0) & (np.abs(local_y) <= depth / 2.0)
+
+        cell_area = (self.room_width / cols) * (self.room_depth / rows)
+        return occupied, cell_area
+
+    def _open_floor_area(self, coords: np.ndarray, cell_size: float = 0.25) -> float:
+        """Cheap, fragmentation-agnostic open-area estimate for use inside the hot objective loop."""
+        occupied, cell_area = self._floor_occupancy_mask(coords, cell_size)
+        return float(np.sum(~occupied)) * cell_area
+
+    def _open_floor_report(self, coords: np.ndarray, cell_size: float = 0.1) -> dict[str, float]:
+        """Post-hoc, connectivity-aware open-floor metrics for the final result only."""
+        from scipy import ndimage
+
+        occupied, cell_area = self._floor_occupancy_mask(coords, cell_size)
+        free = ~occupied
+        total_open = float(np.sum(free)) * cell_area
+        labeled, num_features = ndimage.label(free)
+        largest_open = 0.0
+        if num_features > 0:
+            sizes = ndimage.sum(free, labeled, index=range(1, num_features + 1))
+            largest_open = float(np.max(sizes)) * cell_area
+        room_area = self.room_width * self.room_depth
+        return {
+            "room_area_m2": round(room_area, 3),
+            "open_floor_area_m2": round(total_open, 3),
+            "open_floor_ratio": round(total_open / room_area, 4) if room_area > 0 else 0.0,
+            "largest_open_region_m2": round(largest_open, 3),
+        }
+
     def _objective(self, x: np.ndarray) -> float:
         coords = x.reshape(-1, 4)
         total = 0.0
@@ -1802,6 +1858,7 @@ class CanonicalLayoutOptimizer:
             total += self.weights.low * 2 / (center_distance + 0.2)
 
         total += self._fixed_element_penalty(obbs, coords)
+        total -= self._open_floor_area(coords) * self.weights.open_floor_reward
         return float(total)
 
     def optimize(
@@ -1814,6 +1871,8 @@ class CanonicalLayoutOptimizer:
     ) -> dict[str, Any]:
         if not self.furnitures:
             return self.payload
+
+        print(f"optimizer: start items={self.num_f}", flush=True)
 
         bounds: list[tuple[float, float]] = []
         initial = []
@@ -1839,10 +1898,17 @@ class CanonicalLayoutOptimizer:
             )
 
         original_initial = np.array(initial, dtype=float)
+        print("optimizer: initial poses built", flush=True)
         wall_initial = self._wall_anchored_initial(original_initial)
+        print("optimizer: wall anchor initial done", flush=True)
         support_initial = self._chair_support_initial(wall_initial)
+        print("optimizer: chair support initial done", flush=True)
 
         if use_global:
+            print(
+                f"optimizer: differential evolution start maxiter={global_maxiter} popsize={global_popsize}",
+                flush=True,
+            )
             result_global = differential_evolution(
                 self._objective,
                 bounds,
@@ -1852,6 +1918,7 @@ class CanonicalLayoutOptimizer:
                 maxiter=global_maxiter,
                 popsize=global_popsize,
             )
+            print("optimizer: differential evolution done", flush=True)
             candidates = [original_initial, wall_initial, support_initial]
             if np.isfinite(result_global.fun):
                 candidates.append(result_global.x)
@@ -1859,6 +1926,7 @@ class CanonicalLayoutOptimizer:
         else:
             initial_guess = min((original_initial, wall_initial, support_initial), key=self._objective)
 
+        print("optimizer: initial candidate selected", flush=True)
         result_local = minimize(
             self._objective,
             initial_guess,
@@ -1867,10 +1935,17 @@ class CanonicalLayoutOptimizer:
             tol=1e-4,
             options={"maxiter": local_maxiter},
         )
+        print(
+            f"optimizer: local minimize done success={result_local.success} "
+            f"iterations={getattr(result_local, 'nit', None)}",
+            flush=True,
+        )
 
+        print("optimizer: post-processing start", flush=True)
         optimized_x = self._wall_anchored_initial(result_local.x, force=True)
         optimized_x = self._sync_paired_chairs(optimized_x)
         optimized_x = self._project_inside_room(optimized_x)
+        print("optimizer: post-processing initialized", flush=True)
         for _ in range(4):
             optimized_x = self._resolve_pairwise_overlaps(optimized_x)
             optimized_x = self._project_inside_room(optimized_x)
@@ -1946,7 +2021,9 @@ class CanonicalLayoutOptimizer:
                 "sitting_popliteal": self.body.sitting_popliteal,
                 "arm_reach": self.body.arm_reach,
             },
+            "floor_efficiency": self._open_floor_report(optimized),
         }
+        print("optimizer: output built", flush=True)
         return output
 
     def save_comparison_svg(self, payload: dict[str, Any], output_path: str | Path) -> None:

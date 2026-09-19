@@ -9,6 +9,8 @@ openai
 python-multipart
 psycopg[binary]
 asyncpg
+pgvector
+sentence-transformers
 boto3
 botocore
 certifi

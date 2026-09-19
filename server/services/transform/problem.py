@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from workers.optimizer.neufert_rules import apply_neufert_rules
+
 def _copy(data: Any) -> Any:
     return json.loads(json.dumps(data))
 
@@ -156,10 +158,15 @@ def build_layout_problem(normalized_scan: dict[str, Any]) -> dict[str, Any]:
         "arm_reach": 0.565,
     }
 
-    return {
+    problem = {
         "room_metadata": room_metadata,
         "fixed_elements": fixed_elements,
         "movable_items": movable_items,
         "ignored_scan_items": ignored_scan_items,
         "constraints": constraints,
     }
+
+    # Optional: set NEUFERT_RULES_JSONL to inject validated document rules.
+    import os
+
+    return apply_neufert_rules(problem, os.getenv("NEUFERT_RULES_JSONL"))
