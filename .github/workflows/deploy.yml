@@ -1,0 +1,35 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - feat/api-restructure
+      - dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/VO-server
+            git fetch origin
+            git checkout dev
+            git pull origin dev
+            touch .env
+            grep -v -E '^(JWT_SECRET_KEY|JWT_ALGORITHM|ACCESS_TOKEN_EXPIRE_MINUTES)=' .env > .env.tmp || true
+            mv .env.tmp .env
+            cat >> .env << 'EOF'
+            JWT_SECRET_KEY=${{ secrets.JWT_SECRET_KEY }}
+            JWT_ALGORITHM=${{ secrets.JWT_ALGORITHM }}
+            ACCESS_TOKEN_EXPIRE_MINUTES=${{ secrets.ACCESS_TOKEN_EXPIRE_MINUTES }}
+            EOF
+            source .venv/bin/activate
+            pip install -r requirements.txt -q
+            bash scripts/setup_gltf2usdz.sh
+            sudo systemctl restart vo-server

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from server.api.v1.router import router as v1_router
+from server.core.config import settings
 
 
 @asynccontextmanager
@@ -20,6 +21,9 @@ app = FastAPI(
     description="iOS LiDAR 기반 가구 배치 최적화 백엔드 서버",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url="/docs" if settings.api_docs_enabled else None,
+    redoc_url="/redoc" if settings.api_docs_enabled else None,
+    openapi_url="/openapi.json" if settings.api_docs_enabled else None,
 )
 
 app.add_middleware(
@@ -30,7 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(v1_router, prefix="/api/v1")
+app.include_router(v1_router, prefix="/api")
 
 
 @app.get("/health")
