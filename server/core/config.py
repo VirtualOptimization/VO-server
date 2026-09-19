@@ -17,11 +17,6 @@ class Settings(BaseSettings):
         default=3600,
         validation_alias="S3_PRESIGNED_EXPIRATION_SECONDS",
     )
-    step_functions_state_machine_arn: str = Field(
-        default="",
-        validation_alias="STEP_FUNCTIONS_STATE_MACHINE_ARN",
-    )
-    scan_pipeline_mode: str = Field(default="step_functions", validation_alias="SCAN_PIPELINE_MODE")
     local_pipeline_timeout_seconds: int = Field(
         default=1800,
         validation_alias="LOCAL_PIPELINE_TIMEOUT_SECONDS",

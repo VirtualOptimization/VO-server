@@ -40,7 +40,7 @@
 - ORM: SQLAlchemy, Alembic  
 
 ### ☁️ Infrastructure (AWS)
-- Compute: ECS (Docker), Lambda, Step Functions  
+- Compute: EC2  
 - Storage: S3  
 
 ### ⚙️ Processing & Realtime

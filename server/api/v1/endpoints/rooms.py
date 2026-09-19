@@ -428,7 +428,11 @@ def get_room_by_id(room_id: int, current_user: User = Depends(get_current_user))
         room = db.query(Room).filter(Room.id == room_id, Room.user_id == current_user.id).first()
         if room is None:
             raise HTTPException(status_code=404, detail="room not found")
-        return RoomSummaryResponse(room_id=room.id, status=room.status)
+        return RoomSummaryResponse(
+            room_id=room.id,
+            status=room.status,
+            optimization_status=room.optimization_status,
+        )
     finally:
         db.close()
 

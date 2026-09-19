@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from server.api.v1.deps import get_current_user
 from server.api.v1.endpoints.rooms_common import (
@@ -29,8 +29,12 @@ from server.core.s3 import (
     object_exists,
     upload_json,
 )
-from server.services.local_scan_pipeline import run_local_scan_pipeline
+from server.services.local_scan_pipeline import (
+    run_glb_conversion_background,
+    run_local_optimize_pipeline,
+)
 from server.schemas.scan import (
+    OptimizeStartResponse,
     PresignedUploadTarget,
     ScanUploadCompleteRequest,
     ScanUploadCompleteResponse,
@@ -50,17 +54,6 @@ INCOMPLETE_SCAN_STATUSES = {"PENDING", "UPLOADED", "FAILED"}
 
 
 # ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
-
-def _get_stepfunctions_client():
-    import boto3
-
-    client_kwargs = {"region_name": settings.aws_region}
-    if settings.aws_access_key_id and settings.aws_secret_access_key:
-        client_kwargs.update(
-            aws_access_key_id=settings.aws_access_key_id,
-            aws_secret_access_key=settings.aws_secret_access_key,
-        )
-    return boto3.client("stepfunctions", **client_kwargs)
 
 def _generate_unique_confirm_code(db) -> str:
     while True:
@@ -100,13 +93,17 @@ def _create_upload_session(
         db.close()
 
 
-def _mark_upload_completed(room_id: int, uploaded_keys: list[str], pipeline_started: bool) -> int:
+def _mark_upload_completed(room_id: int, uploaded_keys: list[str]) -> int:
+    """Save is a one-shot step: as soon as the original version exists, the room
+    is done from the user's point of view and belongs in their room list.
+    Optimization state is tracked separately on Room.optimization_status.
+    """
     db = SessionLocal()
     try:
         room = db.get(Room, room_id)
         if not room:
             raise ValueError(f"Room not found: {room_id}")
-        room.status = "PROCESSING" if pipeline_started else "UPLOADED"
+        room.status = "COMPLETED"
         room_shell_key = next((k for k in uploaded_keys if k.endswith("/Room.usdz")), None)
         if room_shell_key:
             room.room_shell_usdc_url = build_s3_uri(room_shell_key)
@@ -124,6 +121,57 @@ def _get_room_context(room_id: int, user_id: int) -> tuple[str | None, str | Non
             raise ValueError(f"Room not found: {room_id}")
         user = db.get(User, room.user_id)
         return _user_s3_segment(user), room.name
+    finally:
+        db.close()
+
+
+def _claim_room_for_optimize(room_id: int, user_id: int) -> dict[str, Any]:
+    """Lock the room row and decide what POST /optimize should do.
+
+    Locking (SELECT ... FOR UPDATE) and the status transition happen in one
+    transaction so two concurrent optimize requests can't both start the
+    pipeline for the same room.
+    """
+    db = SessionLocal()
+    try:
+        room = (
+            db.query(Room)
+            .filter(Room.id == room_id, Room.user_id == user_id)
+            .with_for_update()
+            .first()
+        )
+        if room is None:
+            return {"action": "not_found"}
+
+        has_original = (
+            db.query(Version.id)
+            .filter(Version.room_id == room_id, Version.version_type == "ORIGINAL", Version.version_no == 0)
+            .first()
+            is not None
+        )
+        if not has_original:
+            return {"action": "no_original"}
+
+        if room.optimization_status == "PROCESSING":
+            return {"action": "already_processing"}
+
+        has_optimized = (
+            db.query(Version.id)
+            .filter(Version.room_id == room_id, Version.version_type == "OPTIMIZED")
+            .first()
+            is not None
+        )
+        if room.optimization_status == "COMPLETED" and has_optimized:
+            return {"action": "already_completed"}
+
+        room.optimization_status = "PROCESSING"
+        user = db.get(User, room.user_id)
+        owner_segment = _user_s3_segment(user)
+        db.commit()
+        return {"action": "start", "owner_segment": owner_segment}
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -226,20 +274,6 @@ async def _create_origin_unity_json(raw_prefix: str) -> str:
     return unity_room_data_key
 
 
-async def _start_pipeline_execution(pipeline_input: dict[str, Any]) -> str | None:
-    try:
-        room_id = pipeline_input["room_id"]
-        response = _get_stepfunctions_client().start_execution(
-            stateMachineArn=settings.step_functions_state_machine_arn,
-            name=f"VO-Scan-{room_id}-{uuid.uuid4().hex[:8].upper()}",
-            input=json.dumps(pipeline_input),
-        )
-        return response["executionArn"]
-    except Exception as e:
-        logger.error(f"Step Functions start_execution failed: {e}")
-        return None
-
-
 # ── POST /rooms/start ─────────────────────────────────────────────────────────
 
 @router.post("/start", response_model=ScanUploadStartResponse)
@@ -294,8 +328,14 @@ async def start_scan_upload(
 async def complete_scan_upload(
     room_id: int,
     payload: ScanUploadCompleteRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
 ):
+    """Save only: create the original version and mark the room complete.
+
+    Optimization never runs here anymore — the room-view screen triggers it
+    explicitly via POST /{room_id}/optimize once the user asks for it.
+    """
     if not payload.uploaded_keys:
         raise HTTPException(status_code=422, detail="uploaded_keys는 비어 있을 수 없습니다.")
 
@@ -320,43 +360,74 @@ async def complete_scan_upload(
 
     unity_room_data_key = await _create_origin_unity_json(raw_prefix)
 
-    # 이미 파이프라인이 실행 중이면 중복 실행 방지
-    db_check = SessionLocal()
-    try:
-        room_check = db_check.get(Room, room_id)
-        if room_check and room_check.status in ("PROCESSING", "COMPLETED"):
-            return ScanUploadCompleteResponse(
-                message="already processing", room_id=room_check.id,
-                raw_prefix=raw_prefix, generated_prefix=generated_prefix,
-                uploaded_keys=payload.uploaded_keys, pipeline_started=True,
-                execution_arn=None, pipeline_input={},
-            )
-    finally:
-        db_check.close()
-
-    room_id = await asyncio.to_thread(_mark_upload_completed, room_id, payload.uploaded_keys, False)
+    room_id = await asyncio.to_thread(_mark_upload_completed, room_id, payload.uploaded_keys)
     await asyncio.to_thread(_ensure_original_version, room_id, required_json_key, unity_room_data_key, room_name)
     processed_keys = [*payload.uploaded_keys, unity_room_data_key]
     pipeline_input = _build_pipeline_input(room_id, processed_keys, owner_segment)
 
-    is_local_pipeline = settings.scan_pipeline_mode.lower() == "local"
-
-    if is_local_pipeline:
-        await run_local_scan_pipeline(pipeline_input)
-        execution_arn = None
-        pipeline_started = True
-    else:
-        execution_arn = await _start_pipeline_execution(pipeline_input)
-        pipeline_started = execution_arn is not None
-
-    if pipeline_started and not is_local_pipeline:
-        await asyncio.to_thread(_mark_upload_completed, room_id, payload.uploaded_keys, True)
+    # Unity가 방 껍데기 GLB를 쓰므로 변환은 필요하지만, 저장 응답을 막을 이유는
+    # 없다. 백그라운드로 돌리고 결과를 기다리지 않는다.
+    background_tasks.add_task(run_glb_conversion_background, pipeline_input)
 
     return ScanUploadCompleteResponse(
         message="scan upload completed", room_id=room_id,
         raw_prefix=raw_prefix, generated_prefix=generated_prefix,
-        uploaded_keys=processed_keys, pipeline_started=pipeline_started,
-        execution_arn=execution_arn, pipeline_input=pipeline_input,
+        uploaded_keys=processed_keys, pipeline_started=False,
+        execution_arn=None, pipeline_input=pipeline_input,
+    )
+
+
+# ── POST /rooms/{room_id}/optimize ───────────────────────────────────────────
+
+@router.post("/{room_id}/optimize", response_model=OptimizeStartResponse)
+async def optimize_room(
+    room_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+):
+    """Start (or report the status of) furniture-layout optimization for a saved room.
+
+    Requires no request body: unlike /complete, iOS does not send uploaded_keys
+    here, so the S3 objects under the room's raw prefix are checked directly.
+    """
+    claim = await asyncio.to_thread(_claim_room_for_optimize, room_id, current_user.id)
+    action = claim["action"]
+
+    if action == "not_found":
+        raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
+    if action == "no_original":
+        raise HTTPException(status_code=409, detail="원본 버전이 없습니다.")
+    if action == "already_processing":
+        return JSONResponse(
+            status_code=202,
+            content=OptimizeStartResponse(room_id=room_id, optimization_status="PROCESSING").model_dump(),
+        )
+    if action == "already_completed":
+        return JSONResponse(
+            status_code=200,
+            content=OptimizeStartResponse(room_id=room_id, optimization_status="COMPLETED").model_dump(),
+        )
+
+    owner_segment = claim["owner_segment"]
+    raw_prefix = _raw_prefix(str(room_id), owner_segment)
+
+    candidate_keys = [
+        f"{raw_prefix}/room_data.json",
+        f"{raw_prefix}/Room.usdz",
+        f"{raw_prefix}/Room_empty.usdz",
+    ]
+    exists_flags = await asyncio.gather(*(object_exists(key) for key in candidate_keys))
+    uploaded_keys = [key for key, exists in zip(candidate_keys, exists_flags) if exists]
+    unity_room_data_key = f"{raw_prefix}/room_data.unity.json"
+    if await object_exists(unity_room_data_key):
+        uploaded_keys.append(unity_room_data_key)
+
+    pipeline_input = _build_pipeline_input(room_id, uploaded_keys, owner_segment)
+    background_tasks.add_task(run_local_optimize_pipeline, pipeline_input)
+
+    return JSONResponse(
+        status_code=202,
+        content=OptimizeStartResponse(room_id=room_id, optimization_status="PROCESSING").model_dump(),
     )
 
 
