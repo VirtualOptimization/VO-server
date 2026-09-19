@@ -45,7 +45,7 @@
 
 ### ⚙️ Processing & Realtime
 - Algorithm: Shapely (기하학 기반 최적화 계산)  
-- 3D Tool: usd2gltf (USDZ → GLB 변환)  
+- 3D Tool: Blender CLI (USDZ → FBX 변환)  
 - Communication: FastAPI WebSocket  
 
 ---
@@ -59,7 +59,7 @@
    Shapely 기반 바닥 점유율 계산 및 최적 가구 위치 산출  
 
 3. 🔄 **포맷 변환**  
-   USDZ → GLB 자동 변환 (유니티 호환성 확보)  
+   USDZ → FBX 자동 변환 (VR 호환성 확보)  
 
 4. 🔑 **VR 조회 시스템**  
    6자리 확인 코드 기반 공간 데이터 조회  
@@ -78,15 +78,6 @@ vo-server/
 ├── infra/         # ☁️ AWS CDK (IaC)
 └── shared/        # 📦 DB 스키마 & 공통 모델
 ````
-
----
-
-## 🗄️ RDS 준비
-
-- `infra/` 아래에 AWS CDK 기반 RDS 스택 골격이 있습니다.
-- 기본값은 개발용 PostgreSQL 인스턴스입니다.
-- 실제 배포 절차와 운영용 설정값은 내부 배포 문서에서 관리합니다.
-- 현재 저장소 기준 내부 가이드는 [docs/internal/rds-deploy.md](docs/internal/rds-deploy.md)에 정리되어 있습니다.
 
 ---
 

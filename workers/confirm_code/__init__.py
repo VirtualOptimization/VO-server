@@ -1,1 +1,0 @@
-"""Confirm code generation package."""
