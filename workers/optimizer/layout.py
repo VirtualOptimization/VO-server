@@ -1921,6 +1921,8 @@ class CanonicalLayoutOptimizer:
                 polish=False,
                 maxiter=global_maxiter,
                 popsize=global_popsize,
+                workers=-1,
+                updating="deferred",
             )
             print("optimizer: differential evolution done", flush=True)
             candidates = [original_initial, wall_initial, support_initial]
