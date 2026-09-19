@@ -22,6 +22,9 @@ DEFAULT_MODEL_VARIANT_BY_FILENAME = {
     "DefaultChair": "Default",
     "DefaultTable": "Default",
     "shelf_vertical": "Shelf",
+    # RoomPlan의 modelFileName(otherLegType)과 실제 카탈로그 폴더명(unidentifiedLegs)
+    # 표기가 달라 폴더명 추측이 어긋난다.
+    "Unidentified_wBack_otherLegType_wArms": "Unidentified_wBack_unidentifiedLegs_wArms",
 }
 
 

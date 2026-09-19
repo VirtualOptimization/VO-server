@@ -66,6 +66,7 @@ class FurnitureCatalogItemResponse(BaseModel):
     name: str | None = None
     furniture_type: str | None = None
     glb_url: str | None = None
+    usdz_url: str | None = None
     width: float
     depth: float
     height: float
@@ -73,6 +74,25 @@ class FurnitureCatalogItemResponse(BaseModel):
 
 class FurnitureCatalogResponse(BaseModel):
     items: list[FurnitureCatalogItemResponse]
+
+
+class CatalogResolveRequestItem(BaseModel):
+    identifier: str
+    category: str
+    model_file_name: str
+
+
+class CatalogResolveRequest(BaseModel):
+    objects: list[CatalogResolveRequestItem]
+
+
+class CatalogResolveResultItem(BaseModel):
+    identifier: str
+    usdz_url: str | None = None
+
+
+class CatalogResolveResponse(BaseModel):
+    results: list[CatalogResolveResultItem]
 
 
 class VersionDetailResponse(BaseModel):
