@@ -16,7 +16,14 @@ from server.services.transform import (
     normalize_roomplan_for_ios_view,
     normalize_roomplan_for_unity,
 )
-from workers.optimizer.ai_constraints import maybe_apply_ai_constraints
+from workers.optimizer.ai_constraints import (
+    build_failure_context,
+    maybe_apply_ai_constraints,
+    merge_ai_retry_output,
+    optimizer_needs_recovery,
+    prepare_ai_retry_problem,
+)
+from workers.optimizer.neufert_rules import validate_neufert_rules
 from workers.optimizer.layout import CanonicalLayoutOptimizer
 
 
@@ -94,7 +101,6 @@ def main() -> int:
         raw_payload = json.loads(input_path.read_text(encoding="utf-8"))
         normalized = convert_roomplan_to_optimizer_payload(raw_payload)
         problem = build_layout_problem(normalized)
-        problem = maybe_apply_ai_constraints(problem)
 
         optimizer = CanonicalLayoutOptimizer(problem)
         optimized = optimizer.optimize(
@@ -102,8 +108,32 @@ def main() -> int:
             global_popsize=global_popsize,
             local_maxiter=local_maxiter,
         )
+        validate_neufert_rules(problem, optimized)
+        if optimizer_needs_recovery(optimized):
+            print("optimizer: first pass failed, requesting Claude recovery strategy", flush=True)
+            problem = maybe_apply_ai_constraints(problem, build_failure_context(optimized))
+            if problem.get("ai_used"):
+                retry_problem = prepare_ai_retry_problem(problem)
+                retry_optimizer = CanonicalLayoutOptimizer(retry_problem)
+                retry_output = retry_optimizer.optimize(
+                    global_maxiter=global_maxiter,
+                    global_popsize=global_popsize,
+                    local_maxiter=local_maxiter,
+                )
+                optimized = merge_ai_retry_output(optimized, retry_output, problem)
+                validate_neufert_rules(problem, optimized)
+                print(
+                    "optimizer: recovery validation "
+                    f"{optimized['neufert_validation']['summary']}",
+                    flush=True,
+                )
+            else:
+                print("optimizer: Claude recovery unavailable, keeping first result", flush=True)
+
         optimized["ai_used"] = problem.get("ai_used", False)
         optimized["ai_error"] = problem.get("ai_error")
+        optimized["recovery_attempted"] = bool(problem.get("ai_used", False))
+        optimized["placement_status"] = "infeasible" if optimizer_needs_recovery(optimized) else "success"
         if problem.get("ai_constraints"):
             optimized["ai_constraints"] = problem["ai_constraints"]
         roomplan_optimized_raw = export_optimized_layout_to_roomplan(raw_payload, optimized)
