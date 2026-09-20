@@ -50,7 +50,6 @@ from shared.models.version import Version
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-INCOMPLETE_SCAN_STATUSES = {"PENDING", "UPLOADED", "FAILED"}
 
 
 # ── 내부 헬퍼 ────────────────────────────────────────────────────────────────
@@ -443,26 +442,26 @@ async def optimize_room(
     )
 
 
-@router.delete("/{room_id}", response_model=ScanCancelResponse, summary="미완료 방 스캔 취소")
-async def cancel_incomplete_scan(
+@router.delete("/{room_id}", response_model=ScanCancelResponse, summary="방 삭제")
+async def delete_room(
     room_id: int,
     current_user: User = Depends(get_current_user),
 ):
-    """Delete an abandoned scan session and every S3 object created for it.
+    """Delete a room with all of its versions and every S3 object created for it.
 
-    A room row is created before file upload so that an interrupted upload can
-    be tracked.  Only incomplete sessions are cancellable: deleting a room
-    while the pipeline is processing would race with its worker.
+    Covers both an abandoned upload session (the room row exists before the files
+    land) and a saved room the user no longer wants. Deleting while a worker is
+    still writing would race with it, so processing rooms are rejected instead.
     """
     db = SessionLocal()
     try:
         room = db.query(Room).filter(Room.id == room_id, Room.user_id == current_user.id).first()
         if room is None:
             raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
-        if room.status not in INCOMPLETE_SCAN_STATUSES:
+        if room.status == "PROCESSING" or room.optimization_status == "PROCESSING":
             raise HTTPException(
                 status_code=409,
-                detail="완료되었거나 처리 중인 방 스캔은 취소할 수 없습니다.",
+                detail="처리 중인 방은 삭제할 수 없습니다. 잠시 후 다시 시도해주세요.",
             )
 
         owner_segment = _user_s3_segment(current_user)
@@ -480,14 +479,14 @@ async def cancel_incomplete_scan(
         db.commit()
         return ScanCancelResponse(
             room_id=room_id,
-            status="CANCELLED",
+            status="DELETED",
             deleted_s3_object_count=len(keys),
         )
     except HTTPException:
         raise
     except Exception as exc:
         db.rollback()
-        logger.exception("Failed to cancel scan room_id=%s", room_id)
-        raise HTTPException(status_code=500, detail="미완료 스캔을 취소하지 못했습니다.") from exc
+        logger.exception("Failed to delete room room_id=%s", room_id)
+        raise HTTPException(status_code=500, detail="방을 삭제하지 못했습니다.") from exc
     finally:
         db.close()
