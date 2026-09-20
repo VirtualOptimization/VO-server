@@ -109,6 +109,16 @@ def _build_obb_vertices(center: list[float], dimensions: list[float], raw_theta:
     return vertices
 
 
+def _model_yaw_offset(category: str | None) -> float:
+    """Convert optimizer-facing directions to the asset-facing direction.
+
+    The catalog chair assets use the opposite local forward axis from the
+    RoomPlan/optimizer convention. Their footprint is unchanged by this
+    half-turn, but the visible chair front now faces the paired table.
+    """
+    return math.pi if str(category or "").lower() == "chair" else 0.0
+
+
 def export_optimized_layout_to_roomplan(
     raw_roomplan: dict[str, Any],
     optimized_payload: dict[str, Any],
@@ -139,7 +149,11 @@ def export_optimized_layout_to_roomplan(
         center_y = (float(pos[2]) - (float(dimensions[1]) / 2.0)) + floor_y
         new_center = [_round6(world_x), _round6(center_y), _round6(world_z)]
 
-        raw_theta = math.radians(rotation_y_deg) + floor_theta
+        raw_theta = (
+            math.radians(rotation_y_deg)
+            + floor_theta
+            + _model_yaw_offset(obj.get("category"))
+        )
 
         obj["center"] = new_center
         obj["rotation"] = _build_rotation(raw_theta)
