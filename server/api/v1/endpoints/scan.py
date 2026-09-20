@@ -125,12 +125,18 @@ def _get_room_context(room_id: int, user_id: int) -> tuple[str | None, str | Non
         db.close()
 
 
-def _claim_room_for_optimize(room_id: int, user_id: int) -> dict[str, Any]:
+def _claim_room_for_optimize(room_id: int, user_id: int, *, force: bool = False) -> dict[str, Any]:
     """Lock the room row and decide what POST /optimize should do.
 
     Locking (SELECT ... FOR UPDATE) and the status transition happen in one
     transaction so two concurrent optimize requests can't both start the
     pipeline for the same room.
+
+    force=True re-runs even when a completed optimized version already
+    exists (the user explicitly asked to discard it and try again). It never
+    bypasses the PROCESSING guard -- a run already in flight must finish (or
+    fail) before another one can start, to avoid two background tasks
+    writing the same OPTIMIZED version row at once.
     """
     db = SessionLocal()
     try:
@@ -161,7 +167,7 @@ def _claim_room_for_optimize(room_id: int, user_id: int) -> dict[str, Any]:
             .first()
             is not None
         )
-        if room.optimization_status == "COMPLETED" and has_optimized:
+        if not force and room.optimization_status == "COMPLETED" and has_optimized:
             return {"action": "already_completed"}
 
         room.optimization_status = "PROCESSING"
@@ -383,14 +389,20 @@ async def complete_scan_upload(
 async def optimize_room(
     room_id: int,
     background_tasks: BackgroundTasks,
+    force: bool = False,
     current_user: User = Depends(get_current_user),
 ):
     """Start (or report the status of) furniture-layout optimization for a saved room.
 
     Requires no request body: unlike /complete, iOS does not send uploaded_keys
     here, so the S3 objects under the room's raw prefix are checked directly.
+
+    By default, calling this again after optimization already completed just
+    reports COMPLETED without re-running (cheap to poll, doesn't burn AI/compute
+    cost on accidental double-taps). Pass ?force=true to discard the existing
+    optimized version and run again -- e.g. a "다시 최적화하기" / redo action.
     """
-    claim = await asyncio.to_thread(_claim_room_for_optimize, room_id, current_user.id)
+    claim = await asyncio.to_thread(_claim_room_for_optimize, room_id, current_user.id, force=force)
     action = claim["action"]
 
     if action == "not_found":
