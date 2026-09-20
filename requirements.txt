@@ -11,6 +11,7 @@ psycopg[binary]
 asyncpg
 pgvector
 sentence-transformers
+httpx
 boto3
 botocore
 certifi
