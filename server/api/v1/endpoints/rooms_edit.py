@@ -1,4 +1,4 @@
-"""공간 편집 — USER_EDITED 버전 생성/삭제"""
+"""공간 편집 — USER_EDITED 버전 생성/이름 수정/삭제"""
 from __future__ import annotations
 
 import logging
@@ -19,6 +19,8 @@ from server.core.s3 import (
 from server.schemas.room_view import (
     UserEditedVersionCreateRequest,
     UserEditedVersionCreateResponse,
+    UserEditedVersionRenameRequest,
+    UserEditedVersionRenameResponse,
 )
 from server.services.transform.unity_roomplan import (
     denormalize_roomplan_from_unity,
@@ -512,6 +514,63 @@ async def create_user_edited_version(
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to create USER_EDITED version for room_id={room_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# ── PATCH /rooms/{room_id}/versions/{version_id} ──────────────────────────────
+# 로그인 사용자가 소유한 USER_EDITED 버전의 표시 이름만 변경
+
+@router.patch(
+    "/{room_id}/versions/{version_id}",
+    response_model=UserEditedVersionRenameResponse,
+)
+def rename_user_version(
+    room_id: int,
+    version_id: int,
+    payload: UserEditedVersionRenameRequest,
+    current_user: User = Depends(get_current_user),
+):
+    db = SessionLocal()
+    try:
+        room = db.query(Room).filter(Room.id == room_id, Room.user_id == current_user.id).first()
+        if not room:
+            raise HTTPException(status_code=404, detail="방을 찾을 수 없습니다.")
+
+        version = db.query(Version).filter(
+            Version.id == version_id,
+            Version.room_id == room.id,
+        ).first()
+        if not version:
+            raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
+
+        if version.version_type != "USER_EDITED":
+            raise HTTPException(
+                status_code=403,
+                detail="USER_EDITED 버전만 이름을 수정할 수 있습니다.",
+            )
+
+        version_name = payload.version_name.strip()
+        if not version_name:
+            raise HTTPException(status_code=400, detail="버전 이름을 입력해주세요.")
+
+        version.version_name = version_name
+        db.commit()
+        db.refresh(version)
+
+        return UserEditedVersionRenameResponse(
+            version_id=version.id,
+            room_id=room.id,
+            version_name=version.version_name,
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to rename version {version_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

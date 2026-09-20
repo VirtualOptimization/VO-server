@@ -136,3 +136,13 @@ class UserEditedVersionCreateResponse(BaseModel):
     version_name: str | None = None
     status: str = "READY"
     created_at: datetime | None = None
+
+
+class UserEditedVersionRenameRequest(BaseModel):
+    version_name: str = Field(min_length=1, max_length=100)
+
+
+class UserEditedVersionRenameResponse(BaseModel):
+    version_id: int
+    room_id: int
+    version_name: str
