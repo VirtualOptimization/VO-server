@@ -96,12 +96,22 @@ def _apply_yaw_to_transform(item: dict, yaw: float, coordinate_space: str) -> No
     item["transform"] = transform
 
 
-def _center_y(item: dict) -> float:
+def _center_y(item: dict, coordinate_space: str = "unity") -> float:
+    """Height to keep when a move only changes x/z.
+
+    Unity payloads are floor-normalized (floor at y=0), so an OBB reaching below
+    zero means the object is sunk into the floor and gets lifted back up. RoomPlan
+    payloads keep the scanner's own origin, where the floor sits at whatever y the
+    device started at — usually negative — so the same lift would push every edited
+    object into the air by the floor depth.
+    """
+    lift_sunk_objects = coordinate_space != "roomplan"
+
     center = item.get("center")
     if isinstance(center, list) and len(center) >= 2:
         center_y = float(center[1])
         obb_min_y = _obb_min_y(item)
-        if obb_min_y is not None and obb_min_y < -0.01:
+        if lift_sunk_objects and obb_min_y is not None and obb_min_y < -0.01:
             return center_y - obb_min_y
         return center_y
 
@@ -109,7 +119,7 @@ def _center_y(item: dict) -> float:
     if isinstance(transform, list) and len(transform) >= 4 and len(transform[3]) >= 2:
         center_y = float(transform[3][1])
         obb_min_y = _obb_min_y(item)
-        if obb_min_y is not None and obb_min_y < -0.01:
+        if lift_sunk_objects and obb_min_y is not None and obb_min_y < -0.01:
             return center_y - obb_min_y
         return center_y
 
@@ -240,7 +250,7 @@ def _sync_obb_vertices(item: dict) -> None:
 
 
 def _apply_pose_update(target: dict, update: dict, coordinate_space: str) -> None:
-    preserved_y = _center_y(target)
+    preserved_y = _center_y(target, coordinate_space)
     preserved_rotation = target.get("rotation")
     preserved_yaw = (
         _yaw_from_rotation(preserved_rotation)
