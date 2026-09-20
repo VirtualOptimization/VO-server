@@ -2008,6 +2008,16 @@ class CanonicalLayoutOptimizer:
         for i, furniture in enumerate(self.furnitures):
             optimized[i, 3] = self._snap_theta(float(optimized[i, 3]))
 
+        # Snapping the final rotations can reintroduce an overlap that was
+        # removed by the previous post-processing pass. Resolve once more
+        # before serializing the result consumed by iOS and Unity.
+        for _ in range(2):
+            optimized = self._resolve_furniture_collisions(optimized)
+            optimized = self._resolve_wall_collisions(optimized)
+            optimized = self._project_inside_room(optimized.reshape(-1)).reshape(-1, 4)
+            if self._max_furniture_penetration(optimized) <= 1e-3:
+                break
+
         output = json.loads(json.dumps(self.payload))
         for i, furniture in enumerate(output["movable_items"]):
             theta_deg = round(math.degrees(optimized[i, 3]) % 360.0, 3)
