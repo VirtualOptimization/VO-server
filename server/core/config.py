@@ -21,6 +21,11 @@ class Settings(BaseSettings):
         default=1800,
         validation_alias="LOCAL_PIPELINE_TIMEOUT_SECONDS",
     )
+    anthropic_api_key: str = Field(default="", validation_alias="ANTHROPIC_API_KEY")
+    assistant_model: str = Field(default="claude-sonnet-5", validation_alias="ASSISTANT_MODEL")
+    assistant_max_tokens: int = Field(default=1024, validation_alias="ASSISTANT_MAX_TOKENS")
+    assistant_timeout_seconds: float = Field(default=30.0, validation_alias="ASSISTANT_TIMEOUT_SECONDS")
+
     jwt_secret_key: str = Field(default="", validation_alias="JWT_SECRET_KEY")
     jwt_algorithm: str = Field(default="HS256", validation_alias="JWT_ALGORITHM")
     access_token_expire_minutes: int = Field(
