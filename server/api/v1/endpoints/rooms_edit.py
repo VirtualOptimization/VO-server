@@ -469,9 +469,11 @@ async def create_user_edited_version(
         ios_s3_url = await upload_json(ios_key, ios_layout)
         unity_s3_url = await upload_json(unity_key, unity_layout)
 
+        # 어느 기기에서 편집했는지는 보내온 좌표로 알 수 있다 — iOS 앱은 ios_objects를,
+        # Unity(VR)는 objects를 보낸다. 앱이 버전 목록에 출처를 표시하는 데 쓴다.
         version_json_data = {
             **(payload.json_data or {}),
-            "source": "unity_edit",
+            "source": "ios_edit" if has_ios_updates else "unity_edit",
             "parent_version_id": parent_version.id,
             "layout_json": ios_s3_url,
             "unity_layout_json": unity_s3_url,

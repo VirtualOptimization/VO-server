@@ -25,6 +25,8 @@ class RoomVersionItem(BaseModel):
     version_type: str
     version_no: int
     version_name: str | None = None
+    # 편집본을 만든 곳: "IOS" | "UNITY". 출처를 남기기 전에 저장된 버전은 None.
+    editor: str | None = None
     status: str = "READY"
     created_at: datetime | None = None
     is_latest: bool
