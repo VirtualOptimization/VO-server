@@ -13,9 +13,9 @@ from typing import Any
 import certifi
 
 
-SUPPORTED_PROVIDER = "gemini"
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_TIMEOUT_SECONDS = 15
+SUPPORTED_PROVIDER = "anthropic"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
+DEFAULT_TIMEOUT_SECONDS = 30
 BACK_TO_WALL_TYPES = {"bed", "closet", "cabinet", "shelf", "storage"}
 
 
@@ -44,7 +44,7 @@ def maybe_apply_ai_constraints(problem: dict[str, Any]) -> dict[str, Any]:
         return problem
 
     try:
-        constraints = generate_gemini_constraints(problem)
+        constraints = generate_claude_constraints(problem)
         apply_ai_constraints(problem, constraints)
         problem["ai_used"] = True
         problem["ai_error"] = None
@@ -56,31 +56,31 @@ def maybe_apply_ai_constraints(problem: dict[str, Any]) -> dict[str, Any]:
     return problem
 
 
-def generate_gemini_constraints(problem: dict[str, Any]) -> dict[str, Any]:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+def generate_claude_constraints(problem: dict[str, Any]) -> dict[str, Any]:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is required when AI_LAYOUT_ENABLED=true")
+        raise ValueError("ANTHROPIC_API_KEY is required when AI_LAYOUT_ENABLED=true")
 
-    model = os.getenv("GEMINI_LAYOUT_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    model = os.getenv("ASSISTANT_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+    max_tokens = int(os.getenv("ASSISTANT_MAX_TOKENS", "1024"))
     timeout = float(os.getenv("AI_LAYOUT_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
 
     prompt = _build_prompt(_summarize_problem(problem))
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = "https://api.anthropic.com/v1/messages"
     body = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-        },
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": "You are a spatial layout planning assistant. Return only valid JSON.",
+        "messages": [{"role": "user", "content": prompt}],
     }
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
         method="POST",
     )
 
@@ -90,7 +90,9 @@ def generate_gemini_constraints(problem: dict[str, Any]) -> dict[str, Any]:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini API error {exc.code}: {detail}") from exc
+        raise RuntimeError(f"Claude API error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Claude API connection error: {exc.reason}") from exc
 
     text = _extract_candidate_text(payload)
     return _validate_constraints(_loads_json_object(text), problem)
@@ -392,15 +394,15 @@ def _build_prompt(summary: dict[str, Any]) -> str:
 
 
 def _extract_candidate_text(payload: dict[str, Any]) -> str:
-    candidates = payload.get("candidates") or []
-    if not candidates:
-        raise RuntimeError("Gemini response has no candidates")
-
-    parts = candidates[0].get("content", {}).get("parts", [])
-    texts = [part.get("text", "") for part in parts if part.get("text")]
+    content = payload.get("content") or []
+    texts = [
+        block.get("text", "")
+        for block in content
+        if block.get("type") == "text" and block.get("text")
+    ]
     text = "\n".join(texts).strip()
     if not text:
-        raise RuntimeError("Gemini response has no text")
+        raise RuntimeError("Claude response has no text")
     return text
 
 
