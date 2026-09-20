@@ -13,7 +13,9 @@ from typing import Any
 import certifi
 
 
-SUPPORTED_PROVIDER = "gemini"
+SUPPORTED_PROVIDERS = {"claude", "gemini"}
+DEFAULT_PROVIDER = "claude"
+DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_TIMEOUT_SECONDS = 15
 BACK_TO_WALL_TYPES = {"bed", "closet", "cabinet", "shelf", "storage"}
@@ -37,14 +39,17 @@ def maybe_apply_ai_constraints(problem: dict[str, Any]) -> dict[str, Any]:
         problem["ai_used"] = False
         return problem
 
-    provider = os.getenv("AI_LAYOUT_PROVIDER", SUPPORTED_PROVIDER).strip().lower()
-    if provider != SUPPORTED_PROVIDER:
+    provider = os.getenv("AI_LAYOUT_PROVIDER", DEFAULT_PROVIDER).strip().lower()
+    if provider not in SUPPORTED_PROVIDERS:
         problem["ai_used"] = False
         problem["ai_error"] = f"Unsupported AI layout provider: {provider}"
         return problem
 
     try:
-        constraints = generate_gemini_constraints(problem)
+        if provider == "claude":
+            constraints = generate_claude_constraints(problem)
+        else:
+            constraints = generate_gemini_constraints(problem)
         apply_ai_constraints(problem, constraints)
         problem["ai_used"] = True
         problem["ai_error"] = None
@@ -54,6 +59,59 @@ def maybe_apply_ai_constraints(problem: dict[str, Any]) -> dict[str, Any]:
         problem["ai_error"] = f"{exc.__class__.__name__}: {exc}"
 
     return problem
+
+
+def generate_claude_constraints(problem: dict[str, Any]) -> dict[str, Any]:
+    # Reuses the same key the assistant-proxy chatbot already reads, since
+    # it's the standard env var name the Anthropic SDK looks for.
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY is required when AI_LAYOUT_PROVIDER=claude")
+
+    model = os.getenv("CLAUDE_LAYOUT_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+    timeout = float(os.getenv("AI_LAYOUT_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
+
+    prompt = _build_prompt(_summarize_problem(problem))
+    url = "https://api.anthropic.com/v1/messages"
+    body = {
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+
+    try:
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl_context) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Claude API error {exc.code}: {detail}") from exc
+
+    text = _extract_claude_text(payload)
+    return _validate_constraints(_loads_json_object(text), problem)
+
+
+def _extract_claude_text(payload: dict[str, Any]) -> str:
+    blocks = payload.get("content") or []
+    texts = [
+        block.get("text", "")
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+    ]
+    text = "\n".join(texts).strip()
+    if not text:
+        raise RuntimeError("Claude response has no text")
+    return text
 
 
 def generate_gemini_constraints(problem: dict[str, Any]) -> dict[str, Any]:
