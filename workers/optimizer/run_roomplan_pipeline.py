@@ -49,7 +49,13 @@ def main() -> None:
     from workers.optimizer.neufert_rules import validate_neufert_rules
     print("pipeline: transform imported", flush=True)
     print("pipeline: importing ai constraints", flush=True)
-    from workers.optimizer.ai_constraints import maybe_apply_ai_constraints
+    from workers.optimizer.ai_constraints import (
+        build_failure_context,
+        maybe_apply_ai_constraints,
+        merge_ai_retry_output,
+        optimizer_needs_recovery,
+        prepare_ai_retry_problem,
+    )
     print("pipeline: ai constraints imported", flush=True)
     print("pipeline: importing layout", flush=True)
     from workers.optimizer.layout import CanonicalLayoutOptimizer
@@ -72,18 +78,9 @@ def main() -> None:
         f"neufert={problem.get('neufert_rules_attached', 0)})",
         flush=True,
     )
-    problem = maybe_apply_ai_constraints(problem)
-    print("pipeline: optional AI constraints applied", flush=True)
-
     normalized_out.parent.mkdir(parents=True, exist_ok=True)
     normalized_out.write_text(
         json.dumps(normalized, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    problem_out.parent.mkdir(parents=True, exist_ok=True)
-    problem_out.write_text(
-        json.dumps(problem, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -96,10 +93,6 @@ def main() -> None:
         use_global=not args.no_global,
     )
     print("pipeline: optimizer finished", flush=True)
-    optimized["ai_used"] = problem.get("ai_used", False)
-    optimized["ai_error"] = problem.get("ai_error")
-    if problem.get("ai_constraints"):
-        optimized["ai_constraints"] = problem["ai_constraints"]
     validate_neufert_rules(problem, optimized)
     print(
         "pipeline: Neufert validation "
@@ -107,6 +100,40 @@ def main() -> None:
         flush=True,
     )
 
+    if optimizer_needs_recovery(optimized):
+        print("pipeline: first pass failed, requesting Claude recovery strategy", flush=True)
+        problem = maybe_apply_ai_constraints(problem, build_failure_context(optimized))
+        if problem.get("ai_used"):
+            retry_problem = prepare_ai_retry_problem(problem)
+            retry_optimizer = CanonicalLayoutOptimizer(retry_problem)
+            retry_output = retry_optimizer.optimize(
+                global_maxiter=args.global_maxiter,
+                global_popsize=args.global_popsize,
+                local_maxiter=args.local_maxiter,
+                use_global=not args.no_global,
+            )
+            optimized = merge_ai_retry_output(optimized, retry_output, problem)
+            validate_neufert_rules(problem, optimized)
+            print(
+                "pipeline: recovery validation "
+                f"{optimized['neufert_validation']['summary']}",
+                flush=True,
+            )
+        else:
+            print("pipeline: Claude recovery unavailable, keeping first result", flush=True)
+
+    optimized["ai_used"] = problem.get("ai_used", False)
+    optimized["ai_error"] = problem.get("ai_error")
+    optimized["recovery_attempted"] = bool(problem.get("ai_used", False))
+    optimized["placement_status"] = "infeasible" if optimizer_needs_recovery(optimized) else "success"
+    if problem.get("ai_constraints"):
+        optimized["ai_constraints"] = problem["ai_constraints"]
+
+    problem_out.parent.mkdir(parents=True, exist_ok=True)
+    problem_out.write_text(
+        json.dumps(problem, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     optimized_out.parent.mkdir(parents=True, exist_ok=True)
     optimized_out.write_text(
         json.dumps(optimized, ensure_ascii=False, indent=2),

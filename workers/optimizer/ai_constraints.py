@@ -8,14 +8,15 @@ import os
 import ssl
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from typing import Any
 
 import certifi
 
 
-SUPPORTED_PROVIDER = "gemini"
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_TIMEOUT_SECONDS = 15
+SUPPORTED_PROVIDER = "anthropic"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
+DEFAULT_TIMEOUT_SECONDS = 30
 BACK_TO_WALL_TYPES = {"bed", "closet", "cabinet", "shelf", "storage"}
 
 
@@ -26,14 +27,17 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-def maybe_apply_ai_constraints(problem: dict[str, Any]) -> dict[str, Any]:
-    """Ask an AI model for soft layout constraints and merge them into a problem.
+def maybe_apply_ai_constraints(
+    problem: dict[str, Any],
+    failure_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Ask Claude for recovery constraints only after deterministic failure.
 
     The AI does not place furniture directly. It only suggests semantic constraints
     that the deterministic optimizer can score, such as chair-table pairing and
     wall/corner preferences.
     """
-    if not env_bool("AI_LAYOUT_ENABLED"):
+    if not env_bool("AI_LAYOUT_ENABLED") or failure_context is None:
         problem["ai_used"] = False
         return problem
 
@@ -44,7 +48,7 @@ def maybe_apply_ai_constraints(problem: dict[str, Any]) -> dict[str, Any]:
         return problem
 
     try:
-        constraints = generate_gemini_constraints(problem)
+        constraints = generate_claude_constraints(problem, failure_context)
         apply_ai_constraints(problem, constraints)
         problem["ai_used"] = True
         problem["ai_error"] = None
@@ -56,31 +60,96 @@ def maybe_apply_ai_constraints(problem: dict[str, Any]) -> dict[str, Any]:
     return problem
 
 
-def generate_gemini_constraints(problem: dict[str, Any]) -> dict[str, Any]:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is required when AI_LAYOUT_ENABLED=true")
+def optimizer_needs_recovery(optimized: dict[str, Any]) -> bool:
+    """Return whether the first deterministic pass needs Claude recovery advice."""
+    optimization = optimized.get("optimization", {})
+    collision = float(optimization.get("remaining_collision_penetration_m", 0.0) or 0.0)
+    validation = optimized.get("neufert_validation", {}).get("summary", {})
+    return collision > 1e-3 or int(validation.get("fail", 0) or 0) > 0
 
-    model = os.getenv("GEMINI_LAYOUT_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+
+def build_failure_context(optimized: dict[str, Any]) -> dict[str, Any]:
+    """Keep the Claude recovery request focused on actionable failures."""
+    optimization = optimized.get("optimization", {})
+    validation = optimized.get("neufert_validation", {})
+    return {
+        "remaining_collision_penetration_m": optimization.get("remaining_collision_penetration_m", 0.0),
+        "neufert_failures": [
+            check
+            for check in validation.get("checks", [])
+            if check.get("status") == "fail"
+        ],
+        "qualitative_constraints": [
+            check
+            for check in validation.get("checks", [])
+            if check.get("status") == "qualitative_only"
+        ],
+    }
+
+
+def prepare_ai_retry_problem(problem: dict[str, Any]) -> dict[str, Any]:
+    """Create a retry payload while keeping excluded items out of the variables."""
+    retry_problem = deepcopy(problem)
+    excluded = set(problem.get("ai_excluded_object_ids", []))
+    if excluded:
+        retry_problem["movable_items"] = [
+            item for item in retry_problem.get("movable_items", []) if item.get("id") not in excluded
+        ]
+    return retry_problem
+
+
+def merge_ai_retry_output(
+    first_output: dict[str, Any],
+    retry_output: dict[str, Any],
+    problem: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge retry coordinates back into the complete furniture result."""
+    merged = deepcopy(first_output)
+    retry_by_id = {item.get("id"): item for item in retry_output.get("movable_items", [])}
+    excluded = set(problem.get("ai_excluded_object_ids", []))
+    for item in merged.get("movable_items", []):
+        retry_item = retry_by_id.get(item.get("id"))
+        if retry_item:
+            for key in ("optimized_pos", "optimized_rotation_y_deg"):
+                if key in retry_item:
+                    item[key] = retry_item[key]
+        elif item.get("id") in excluded:
+            item["optimized_pos"] = item.get("pos")
+            item["optimized_rotation_y_deg"] = item.get("rotation_y_deg", 0.0)
+
+    merged["optimization"] = deepcopy(retry_output.get("optimization", {}))
+    merged["optimization"]["recovery_excluded_object_ids"] = sorted(excluded)
+    return merged
+
+
+def generate_claude_constraints(
+    problem: dict[str, Any],
+    failure_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY is required when AI_LAYOUT_ENABLED=true")
+
+    model = os.getenv("ASSISTANT_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+    max_tokens = int(os.getenv("ASSISTANT_MAX_TOKENS", "1024"))
     timeout = float(os.getenv("AI_LAYOUT_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
 
-    prompt = _build_prompt(_summarize_problem(problem))
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    prompt = _build_prompt(_summarize_problem(problem), failure_context)
+    url = "https://api.anthropic.com/v1/messages"
     body = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-        },
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": "You are a spatial layout planning assistant. Return only valid JSON.",
+        "messages": [{"role": "user", "content": prompt}],
     }
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
         method="POST",
     )
 
@@ -90,7 +159,9 @@ def generate_gemini_constraints(problem: dict[str, Any]) -> dict[str, Any]:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini API error {exc.code}: {detail}") from exc
+        raise RuntimeError(f"Claude API error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Claude API connection error: {exc.reason}") from exc
 
     text = _extract_candidate_text(payload)
     return _validate_constraints(_loads_json_object(text), problem)
@@ -141,6 +212,55 @@ def apply_ai_constraints(problem: dict[str, Any], constraints: dict[str, Any]) -
             anchor_preferences = item.setdefault("anchor_preferences", {})
             anchor_preferences["wall_cling_required"] = True
             anchor_preferences["back_to_wall"] = True
+
+    excluded_ids: list[str] = []
+    for action in constraints.get("recovery_actions", []):
+        if not isinstance(action, dict):
+            continue
+        object_id = action.get("object_id")
+        item = items_by_id.get(object_id)
+        action_name = action.get("action")
+        if not item or action_name not in {"prioritize", "relax", "exclude"}:
+            continue
+
+        if action_name == "exclude":
+            excluded_ids.append(item["id"])
+            continue
+
+        if action_name == "prioritize":
+            item.setdefault("layout_priorities", []).append(
+                {
+                    "priority": action.get("priority", "access_clearance"),
+                    "level": action.get("level", "high"),
+                    "reason": str(action.get("reason", ""))[:200],
+                    "source": "ai_recovery",
+                }
+            )
+            continue
+
+        # Only relax a non-hard Neufert rule and keep the relaxation bounded.
+        factor = action.get("relaxation_factor", 1.0)
+        try:
+            factor = min(1.0, max(0.7, float(factor)))
+        except (TypeError, ValueError):
+            continue
+        page_number = action.get("rule_page_number")
+        for rule in item.get("placement_rules", {}).get("neufert_rules", []):
+            if page_number is not None and rule.get("page_number") != page_number:
+                continue
+            if rule.get("priority") == "hard":
+                continue
+            relation = str(rule.get("relation", ""))
+            direction = str(rule.get("direction", ""))
+            if relation in {"passage", "clearance"}:
+                if direction == "front":
+                    item["placement_rules"]["front_clearance"] *= factor
+                elif direction in {"side", "around"}:
+                    item["placement_rules"]["side_clearance"] *= factor
+                    if direction == "around":
+                        item["placement_rules"]["front_clearance"] *= factor
+
+    problem["ai_excluded_object_ids"] = sorted(set(excluded_ids))
 
     applied_support_counts: dict[str, int] = {}
     ai_paired_chairs: set[str] = set()
@@ -296,7 +416,10 @@ def _summarize_problem(problem: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_prompt(summary: dict[str, Any]) -> str:
+def _build_prompt(
+    summary: dict[str, Any],
+    failure_context: dict[str, Any] | None = None,
+) -> str:
     schema = {
         "support_groups": [
             {
@@ -348,6 +471,17 @@ def _build_prompt(summary: dict[str, Any]) -> str:
                 "reason": "short reason",
             }
         ],
+        "recovery_actions": [
+            {
+                "action": "prioritize | relax | exclude",
+                "object_id": "furniture object id",
+                "priority": "wall_attachment | access_clearance | group_cohesion | orientation | unknown",
+                "level": "critical | high | medium | low",
+                "rule_page_number": 255,
+                "relaxation_factor": 0.8,
+                "reason": "short reason",
+            }
+        ],
         "rationale": "short explanation",
     }
     return (
@@ -379,6 +513,11 @@ def _build_prompt(summary: dict[str, Any]) -> str:
         "- Set back_to_wall only for storage, closet, shelf, cabinet, and bed. Do not set it for ordinary tables or chairs.\n"
         "- Assign a semantic role when it helps distinguish desk/table/storage/seating usage.\n"
         "- Keep door/window access and walking paths in mind.\n"
+        "- This is a recovery pass after a deterministic optimization failure.\n"
+        "- Use recovery_actions to identify a priority change, a bounded relaxation of a non-hard rule, "
+        "or a temporary exclusion only when the room is genuinely over-constrained.\n"
+        "- Never relax door, wall, collision, or hard minimum constraints.\n"
+        "- Use exclude sparingly and only for a movable, non-essential object.\n"
         "- Each furniture object may include a `neufert_guidance` list: rules already matched from the "
         "Neufert architectural reference for this exact object. Treat these as authoritative over your own "
         "generic assumptions about that object -- if guidance says an object should be against a wall, "
@@ -388,19 +527,25 @@ def _build_prompt(summary: dict[str, Any]) -> str:
         "best practice for that case.\n\n"
         f"Output schema example:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
         f"Input room summary:\n{json.dumps(summary, ensure_ascii=False)}"
+        + (
+            f"\n\nFailure context from the first optimizer pass:\n"
+            f"{json.dumps(failure_context, ensure_ascii=False)}"
+            if failure_context is not None
+            else ""
+        )
     )
 
 
 def _extract_candidate_text(payload: dict[str, Any]) -> str:
-    candidates = payload.get("candidates") or []
-    if not candidates:
-        raise RuntimeError("Gemini response has no candidates")
-
-    parts = candidates[0].get("content", {}).get("parts", [])
-    texts = [part.get("text", "") for part in parts if part.get("text")]
+    content = payload.get("content") or []
+    texts = [
+        block.get("text", "")
+        for block in content
+        if block.get("type") == "text" and block.get("text")
+    ]
     text = "\n".join(texts).strip()
     if not text:
-        raise RuntimeError("Gemini response has no text")
+        raise RuntimeError("Claude response has no text")
     return text
 
 
@@ -603,6 +748,35 @@ def _validate_constraints(payload: dict[str, Any], problem: dict[str, Any]) -> d
             }
         )
 
+    recovery_actions: list[dict[str, Any]] = []
+    valid_actions = {"prioritize", "relax", "exclude"}
+    for action in payload.get("recovery_actions", []):
+        if not isinstance(action, dict) or action.get("action") not in valid_actions:
+            continue
+        item = items_by_id.get(action.get("object_id"))
+        if not item:
+            continue
+        action_name = action["action"]
+        normalized: dict[str, Any] = {
+            "action": action_name,
+            "object_id": item["id"],
+            "reason": str(action.get("reason", ""))[:200],
+        }
+        if action_name == "prioritize":
+            priority_name = action.get("priority", "access_clearance")
+            normalized["priority"] = priority_name if priority_name in valid_priorities else "unknown"
+            level = action.get("level", "high")
+            normalized["level"] = level if level in valid_levels else "medium"
+        elif action_name == "relax":
+            normalized["rule_page_number"] = action.get("rule_page_number")
+            try:
+                normalized["relaxation_factor"] = min(
+                    1.0, max(0.7, float(action.get("relaxation_factor", 0.8)))
+                )
+            except (TypeError, ValueError):
+                normalized["relaxation_factor"] = 0.8
+        recovery_actions.append(normalized)
+
     return {
         "support_groups": support_groups,
         "chair_pairs": chair_pairs,
@@ -610,6 +784,7 @@ def _validate_constraints(payload: dict[str, Any], problem: dict[str, Any]) -> d
         "orientation_preferences": orientation_preferences,
         "furniture_roles": furniture_roles,
         "layout_priorities": layout_priorities,
+        "recovery_actions": recovery_actions,
         "rationale": str(payload.get("rationale", ""))[:500],
     }
 
