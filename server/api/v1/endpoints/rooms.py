@@ -68,6 +68,14 @@ def _catalog_glb_uri(model: FurnitureModel) -> str | None:
     return model.glb_url
 
 
+def _version_editor(version: Version) -> str | None:
+    """편집본을 만든 곳. 출처를 남기기 전에 저장된 버전은 알 수 없어 None."""
+    if version.version_type != "USER_EDITED":
+        return None
+    json_data = version.json_data if isinstance(version.json_data, dict) else {}
+    return {"ios_edit": "IOS", "unity_edit": "UNITY"}.get(json_data.get("source"))
+
+
 def _unity_layout_uri(version: Version) -> str | None:
     json_data = version.json_data if isinstance(version.json_data, dict) else {}
     unity_uri = (
@@ -473,6 +481,7 @@ def get_room_versions(room_id: int, current_user: User = Depends(get_current_use
                     version_type=version.version_type,
                     version_no=version.version_no,
                     version_name=version.version_name,
+                    editor=_version_editor(version),
                     status=version.status,
                     created_at=version.created_at,
                     is_latest=version.version_no == latest_version_no,
