@@ -409,11 +409,20 @@ class CanonicalLayoutOptimizer:
                         direction = direction / norm
                     shift = direction * (overlap + 0.06)
 
-                    adjusted[i, :2] += shift
+                    candidate = adjusted.copy()
+                    candidate[i, :2] += shift
                     for chair_idx in paired_chairs(i):
-                        adjusted[chair_idx, :2] += shift
-                    adjusted[i] = self._keep_obb_inside_room(adjusted[i], furniture)
-                    moved = True
+                        candidate[chair_idx, :2] += shift
+                    candidate[i] = self._keep_obb_inside_room(candidate[i], furniture)
+
+                    # Clearing a door must never make furniture-vs-furniture
+                    # collisions worse than leaving the item where it was;
+                    # a later pass (or the objective penalty itself) is
+                    # better positioned to resolve a door/furniture conflict
+                    # that has no collision-free fix here.
+                    if self._max_furniture_penetration(candidate) <= self._max_furniture_penetration(adjusted) + 1e-4:
+                        adjusted = candidate
+                        moved = True
             if not moved:
                 break
 
@@ -1082,10 +1091,20 @@ class CanonicalLayoutOptimizer:
                     candidates.append(self._sync_paired_chairs(candidate, primary_only=True).reshape(-1, 4))
 
             if candidates:
-                coords = min(
-                    candidates,
-                    key=lambda candidate: self._objective(candidate.reshape(-1)),
-                )
+                # A wall/corner preference is only allowed to win on overall
+                # objective score among candidates that don't make furniture
+                # collisions worse than not moving this item at all -- the
+                # full weighted objective alone isn't a strict enough guard,
+                # since a strong wall-anchor bonus can outweigh a modest
+                # collision increase in the weighted sum.
+                baseline_penetration = self._max_furniture_penetration(coords)
+                safe_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if self._max_furniture_penetration(candidate) <= baseline_penetration + 1e-4
+                ]
+                pool = safe_candidates or [coords]
+                coords = min(pool, key=lambda candidate: self._objective(candidate.reshape(-1)))
 
         return self._sync_paired_chairs(coords, primary_only=True)
 
