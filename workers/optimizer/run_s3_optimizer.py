@@ -120,8 +120,8 @@ def main() -> int:
                     global_popsize=global_popsize,
                     local_maxiter=local_maxiter,
                 )
+                validate_neufert_rules(problem, retry_output)
                 optimized = merge_ai_retry_output(optimized, retry_output, problem)
-                validate_neufert_rules(problem, optimized)
                 print(
                     "optimizer: recovery validation "
                     f"{optimized['neufert_validation']['summary']}",
