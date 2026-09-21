@@ -88,14 +88,28 @@ def build_failure_context(optimized: dict[str, Any]) -> dict[str, Any]:
 
 
 def prepare_ai_retry_problem(problem: dict[str, Any]) -> dict[str, Any]:
-    """Create a retry payload while keeping excluded items out of the variables."""
+    """Create a retry payload where excluded items are pinned, not deleted.
+
+    Dropping an excluded item from movable_items would also drop it from
+    every collision check, so other furniture could end up placed right on
+    top of where it physically still sits. Pinning it instead keeps it as a
+    real (immovable) obstacle for the rest of the retry optimization.
+    """
     retry_problem = deepcopy(problem)
     excluded = set(problem.get("ai_excluded_object_ids", []))
     if excluded:
-        retry_problem["movable_items"] = [
-            item for item in retry_problem.get("movable_items", []) if item.get("id") not in excluded
-        ]
+        for item in retry_problem.get("movable_items", []):
+            if item.get("id") in excluded:
+                item["pinned"] = True
     return retry_problem
+
+
+def _placement_quality(output: dict[str, Any]) -> tuple[float, int]:
+    """Lower is better: (remaining collision penetration, failed rule count)."""
+    optimization = output.get("optimization", {})
+    penetration = float(optimization.get("remaining_collision_penetration_m", 0.0) or 0.0)
+    fail_count = int(output.get("neufert_validation", {}).get("summary", {}).get("fail", 0) or 0)
+    return (penetration, fail_count)
 
 
 def merge_ai_retry_output(
@@ -103,10 +117,24 @@ def merge_ai_retry_output(
     retry_output: dict[str, Any],
     problem: dict[str, Any],
 ) -> dict[str, Any]:
-    """Merge retry coordinates back into the complete furniture result."""
+    """Merge retry coordinates back into the complete furniture result.
+
+    An AI-guided retry is a best-effort nudge, not a guarantee. Callers must
+    run validate_neufert_rules() on retry_output before calling this, so both
+    outputs can be compared on equal footing. If the retry did not actually
+    improve on the first pass (equal-or-fewer collisions and rule failures),
+    the first pass is kept instead of silently handing back a worse layout.
+    """
+    excluded = set(problem.get("ai_excluded_object_ids", []))
+
+    if _placement_quality(retry_output) > _placement_quality(first_output):
+        merged = deepcopy(first_output)
+        merged["optimization"]["recovery_rejected"] = True
+        merged["optimization"]["recovery_excluded_object_ids"] = sorted(excluded)
+        return merged
+
     merged = deepcopy(first_output)
     retry_by_id = {item.get("id"): item for item in retry_output.get("movable_items", [])}
-    excluded = set(problem.get("ai_excluded_object_ids", []))
     for item in merged.get("movable_items", []):
         retry_item = retry_by_id.get(item.get("id"))
         if retry_item:
@@ -118,7 +146,9 @@ def merge_ai_retry_output(
             item["optimized_rotation_y_deg"] = item.get("rotation_y_deg", 0.0)
 
     merged["optimization"] = deepcopy(retry_output.get("optimization", {}))
+    merged["optimization"]["recovery_rejected"] = False
     merged["optimization"]["recovery_excluded_object_ids"] = sorted(excluded)
+    merged["neufert_validation"] = deepcopy(retry_output.get("neufert_validation", {}))
     return merged
 
 

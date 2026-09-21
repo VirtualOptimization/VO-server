@@ -75,6 +75,8 @@ def apply_neufert_rules(problem: dict[str, Any], path: str | Path | None) -> dic
     room_dims = problem.get("room_metadata", {}).get("dimensions", {})
     room_area = float(room_dims.get("width", 0.0)) * float(room_dims.get("depth", 0.0))
     relaxation_scale = _small_room_scale(room_area)
+    problem["room_area_m2"] = round(room_area, 3)
+    problem["small_room_relaxation_scale"] = round(relaxation_scale, 3)
 
     for item in items:
         item.setdefault("placement_rules", {})["neufert_rules"] = []
@@ -87,16 +89,24 @@ def apply_neufert_rules(problem: dict[str, Any], path: str | Path | None) -> dic
 
         attached += len(matched_items)
         for item in matched_items:
-            item["placement_rules"]["neufert_rules"].append(rule)
+            applied_rule = dict(rule)
+            item["placement_rules"]["neufert_rules"].append(applied_rule)
 
             min_value = rule.get("min_distance_m")
             if min_value is not None and float(min_value) > 0:
                 value = float(min_value)
+                applied_rule["applied_value_m"] = round(value, 4)
+                applied_rule["applied_from"] = "min_distance_m"
             else:
                 recommended_value = rule.get("recommended_distance_m")
                 if recommended_value is None or float(recommended_value) <= 0:
+                    applied_rule["applied_value_m"] = None
+                    applied_rule["applied_from"] = "qualitative_only"
                     continue
                 value = float(recommended_value) * relaxation_scale
+                applied_rule["applied_value_m"] = round(value, 4)
+                applied_rule["applied_from"] = "recommended_distance_m"
+                applied_rule["relaxation_scale_applied"] = round(relaxation_scale, 3)
 
             relation = str(rule.get("relation", ""))
             direction = str(rule.get("direction", ""))

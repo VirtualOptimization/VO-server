@@ -112,8 +112,8 @@ def main() -> None:
                 local_maxiter=args.local_maxiter,
                 use_global=not args.no_global,
             )
+            validate_neufert_rules(problem, retry_output)
             optimized = merge_ai_retry_output(optimized, retry_output, problem)
-            validate_neufert_rules(problem, optimized)
             print(
                 "pipeline: recovery validation "
                 f"{optimized['neufert_validation']['summary']}",

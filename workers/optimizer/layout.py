@@ -421,6 +421,12 @@ class CanonicalLayoutOptimizer:
 
     @staticmethod
     def _mobility_weight(furniture: dict[str, Any]) -> float:
+        if furniture.get("pinned"):
+            # A pinned item (e.g. an AI-excluded object kept as a fixed
+            # obstacle) must absorb ~none of a collision correction; a very
+            # high weight here makes the *other* side yield almost entirely
+            # (see the i_share/j_share split in _resolve_furniture_collisions).
+            return 1_000_000.0
         return {
             "chair": 1.0,
             "desk": 0.55,
@@ -978,7 +984,7 @@ class CanonicalLayoutOptimizer:
 
         return coords.reshape(-1)
 
-    def _wall_anchored_initial(self, initial: np.ndarray, *, force: bool = False) -> np.ndarray:
+    def _wall_anchored_initial(self, initial: np.ndarray) -> np.ndarray:
         coords = initial.reshape(-1, 4).copy()
         ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
         target_gap = 0.02
@@ -1011,7 +1017,7 @@ class CanonicalLayoutOptimizer:
         for i, furniture in enumerate(self.furnitures):
             prefs = furniture.get("anchor_preferences", {})
             rules = furniture.get("placement_rules", {})
-            if furniture["type"] == "chair":
+            if furniture["type"] == "chair" or furniture.get("pinned"):
                 continue
             prefers_bed_corner = furniture["type"] == "bed"
             if not (prefers_bed_corner or prefs.get("wall_cling_required") or rules.get("back_near_wall_preferred") or rules.get("corner_preferred")):
@@ -1025,7 +1031,11 @@ class CanonicalLayoutOptimizer:
                 coords[i, 3],
             )
             distances = self._distance_to_walls(corners)
-            candidates = [] if force else [coords]
+            # Always keep the unshifted position as a candidate, even when
+            # force=True. Otherwise a wall-cling/corner preference can be
+            # forced through even when every wall-directed shift collides
+            # with other furniture worse than not moving at all.
+            candidates = [coords]
             back_wall_idx = self._back_wall_index(furniture, float(coords[i, 3]))
             wall_indices = [back_wall_idx] if back_wall_idx is not None else list(range(4))
 
@@ -1086,18 +1096,20 @@ class CanonicalLayoutOptimizer:
         for i, furniture in enumerate(self.furnitures):
             prefs = furniture.get("anchor_preferences", {})
             rules = furniture.get("placement_rules", {})
-            if furniture["type"] == "chair" or not prefs.get("wall_cling_required"):
+            if furniture["type"] == "chair" or furniture.get("pinned") or not prefs.get("wall_cling_required"):
                 continue
 
+            candidate = coords.copy()
+
             corners = self._obb_corners(
-                coords[i, 0],
-                coords[i, 1],
+                candidate[i, 0],
+                candidate[i, 1],
                 float(furniture["extent"][0]),
                 float(furniture["extent"][1]),
-                coords[i, 3],
+                candidate[i, 3],
             )
             distances = self._distance_to_walls(corners)
-            back_wall_idx = self._back_wall_index(furniture, float(coords[i, 3]))
+            back_wall_idx = self._back_wall_index(furniture, float(candidate[i, 3]))
             wall_idx = (
                 back_wall_idx
                 if back_wall_idx is not None
@@ -1106,21 +1118,21 @@ class CanonicalLayoutOptimizer:
             shift = float(distances[wall_idx]) - target_gap
             if abs(shift) > 1e-4:
                 if wall_idx == 0:
-                    coords[i, 0] -= shift
+                    candidate[i, 0] -= shift
                 elif wall_idx == 1:
-                    coords[i, 0] += shift
+                    candidate[i, 0] += shift
                 elif wall_idx == 2:
-                    coords[i, 1] -= shift
+                    candidate[i, 1] -= shift
                 else:
-                    coords[i, 1] += shift
+                    candidate[i, 1] += shift
 
             if prefs.get("corner_preferred") or rules.get("corner_preferred"):
                 corners = self._obb_corners(
-                    coords[i, 0],
-                    coords[i, 1],
+                    candidate[i, 0],
+                    candidate[i, 1],
                     float(furniture["extent"][0]),
                     float(furniture["extent"][1]),
-                    coords[i, 3],
+                    candidate[i, 3],
                 )
                 distances = self._distance_to_walls(corners)
                 adjacent = [idx for idx in (0, 1, 2, 3) if idx != wall_idx and (idx < 2) != (wall_idx < 2)]
@@ -1128,13 +1140,18 @@ class CanonicalLayoutOptimizer:
                 second_shift = float(distances[second_idx]) - target_gap
                 if abs(second_shift) > 1e-4:
                     if second_idx == 0:
-                        coords[i, 0] -= second_shift
+                        candidate[i, 0] -= second_shift
                     elif second_idx == 1:
-                        coords[i, 0] += second_shift
+                        candidate[i, 0] += second_shift
                     elif second_idx == 2:
-                        coords[i, 1] -= second_shift
+                        candidate[i, 1] -= second_shift
                     else:
-                        coords[i, 1] += second_shift
+                        candidate[i, 1] += second_shift
+
+            # A wall-cling preference must never make furniture collisions
+            # worse than leaving the item where it was (see stage_trace).
+            if self._max_furniture_penetration(candidate) <= self._max_furniture_penetration(coords) + 1e-4:
+                coords = candidate
 
         return coords.reshape(-1)
 
@@ -1218,9 +1235,18 @@ class CanonicalLayoutOptimizer:
                     else:
                         direction = direction / norm
 
-                    shift = direction * ((overlap / 2.0) + 0.015)
-                    apply_shift(i, -shift)
-                    apply_shift(j, shift)
+                    i_pinned = bool(self.furnitures[i].get("pinned"))
+                    j_pinned = bool(self.furnitures[j].get("pinned"))
+                    if i_pinned and j_pinned:
+                        continue
+                    if i_pinned:
+                        apply_shift(j, direction * (overlap + 0.03))
+                    elif j_pinned:
+                        apply_shift(i, -direction * (overlap + 0.03))
+                    else:
+                        shift = direction * ((overlap / 2.0) + 0.015)
+                        apply_shift(i, -shift)
+                        apply_shift(j, shift)
                     moved = True
 
             if not moved:
@@ -1879,9 +1905,21 @@ class CanonicalLayoutOptimizer:
         bounds: list[tuple[float, float]] = []
         initial = []
         for furniture in self.furnitures:
+            center_z = float(furniture["pos"][2])
+            center_x = float(furniture["pos"][0])
+            center_y = float(furniture["pos"][1])
+            rotation = math.radians(float(furniture.get("rotation_y_deg", 0.0))) % (2.0 * math.pi)
+
+            if furniture.get("pinned"):
+                # AI-excluded items stay exactly where they were scanned so
+                # they still act as real obstacles for everything else, but
+                # are never themselves moved by the search.
+                bounds.extend([(center_x, center_x), (center_y, center_y), (center_z, center_z), (rotation, rotation)])
+                initial.extend([center_x, center_y, center_z, rotation])
+                continue
+
             x_bounds = center_axis_bounds(self.room_width, float(furniture["extent"][0]))
             y_bounds = center_axis_bounds(self.room_depth, float(furniture["extent"][1]))
-            center_z = float(furniture["pos"][2])
             bounds.extend(
                 [
                     x_bounds,
@@ -1890,14 +1928,7 @@ class CanonicalLayoutOptimizer:
                     (0.0, 2.0 * math.pi),
                 ]
             )
-            initial.extend(
-                [
-                    float(furniture["pos"][0]),
-                    float(furniture["pos"][1]),
-                    center_z,
-                    math.radians(float(furniture.get("rotation_y_deg", 0.0))) % (2.0 * math.pi),
-                ]
-            )
+            initial.extend([center_x, center_y, center_z, rotation])
 
         lower_bounds = np.array([lower for lower, _ in bounds], dtype=float)
         upper_bounds = np.array([upper for _, upper in bounds], dtype=float)
@@ -1947,14 +1978,28 @@ class CanonicalLayoutOptimizer:
             flush=True,
         )
 
+        stage_trace: list[dict[str, Any]] = []
+
+        def _record_stage(name: str, arr: np.ndarray) -> None:
+            coords = arr.reshape(-1, 4) if arr.ndim == 1 else arr
+            stage_trace.append(
+                {
+                    "stage": name,
+                    "max_penetration_m": round(float(self._max_furniture_penetration(coords)), 4),
+                }
+            )
+
         print("optimizer: post-processing start", flush=True)
-        optimized_x = self._wall_anchored_initial(result_local.x, force=True)
+        _record_stage("local_minimize", result_local.x)
+        optimized_x = self._wall_anchored_initial(result_local.x)
         optimized_x = self._sync_paired_chairs(optimized_x)
         optimized_x = self._project_inside_room(optimized_x)
         print("optimizer: post-processing initialized", flush=True)
+        _record_stage("wall_anchor_and_chair_sync", optimized_x)
         for _ in range(4):
             optimized_x = self._resolve_pairwise_overlaps(optimized_x)
             optimized_x = self._project_inside_room(optimized_x)
+        _record_stage("pairwise_overlap_resolution", optimized_x)
         optimized_x = self._arrange_table_chairs(optimized_x)
         optimized_x = self._project_inside_room(optimized_x)
         optimized_x = self._limit_paired_support_penetration(optimized_x)
@@ -1964,22 +2009,26 @@ class CanonicalLayoutOptimizer:
         optimized_x = self._orient_paired_chairs_toward_support(optimized_x)
         optimized_x = self._limit_paired_support_penetration(optimized_x)
         optimized_x = self._project_inside_room(optimized_x)
+        _record_stage("chair_table_arrangement_pass_1", optimized_x)
         optimized = optimized_x.reshape(-1, 4)
         for i, furniture in enumerate(self.furnitures):
             optimized[i, 3] = self._snap_theta(float(optimized[i, 3]))
+        _record_stage("rotation_snap_pass_1", optimized)
         for _ in range(6):
             optimized = self._resolve_wall_collisions(optimized)
             optimized = self._resolve_furniture_collisions(optimized)
             optimized = self._resolve_wall_collisions(optimized)
             if self._max_furniture_penetration(optimized) <= 1e-3:
                 break
+        _record_stage("collision_resolution_pass_1", optimized)
 
-        optimized = self._wall_anchored_initial(optimized.reshape(-1), force=True).reshape(-1, 4)
+        optimized = self._wall_anchored_initial(optimized.reshape(-1)).reshape(-1, 4)
         optimized = self._project_inside_room(optimized.reshape(-1)).reshape(-1, 4)
         optimized = self._force_wall_cling_items(optimized.reshape(-1)).reshape(-1, 4)
         optimized = self._project_inside_room(optimized.reshape(-1)).reshape(-1, 4)
         optimized = self._resolve_door_clearance_collisions(optimized).reshape(-1, 4)
         optimized = self._project_inside_room(optimized.reshape(-1)).reshape(-1, 4)
+        _record_stage("wall_cling_and_door_clearance", optimized)
         optimized_x = self._sync_paired_chairs(optimized.reshape(-1))
         optimized_x = self._arrange_table_chairs(optimized_x)
         optimized_x = self._project_inside_room(optimized_x)
@@ -1994,6 +2043,7 @@ class CanonicalLayoutOptimizer:
         optimized_x = self._project_inside_room(optimized_x)
         optimized_x = self._resolve_door_clearance_collisions(optimized_x.reshape(-1, 4)).reshape(-1)
         optimized_x = self._project_inside_room(optimized_x)
+        _record_stage("chair_table_arrangement_pass_2", optimized_x)
         for _ in range(6):
             before_penetration = self._max_furniture_penetration(optimized_x.reshape(-1, 4))
             optimized_x = self._resolve_furniture_collisions(optimized_x.reshape(-1, 4)).reshape(-1)
@@ -2004,9 +2054,11 @@ class CanonicalLayoutOptimizer:
                 break
             if before_penetration <= self._max_furniture_penetration(optimized_x.reshape(-1, 4)) <= 1e-3:
                 break
+        _record_stage("collision_resolution_pass_2", optimized_x)
         optimized = optimized_x.reshape(-1, 4)
         for i, furniture in enumerate(self.furnitures):
             optimized[i, 3] = self._snap_theta(float(optimized[i, 3]))
+        _record_stage("rotation_snap_pass_2", optimized)
 
         # Snapping the final rotations can reintroduce an overlap that was
         # removed by the previous post-processing pass. Resolve once more
@@ -2017,6 +2069,7 @@ class CanonicalLayoutOptimizer:
             optimized = self._project_inside_room(optimized.reshape(-1)).reshape(-1, 4)
             if self._max_furniture_penetration(optimized) <= 1e-3:
                 break
+        _record_stage("final_collision_recheck", optimized)
 
         output = json.loads(json.dumps(self.payload))
         for i, furniture in enumerate(output["movable_items"]):
@@ -2038,6 +2091,7 @@ class CanonicalLayoutOptimizer:
                 "arm_reach": self.body.arm_reach,
             },
             "floor_efficiency": self._open_floor_report(optimized),
+            "stage_trace": stage_trace,
         }
         print("optimizer: output built", flush=True)
         return output
