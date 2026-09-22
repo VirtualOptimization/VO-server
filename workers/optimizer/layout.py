@@ -2219,6 +2219,21 @@ class CanonicalLayoutOptimizer:
         optimized = self._enforce_minimum_passage(optimized)
         _record_stage("minimum_passage_widening", optimized)
 
+        # Every scanned room is, by construction, a real arrangement that
+        # already exists without furniture colliding (at worst it has the
+        # same measurement-noise-level contact the scan itself shows, e.g. a
+        # chair genuinely tucked under its desk). No-furniture-collision is
+        # the one guarantee that must never be optional (Tier 0), so if the
+        # search's best result is not at least as good as simply leaving
+        # furniture where it was scanned, ship the untouched scanned layout
+        # instead of a moved-but-worse one.
+        original_coords = original_initial.reshape(-1, 4)
+        original_penetration = self._max_furniture_penetration(original_coords)
+        fallback_to_scan = self._max_furniture_penetration(optimized) > original_penetration + 1e-4
+        if fallback_to_scan:
+            optimized = original_coords.copy()
+            _record_stage("fallback_to_scanned_layout", optimized)
+
         output = json.loads(json.dumps(self.payload))
         for i, furniture in enumerate(output["movable_items"]):
             theta_deg = round(math.degrees(optimized[i, 3]) % 360.0, 3)
@@ -2240,6 +2255,7 @@ class CanonicalLayoutOptimizer:
             },
             "floor_efficiency": self._open_floor_report(optimized),
             "stage_trace": stage_trace,
+            "fallback_to_scanned_layout": fallback_to_scan,
         }
         print("optimizer: output built", flush=True)
         return output
