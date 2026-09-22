@@ -21,6 +21,11 @@ class Anthropometrics:
     shoulder_width: float = 0.425
     sitting_popliteal: float = 0.463
     arm_reach: float = 0.565
+    # LH "Planning Design Guidelines for LH Unit Plan" (2012-16), Fig 6-3:
+    # passing between two furniture bodies needs ~0.8m, not the bare
+    # shoulder width -- that figure alone is only the body itself, with no
+    # margin to avoid brushing against either side while walking through.
+    furniture_passage_recommended: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,37 @@ class CanonicalLayoutOptimizer:
                     return 0.0
                 min_overlap = min(min_overlap, overlap)
         return min_overlap
+
+    @staticmethod
+    def _sat_gap_vector(corners1: np.ndarray, corners2: np.ndarray) -> np.ndarray:
+        """Vector pointing from shape1 to shape2 along the axis that best
+        separates them, with length equal to the true gap between them.
+
+        Zero vector if the shapes overlap (use _sat_mtv for that case). This
+        is the gap-distance counterpart to _sat_mtv: pushing shape2 further
+        along this exact direction (not an arbitrary center-to-center line)
+        is what actually increases the real minimum distance between two
+        rotated rectangles -- any other direction can under- or overshoot,
+        or even create a new overlap on a different axis.
+        """
+        best_gap = 0.0
+        best_vector = np.array([0.0, 0.0], dtype=float)
+        for corners in (corners1, corners2):
+            for i in range(4):
+                edge = corners[(i + 1) % 4] - corners[i]
+                axis = np.array([-edge[1], edge[0]], dtype=float)
+                axis /= np.linalg.norm(axis) + 1e-9
+                proj1 = corners1 @ axis
+                proj2 = corners2 @ axis
+                gap_forward = float(np.min(proj2) - np.max(proj1))
+                gap_backward = float(np.min(proj1) - np.max(proj2))
+                if gap_forward > best_gap:
+                    best_gap = gap_forward
+                    best_vector = axis
+                if gap_backward > best_gap:
+                    best_gap = gap_backward
+                    best_vector = -axis
+        return best_vector * best_gap
 
     @staticmethod
     def _sat_mtv(corners1: np.ndarray, corners2: np.ndarray) -> np.ndarray:
@@ -491,6 +527,97 @@ class CanonicalLayoutOptimizer:
                 if max_penetration <= 1e-3:
                     break
             else:
+                break
+
+        return adjusted
+
+    def _is_paired_relationship(self, i: int, j: int, ids: dict[str, int]) -> bool:
+        # A chair and its own desk/table (or two chairs sharing one) are
+        # meant to sit close together -- the minimum-passage pass below
+        # doesn't apply between them; _sync_paired_chairs already governs
+        # their relative position.
+        fi, fj = self.furnitures[i], self.furnitures[j]
+        if fi["type"] == "chair" and ids.get(fi.get("pair_with")) == j:
+            return True
+        if fj["type"] == "chair" and ids.get(fj.get("pair_with")) == i:
+            return True
+        if (
+            fi["type"] == "chair"
+            and fj["type"] == "chair"
+            and fi.get("pair_with")
+            and fi.get("pair_with") == fj.get("pair_with")
+        ):
+            return True
+        return False
+
+    def _enforce_minimum_passage(self, coords: np.ndarray) -> np.ndarray:
+        """Widen any furniture pair closer than the minimum walking clearance.
+
+        This runs strictly after collision resolution and only ever accepts
+        a push that does not create a new overlap anywhere in the room --
+        "no collision" is a harder requirement than "leave a walking gap",
+        so this pass must never regress the former to chase the latter.
+        """
+        adjusted = np.array(coords, dtype=float)
+        if self.num_f < 2:
+            return adjusted
+
+        ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
+        # Two-tier target, same min/recommended shape as the Neufert rules:
+        # try to reach the comfortable LH passage width first, and only fall
+        # back toward the bare-body absolute floor if the room is too tight
+        # for the full target without creating a new collision.
+        recommended_passage = self.body.furniture_passage_recommended
+        absolute_floor = self.body.shoulder_width
+
+        for _ in range(20):
+            moved = False
+            for i in range(self.num_f):
+                for j in range(i + 1, self.num_f):
+                    if self._is_paired_relationship(i, j, ids):
+                        continue
+
+                    obb_i = self._obb_corners(
+                        adjusted[i, 0], adjusted[i, 1],
+                        float(self.furnitures[i]["extent"][0]), float(self.furnitures[i]["extent"][1]),
+                        adjusted[i, 3],
+                    )
+                    obb_j = self._obb_corners(
+                        adjusted[j, 0], adjusted[j, 1],
+                        float(self.furnitures[j]["extent"][0]), float(self.furnitures[j]["extent"][1]),
+                        adjusted[j, 3],
+                    )
+                    gap_vector = self._sat_gap_vector(obb_i, obb_j)
+                    gap = float(np.linalg.norm(gap_vector))
+                    if gap <= 1e-8:
+                        continue
+
+                    total_mobility = self._mobility_weight(self.furnitures[i]) + self._mobility_weight(self.furnitures[j])
+                    i_share = self._mobility_weight(self.furnitures[j]) / total_mobility
+                    j_share = self._mobility_weight(self.furnitures[i]) / total_mobility
+                    direction = gap_vector / gap
+
+                    applied = False
+                    for target in (recommended_passage, absolute_floor):
+                        deficit = target - gap
+                        if deficit <= 1e-3:
+                            continue
+                        push = deficit + 0.02
+                        candidate = adjusted.copy()
+                        candidate[i, :2] -= direction * push * i_share
+                        candidate[j, :2] += direction * push * j_share
+                        candidate[i] = self._keep_obb_inside_room(candidate[i], self.furnitures[i])
+                        candidate[j] = self._keep_obb_inside_room(candidate[j], self.furnitures[j])
+                        if self._max_furniture_penetration(candidate) > 1e-3:
+                            continue
+                        adjusted = candidate
+                        applied = True
+                        break
+
+                    if applied:
+                        moved = True
+
+            if not moved:
                 break
 
         return adjusted
@@ -2088,6 +2215,9 @@ class CanonicalLayoutOptimizer:
             if self._max_furniture_penetration(optimized) <= 1e-3:
                 break
         _record_stage("final_collision_recheck", optimized)
+
+        optimized = self._enforce_minimum_passage(optimized)
+        _record_stage("minimum_passage_widening", optimized)
 
         output = json.loads(json.dumps(self.payload))
         for i, furniture in enumerate(output["movable_items"]):
