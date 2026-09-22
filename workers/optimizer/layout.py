@@ -409,20 +409,19 @@ class CanonicalLayoutOptimizer:
                         direction = direction / norm
                     shift = direction * (overlap + 0.06)
 
-                    candidate = adjusted.copy()
-                    candidate[i, :2] += shift
+                    # Unlike the wall-cling/corner *preference* elsewhere in
+                    # this file, clearing a door is a hard requirement, not a
+                    # soft one -- a blocked door is worse than a temporary
+                    # furniture-vs-furniture overlap. So this shift always
+                    # applies (never gated on furniture penetration); the
+                    # furniture-collision passes that run right after this
+                    # stage in optimize() are what clean up any resulting
+                    # overlap, without undoing the door clearance itself.
+                    adjusted[i, :2] += shift
                     for chair_idx in paired_chairs(i):
-                        candidate[chair_idx, :2] += shift
-                    candidate[i] = self._keep_obb_inside_room(candidate[i], furniture)
-
-                    # Clearing a door must never make furniture-vs-furniture
-                    # collisions worse than leaving the item where it was;
-                    # a later pass (or the objective penalty itself) is
-                    # better positioned to resolve a door/furniture conflict
-                    # that has no collision-free fix here.
-                    if self._max_furniture_penetration(candidate) <= self._max_furniture_penetration(adjusted) + 1e-4:
-                        adjusted = candidate
-                        moved = True
+                        adjusted[chair_idx, :2] += shift
+                    adjusted[i] = self._keep_obb_inside_room(adjusted[i], furniture)
+                    moved = True
             if not moved:
                 break
 
