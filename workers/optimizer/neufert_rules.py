@@ -108,6 +108,14 @@ def apply_neufert_rules(problem: dict[str, Any], path: str | Path | None) -> dic
                 applied_rule["applied_from"] = "recommended_distance_m"
                 applied_rule["relaxation_scale_applied"] = round(relaxation_scale, 3)
 
+            if rule.get("validation_only"):
+                # This rule is for neufert_validation / AI-recovery triggering
+                # only. Promoting it into front_clearance/side_clearance would
+                # let it compete with hard furniture-collision avoidance in
+                # the SLSQP objective -- measured on real scans to sometimes
+                # worsen actual overlap (Tier 0) in already-crowded rooms.
+                continue
+
             relation = str(rule.get("relation", ""))
             direction = str(rule.get("direction", ""))
             numeric = float(value)
@@ -182,7 +190,12 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
                 0.0,
             )
             gaps.append(gap)
-        return min(gaps)
+        # Two separated convex polygons are guaranteed a positive gap on at
+        # least one candidate axis (the true separating axis); the other
+        # axes typically still show projection overlap and report 0. The
+        # real separation distance is therefore the *largest* gap found,
+        # not the smallest -- mirroring _sat_gap_vector in layout.py.
+        return max(gaps)
 
     item_corners = {id(item): corners(item) for item in items}
     checks: list[dict[str, Any]] = []
