@@ -16,7 +16,8 @@ import certifi
 
 SUPPORTED_PROVIDER = "anthropic"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_MAX_TOKENS = 4096
 BACK_TO_WALL_TYPES = {"bed", "closet", "cabinet", "shelf", "storage"}
 
 
@@ -152,19 +153,11 @@ def merge_ai_retry_output(
     return merged
 
 
-def generate_claude_constraints(
-    problem: dict[str, Any],
-    failure_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY is required when AI_LAYOUT_ENABLED=true")
+class _UnusableClaudeResponseError(RuntimeError):
+    """Claude answered, but the response couldn't be turned into JSON constraints."""
 
-    model = os.getenv("ASSISTANT_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
-    max_tokens = int(os.getenv("ASSISTANT_MAX_TOKENS", "1024"))
-    timeout = float(os.getenv("AI_LAYOUT_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
 
-    prompt = _build_prompt(_summarize_problem(problem), failure_context)
+def _call_claude_once(prompt: str, *, api_key: str, model: str, max_tokens: int, timeout: float) -> dict[str, Any]:
     url = "https://api.anthropic.com/v1/messages"
     body = {
         "model": model,
@@ -193,8 +186,51 @@ def generate_claude_constraints(
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Claude API connection error: {exc.reason}") from exc
 
-    text = _extract_candidate_text(payload)
-    return _validate_constraints(_loads_json_object(text), problem)
+    try:
+        text = _extract_candidate_text(payload)
+        return _loads_json_object(text)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        raise _UnusableClaudeResponseError(str(exc)) from exc
+
+
+def generate_claude_constraints(
+    problem: dict[str, Any],
+    failure_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY is required when AI_LAYOUT_ENABLED=true")
+
+    model = os.getenv("ASSISTANT_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+    # This is a separate, larger budget from the chatbot's ASSISTANT_MAX_TOKENS:
+    # the recovery response is a much bigger structured JSON schema (support
+    # groups, chair pairs, orientation, recovery actions, ...) across every
+    # piece of furniture, not a short conversational reply. Sharing the
+    # chatbot's 1024-token budget caused Claude's response to be truncated
+    # mid-JSON (stop_reason="max_tokens"), which always fails to parse.
+    max_tokens = int(os.getenv("AI_LAYOUT_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
+    timeout = float(os.getenv("AI_LAYOUT_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
+    prompt = _build_prompt(_summarize_problem(problem), failure_context)
+
+    # An occasional response that isn't clean JSON (e.g. Claude straying into
+    # stray code-like syntax inside a string value) is a random one-off
+    # hiccup, not a systemic failure -- the same prompt can succeed on a
+    # later attempt with no other change. Retry with fresh calls before
+    # giving up. Network/API-level errors are not retried here since asking
+    # again won't fix an auth failure or a dead connection.
+    max_attempts = 3
+    last_error: _UnusableClaudeResponseError | None = None
+    raw_constraints: dict[str, Any] | None = None
+    for _ in range(max_attempts):
+        try:
+            raw_constraints = _call_claude_once(prompt, api_key=api_key, model=model, max_tokens=max_tokens, timeout=timeout)
+            break
+        except _UnusableClaudeResponseError as exc:
+            last_error = exc
+    if raw_constraints is None:
+        raise last_error
+
+    return _validate_constraints(raw_constraints, problem)
 
 
 def apply_ai_constraints(problem: dict[str, Any], constraints: dict[str, Any]) -> None:
@@ -517,7 +553,10 @@ def _build_prompt(
     return (
         "You are a furniture layout constraint planner. "
         "Return ONLY valid JSON. Do not return markdown. "
-        "Do not create final coordinates. Use only object ids that exist in the input. "
+        "Do not create final coordinates. Use only object ids that exist in the input, "
+        "copied exactly character-for-character. Every JSON string value must be a plain "
+        "literal string -- never a function call, method chain (e.g. .replace(...)), "
+        "ternary/conditional expression, or any other code inside a string. "
         "Suggest semantic constraints for a deterministic optimizer. "
         "Prefer support_groups over chair_pairs. support_groups describe human-intended furniture clusters; "
         "the optimizer will validate exact final placement.\n\n"

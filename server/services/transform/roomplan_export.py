@@ -166,6 +166,14 @@ def export_optimized_layout_to_roomplan(
         if optimized_item.get("model_key"):
             obj["model_key"] = optimized_item["model_key"]
 
+    # Surfaces whether the optimizer (and, when it ran, the AI recovery pass)
+    # actually satisfied every collision/clearance rule, or is handing back
+    # its best effort for a room that genuinely couldn't fit everything
+    # (e.g. more furniture than the floor area realistically allows). The
+    # client can use this to show a "we couldn't fully resolve this" notice
+    # instead of silently presenting an imperfect layout as final.
+    result["placementStatus"] = optimized_payload.get("placement_status", "success")
+
     return result
 
 

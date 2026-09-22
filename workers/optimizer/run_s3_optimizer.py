@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 import boto3
+from dotenv import load_dotenv
 
 from server.services.transform import (
     build_layout_problem,
@@ -68,6 +69,7 @@ def default_unity_key(roomplan_key: str) -> str:
 
 
 def main() -> int:
+    load_dotenv()
     bucket = require_env("S3_BUCKET_NAME")
     input_key = require_env("INPUT_S3_KEY")
     roomplan_optimized_key = require_env("ROOMPLAN_OPTIMIZED_OUT_S3_KEY")
