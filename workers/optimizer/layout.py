@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 from dataclasses import dataclass
@@ -9,9 +10,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy import ndimage
 from scipy.optimize import differential_evolution, minimize
 
+from workers.optimizer import lh_principles as lh
 from workers.optimizer.bounds import center_axis_bounds
+
+# Same order as CanonicalLayoutOptimizer._wall_outward_normals / _distance_to_walls.
+ABSOLUTE_WALL_NAMES = ("west", "east", "south", "north")
 
 
 @dataclass(frozen=True)
@@ -41,7 +47,8 @@ class PenaltyWeights:
     rotation_snap: float = 25_000.0
     wall_anchor: float = 15_000.0
     body_collision: float = 50_000_000.0
-    open_floor_reward: float = 400.0
+    # Per m2 of the largest connected free-floor region.
+    open_region_reward: float = 2_000.0
 
 
 class CanonicalLayoutOptimizer:
@@ -61,6 +68,13 @@ class CanonicalLayoutOptimizer:
         self.furnitures = payload["movable_items"]
         self.fixed_elements = payload.get("fixed_elements", [])
         self.num_f = len(self.furnitures)
+        # Wall-mounted items (shelves/cabinets whose bottom is well off the floor)
+        # are fixed to the wall: keep them where they were scanned, and let floor
+        # furniture sit under them (see _vertically_apart).
+        for furniture in self.furnitures:
+            if self._bottom_height(furniture) > lh.WALL_MOUNTED_MIN_BOTTOM_M:
+                furniture["pinned"] = True
+                furniture["wall_mounted"] = True
         self.body = anthropometrics or Anthropometrics()
         self.weights = weights or PenaltyWeights()
 
@@ -92,36 +106,64 @@ class CanonicalLayoutOptimizer:
             return np.array(fallback, dtype=float)
         return arr / norm
 
+    # The SAT helpers run ~10^6 times per optimization on 4-corner shapes, where
+    # numpy's per-call overhead dominates, so they work on plain Python floats.
     @staticmethod
-    def _sat_overlap(corners1: np.ndarray, corners2: np.ndarray) -> float:
-        max_overlap = -1e9
-        for corners in (corners1, corners2):
-            for i in range(4):
-                edge = corners[(i + 1) % 4] - corners[i]
-                axis = np.array([-edge[1], edge[0]], dtype=float)
-                axis /= np.linalg.norm(axis) + 1e-9
-                proj1 = corners1 @ axis
-                proj2 = corners2 @ axis
-                overlap = min(np.max(proj1), np.max(proj2)) - max(np.min(proj1), np.min(proj2))
-                if np.max(proj1) < np.min(proj2) - 1e-3 or np.max(proj2) < np.min(proj1) - 1e-3:
-                    return 0.0
-                max_overlap = max(max_overlap, overlap)
-        return max_overlap
+    def _points(corners: np.ndarray) -> list[tuple[float, float]]:
+        if isinstance(corners, np.ndarray):
+            return [(float(p[0]), float(p[1])) for p in corners.tolist()]
+        return [(float(p[0]), float(p[1])) for p in corners]
 
     @staticmethod
-    def _sat_penetration(corners1: np.ndarray, corners2: np.ndarray) -> float:
-        min_overlap = 1e9
-        for corners in (corners1, corners2):
+    def _bbox_gap(p1: list[tuple[float, float]], p2: list[tuple[float, float]]) -> float:
+        xs1 = [p[0] for p in p1]
+        ys1 = [p[1] for p in p1]
+        xs2 = [p[0] for p in p2]
+        ys2 = [p[1] for p in p2]
+        return max(min(xs2) - max(xs1), min(xs1) - max(xs2), min(ys2) - max(ys1), min(ys1) - max(ys2))
+
+    @staticmethod
+    def _sat_axes(p1: list[tuple[float, float]], p2: list[tuple[float, float]]):
+        """Yield (overlap, separated_by_more_than_1mm) along each edge normal."""
+        for poly in (p1, p2):
             for i in range(4):
-                edge = corners[(i + 1) % 4] - corners[i]
-                axis = np.array([-edge[1], edge[0]], dtype=float)
-                axis /= np.linalg.norm(axis) + 1e-9
-                proj1 = corners1 @ axis
-                proj2 = corners2 @ axis
-                overlap = min(np.max(proj1), np.max(proj2)) - max(np.min(proj1), np.min(proj2))
-                if overlap <= 1e-3:
-                    return 0.0
-                min_overlap = min(min_overlap, overlap)
+                ax, ay = poly[i]
+                bx, by = poly[(i + 1) % 4]
+                nx, ny = ay - by, bx - ax
+                norm = math.hypot(nx, ny) + 1e-9
+                nx, ny = nx / norm, ny / norm
+                proj1 = [x * nx + y * ny for x, y in p1]
+                proj2 = [x * nx + y * ny for x, y in p2]
+                max1, min1, max2, min2 = max(proj1), min(proj1), max(proj2), min(proj2)
+                yield min(max1, max2) - max(min1, min2), max1 < min2 - 1e-3 or max2 < min1 - 1e-3
+
+    @classmethod
+    def _sat_overlap(cls, corners1: np.ndarray, corners2: np.ndarray) -> float:
+        p1, p2 = cls._points(corners1), cls._points(corners2)
+        # Edge normals of a rectangle are within 45 degrees of any separating
+        # direction, so a bounding-box gap over sqrt(2) mm always yields an
+        # edge-normal gap over 1 mm below.
+        if cls._bbox_gap(p1, p2) > 1.5e-3:
+            return 0.0
+        max_overlap = -1e9
+        for overlap, separated in cls._sat_axes(p1, p2):
+            if separated:
+                return 0.0
+            max_overlap = max(max_overlap, overlap)
+        return max_overlap
+
+    @classmethod
+    def _sat_penetration(cls, corners1: np.ndarray, corners2: np.ndarray) -> float:
+        p1, p2 = cls._points(corners1), cls._points(corners2)
+        # Disjoint bounding boxes mean the shapes are disjoint, so some edge
+        # normal below has overlap <= 0.
+        if cls._bbox_gap(p1, p2) > 0.0:
+            return 0.0
+        min_overlap = 1e9
+        for overlap, _ in cls._sat_axes(p1, p2):
+            if overlap <= 1e-3:
+                return 0.0
+            min_overlap = min(min_overlap, overlap)
         return min_overlap
 
     @staticmethod
@@ -226,6 +268,551 @@ class CanonicalLayoutOptimizer:
             np.array([0.0, 1.0]),   # north
         ]
 
+    WALL_INDEX = {"west": 0, "east": 1, "south": 2, "north": 3}
+
+    @staticmethod
+    def _top_height(furniture: dict[str, Any]) -> float:
+        return float(furniture["pos"][2])
+
+    @classmethod
+    def _bottom_height(cls, furniture: dict[str, Any]) -> float:
+        extent = furniture["extent"]
+        height = float(extent[2]) if len(extent) > 2 else cls._top_height(furniture)
+        return cls._top_height(furniture) - height
+
+    def _vertically_apart(self, i: int, j: int) -> bool:
+        """True when two items' height ranges don't overlap (e.g. a desk under a wall cabinet).
+
+        Two floor-standing items always overlap in height, so this never excuses a
+        real collision between floor furniture. Called inside the objective, so the
+        answer is precomputed once per optimizer.
+        """
+        if not hasattr(self, "_apart_cache"):
+            spans = [(self._bottom_height(f), self._top_height(f)) for f in self.furnitures]
+            self._apart_cache = [
+                [min(a[1], b[1]) - max(a[0], b[0]) <= 0.02 for b in spans] for a in spans
+            ]
+        return self._apart_cache[i][j]
+
+    def _is_wall_mounted(self, index: int) -> bool:
+        return bool(self.furnitures[index].get("wall_mounted"))
+
+    def _wall_band(self, wall: str) -> float:
+        """How far the scanned wall obstacle on `wall` reaches into the room.
+
+        Boundary walls lie outside the room (see _build_wall_obstacle_polygon), so
+        this is ~0 unless an interior wall runs along the boundary. An item
+        "against" the wall sits just outside this band.
+        """
+        if not hasattr(self, "_wall_band_cache"):
+            bands = {name: 0.0 for name in ABSOLUTE_WALL_NAMES}
+            for fixed in self.fixed_elements:
+                if fixed.get("type") != "wall" or fixed.get("wall") not in bands:
+                    continue
+                poly = self._wall_obstacle_polygon(fixed, buffer=0.02)
+                inward = {
+                    "west": float(poly[:, 0].max()),
+                    "east": self.room_width - float(poly[:, 0].min()),
+                    "south": float(poly[:, 1].max()),
+                    "north": self.room_depth - float(poly[:, 1].min()),
+                }[fixed["wall"]]
+                bands[fixed["wall"]] = max(bands[fixed["wall"]], inward)
+            self._wall_band_cache = {name: band + 0.005 for name, band in bands.items()}
+        return self._wall_band_cache[wall]
+
+    def _intent_penalty(self, furniture: dict[str, Any], coords: np.ndarray, corners: np.ndarray) -> float:
+        """Pull an item toward the wall an AI plan chose for it (see spatial_intent.py)."""
+        intent = furniture.get("spatial_intent")
+        if not intent:
+            return 0.0
+        weight = self.weights.high if intent["strength"] == "must" else self.weights.wall_anchor
+        if intent["keep"]:
+            return weight * float(np.linalg.norm(coords[:2] - self._coords_from_furniture(furniture)[:2]))
+        distances = self._distance_to_walls(corners)
+        wall_idx = self.WALL_INDEX[intent["wall"]]
+        back = -self._world_front(furniture, float(coords[3]))
+        misalignment = (1.0 - float(np.dot(back, self._wall_outward_normals()[wall_idx]))) / 2.0
+        penalty = max(float(distances[wall_idx]) - self._wall_band(intent["wall"]), 0.0) + misalignment
+        if intent.get("corner_wall"):
+            penalty += max(float(distances[self.WALL_INDEX[intent["corner_wall"]]]) - self._wall_band(intent["corner_wall"]), 0.0)
+        return weight * penalty
+
+    def _lh_context(self) -> tuple[dict[str, str], dict[str, Any], list[str]] | None:
+        """Door-relative wall names, entrance door and item roles (computed once)."""
+        if not hasattr(self, "_lh_cache"):
+            door = lh.entrance_door(self.fixed_elements)
+            self._lh_cache = (
+                (lh.relative_to_absolute(door["wall"]), door, [lh.role(f, self.furnitures) for f in self.furnitures])
+                if door
+                else None
+            )
+        return self._lh_cache
+
+    def _principle_penalty(self, index: int, coords: np.ndarray, corners: np.ndarray) -> float:
+        """Sourced placement principles as objective terms (see lh_principles.py).
+
+        must (P0/P1 bed head against a non-door wall, P4 desk not backed on the door
+        wall) are weighted like other critical constraints so the search itself
+        avoids them; prefer (P2 door in view from bed, P3 wardrobe by the door) only
+        nudge. Orientation found here survives
+        post-processing, which translates items and snaps rotation but never turns
+        a bed around.
+        """
+        context = self._lh_context()
+        if context is None:
+            return 0.0
+        walls, door, roles = context
+        item_role = roles[index]
+        if item_role not in {"bed", "single_bed", "desk", "wardrobe"}:
+            return 0.0
+        furniture = self.furnitures[index]
+        back = -self._world_front(furniture, float(coords[3]))
+        normals = self._wall_outward_normals()
+        facing_idx = int(np.argmax([float(np.dot(back, normal)) for normal in normals]))
+        facing = ABSOLUTE_WALL_NAMES[facing_idx]
+        gap = max(float(self._distance_to_walls(corners)[facing_idx]) - self._wall_band(facing), 0.0)
+        against = gap <= lh.AGAINST_WALL_TOLERANCE_M
+
+        penalty = 0.0
+        if item_role in {"bed", "single_bed"}:
+            if facing == walls["door_wall"] and against:
+                penalty += self.weights.critical
+            penalty += self.weights.high * gap
+            if lh.door_view_from_bed(furniture, coords[0], coords[1], coords[3], door, self.room_width, self.room_depth) != "in_front":
+                penalty += self.weights.medium
+            # P5 (single bed in a corner) is not repeated here: _bed_penalty
+            # already rewards two wall contacts far more strongly.
+        elif item_role == "desk" and facing == walls["door_wall"] and against:
+            penalty += self.weights.critical
+        elif item_role == "wardrobe" and facing == walls["opposite_door"] and against:
+            penalty += self.weights.medium
+        return penalty
+
+    def _move_with_paired_chairs(self, coords: np.ndarray, index: int, x: float, y: float, theta: float) -> np.ndarray:
+        """Move one item and carry its paired chairs along rigidly (keeps their arrangement)."""
+        moved = coords.copy()
+        x0, y0, t0 = coords[index, 0], coords[index, 1], coords[index, 3]
+        moved[index, 0], moved[index, 1], moved[index, 3] = x, y, theta
+        support_id = self.furnitures[index].get("id")
+        delta = theta - t0
+        c, s = math.cos(delta), math.sin(delta)
+        for j, other in enumerate(self.furnitures):
+            if other.get("type") != "chair" or other.get("pair_with") != support_id:
+                continue
+            rx, ry = coords[j, 0] - x0, coords[j, 1] - y0
+            moved[j, 0] = x + rx * c - ry * s
+            moved[j, 1] = y + rx * s + ry * c
+            moved[j, 3] = (coords[j, 3] + delta) % (2.0 * math.pi)
+        return moved
+
+    def _wall_poses(
+        self, index: int, wall: str, current: np.ndarray | None = None, *, corners_only: bool = False
+    ) -> list[tuple[float, float, float]]:
+        """Poses with the item's back against `wall`: both corners, and unless
+        corners_only, the middle and (if given) the spot nearest its current position."""
+        furniture = self.furnitures[index]
+        theta = self._snapped_theta_for_world_front(furniture, -self._wall_outward_normals()[self.WALL_INDEX[wall]])
+        obb = self._obb_corners(0.0, 0.0, float(furniture["extent"][0]), float(furniture["extent"][1]), theta)
+        half_x = float(obb[:, 0].max() - obb[:, 0].min()) / 2.0
+        half_y = float(obb[:, 1].max() - obb[:, 1].min()) / 2.0
+        vertical = wall in {"west", "east"}
+        if vertical:
+            fixed = self._wall_band("west") + half_x if wall == "west" else self.room_width - self._wall_band("east") - half_x
+            low, high = self._wall_band("south") + half_y, self.room_depth - self._wall_band("north") - half_y
+        else:
+            fixed = self._wall_band("south") + half_y if wall == "south" else self.room_depth - self._wall_band("north") - half_y
+            low, high = self._wall_band("west") + half_x, self.room_width - self._wall_band("east") - half_x
+        if low > high:
+            return []
+        spots = {low, high} if corners_only else {low, high, (low + high) / 2.0}
+        if current is not None and not corners_only:
+            spots.add(min(max(float(current[1] if vertical else current[0]), low), high))
+        return [((fixed, s, theta) if vertical else (s, fixed, theta)) for s in sorted(spots)]
+
+    def _against_wall_candidates(self, coords: np.ndarray, index: int, walls: list[str]) -> list[np.ndarray]:
+        """Layouts with one item moved (with its paired chairs) against each given wall."""
+        return [
+            self._move_with_paired_chairs(coords, index, x, y, theta)
+            for wall in walls
+            for x, y, theta in self._wall_poses(index, wall, coords[index])
+        ]
+
+    PRINCIPLE_SEEDS = 2
+    SETTLED_REPAIRS = 3
+    SEED_COMBOS = 6
+
+    SEED_SEARCH_CHECKS = 20000
+    SEED_SEARCH_SOLUTIONS = 40
+
+    def _place_chairs_in_front(self, coords: np.ndarray, support: int, chairs: list[int]) -> None:
+        """Put a support's paired chairs at its front edge, spread along its width."""
+        front = self._world_front(self.furnitures[support], float(coords[support, 3]))
+        lateral = np.array([-front[1], front[0]])
+        extent = [float(v) for v in self.furnitures[support]["extent"][:2]]
+        for k, chair in enumerate(chairs):
+            chair_extent = [float(v) for v in self.furnitures[chair]["extent"][:2]]
+            reach = max(max(extent) / 2 - max(chair_extent) / 2, 0.0)
+            offset = 0.0 if len(chairs) == 1 else -reach + 2 * reach * k / (len(chairs) - 1)
+            coords[chair, 3] = self._snapped_theta_for_world_front(self.furnitures[chair], -front)
+            tuck = max(
+                self._allowed_chair_support_penetration(self.furnitures[chair], coords[chair], self.furnitures[support], coords[support]) - 0.01,
+                0.0,
+            )
+            coords[chair, :2] = (
+                coords[support, :2]
+                + front * (min(extent) / 2 + min(chair_extent) / 2 - tuck)
+                + lateral * offset
+            )
+            # The chair's depth along `front` need not be its short side; back it
+            # out until the measured tuck is within the allowance.
+            for _ in range(3):
+                chair_obb = self._obb_corners(coords[chair, 0], coords[chair, 1], chair_extent[0], chair_extent[1], coords[chair, 3])
+                support_obb = self._obb_corners(coords[support, 0], coords[support, 1], extent[0], extent[1], coords[support, 3])
+                excess = self._sat_penetration(chair_obb, support_obb) - tuck
+                if excess <= 1e-3:
+                    break
+                coords[chair, :2] += front * excess
+
+    def _search_clean_layouts(self, base: np.ndarray, walls: dict[str, str], roles: list[str]) -> list[np.ndarray]:
+        """Exhaustively try wall placements for every movable item (bounded by a check budget).
+
+        Returns layouts with no floor-furniture overlap, nothing in a door swing,
+        wall or outside the room, the bed head on a non-door wall and the desk off
+        the door wall -- the kind of arrangement the LH unit plans show. Items keep
+        their backs to a wall; wall-mounted items stay put as obstacles.
+        """
+        furnitures = self.furnitures
+        ids = {f["id"]: i for i, f in enumerate(furnitures)}
+        chairs_of: dict[int, list[int]] = {}
+        for j, f in enumerate(furnitures):
+            if f["type"] == "chair" and f.get("pair_with") in ids and not f.get("pinned"):
+                chairs_of.setdefault(ids[f["pair_with"]], []).append(j)
+        paired_chairs = {chair for chairs in chairs_of.values() for chair in chairs}
+        fixed = {j for j, f in enumerate(furnitures) if f.get("pinned")}
+        order = sorted(
+            (j for j in range(self.num_f) if j not in fixed and j not in paired_chairs),
+            key=lambda j: -float(furnitures[j]["extent"][0]) * float(furnitures[j]["extent"][1]),
+        )
+
+        def allowed(j: int) -> list[str]:
+            if roles[j] in {"bed", "single_bed", "desk"}:
+                return [wall for wall in ABSOLUTE_WALL_NAMES if wall != walls["door_wall"]]
+            return list(ABSOLUTE_WALL_NAMES)
+
+        poses = {j: [pose for wall in allowed(j) for pose in self._wall_poses(j, wall)] for j in order}
+
+        def paired(a: int, b: int) -> bool:
+            return a in chairs_of.get(b, []) or b in chairs_of.get(a, []) or any(
+                a in chairs and b in chairs for chairs in chairs_of.values()
+            )
+
+        def fits(coords: np.ndarray, placed: set[int], group: list[int]) -> bool:
+            for a in group:
+                obb_a = self._obb_corners(coords[a, 0], coords[a, 1], float(furnitures[a]["extent"][0]), float(furnitures[a]["extent"][1]), coords[a, 3])
+                if self._fixed_element_penalty([obb_a], coords) > 0 or self._outside_room_penalty(obb_a) > 0:
+                    return False
+                for b in placed:
+                    if b == a or paired(a, b) or self._vertically_apart(a, b):
+                        continue
+                    obb_b = self._obb_corners(coords[b, 0], coords[b, 1], float(furnitures[b]["extent"][0]), float(furnitures[b]["extent"][1]), coords[b, 3])
+                    if self._sat_penetration(obb_a, obb_b) > 1e-3:
+                        return False
+            return True
+
+        solutions: list[np.ndarray] = []
+        # A work budget, not a time limit, so the result does not depend on machine speed or load.
+        budget = [self.SEED_SEARCH_CHECKS]
+
+        def search(k: int, coords: np.ndarray, placed: set[int]) -> None:
+            if len(solutions) >= self.SEED_SEARCH_SOLUTIONS or budget[0] <= 0:
+                return
+            if k == len(order):
+                solutions.append(coords.copy())
+                return
+            j = order[k]
+            for x, y, theta in poses[j]:
+                trial = coords.copy()
+                trial[j, 0], trial[j, 1], trial[j, 3] = x, y, theta
+                group = [j] + chairs_of.get(j, [])
+                if chairs_of.get(j):
+                    self._place_chairs_in_front(trial, j, chairs_of[j])
+                budget[0] -= 1
+                if fits(trial, placed, group):
+                    search(k + 1, trial, placed | set(group))
+
+        search(0, base.copy(), set(fixed))
+        solutions.sort(key=lambda coords: self._objective(coords.reshape(-1)))
+        return [coords.reshape(-1) for coords in solutions[: self.PRINCIPLE_SEEDS]]
+
+    def _principle_seeds(self, initial: np.ndarray) -> list[np.ndarray]:
+        """Starting layouts built directly from the sourced principles.
+
+        The global search can miss arrangements that need several pieces moved at
+        once (e.g. bed to the wall opposite the door AND wardrobe beside the door).
+        This enumerates bed / wardrobe / desk wall-and-corner combinations the way
+        the LH unit plans are laid out, and returns the best-scoring few as extra
+        starting points. Everything else stays at its scanned pose for the search
+        to settle.
+        """
+        context = self._lh_context()
+        if context is None:
+            return []
+        walls, _, roles = context
+        base = initial.reshape(-1, 4)
+        clean = self._search_clean_layouts(base, walls, roles)
+        if clean:
+            return clean
+
+        def pick(role_names: set[str]) -> int | None:
+            matches = [i for i, r in enumerate(roles) if r in role_names]
+            if not matches:
+                return None
+            return max(matches, key=lambda i: float(self.furnitures[i]["extent"][0]) * float(self.furnitures[i]["extent"][1]))
+
+        not_door = [walls["opposite_door"], walls["left_of_door"], walls["right_of_door"]]
+        choices: list[tuple[int, list[tuple[float, float, float]]]] = []
+        for index, allowed in (
+            (pick({"bed", "single_bed"}), not_door),
+            (pick({"wardrobe"}), [walls["door_wall"], walls["left_of_door"], walls["right_of_door"]]),
+            (pick({"desk"}), not_door),
+        ):
+            if index is not None:
+                poses = [pose for wall in allowed for pose in self._wall_poses(index, wall, corners_only=True)]
+                if poses:
+                    choices.append((index, poses))
+        if not choices:
+            return []
+
+        principal = {index for index, _ in choices}
+        principal |= {
+            j for j, f in enumerate(self.furnitures)
+            if f.get("type") == "chair" and any(f.get("pair_with") == self.furnitures[i].get("id") for i in principal)
+        }
+
+        # Stage 1: rank the principal-item combinations by how cleanly they fit
+        # among themselves (cheap -- the other furniture is placed in stage 2).
+        ranked = []
+        for combo in itertools.product(*(poses for _, poses in choices)):
+            coords = base.copy()
+            for (index, _), (x, y, theta) in zip(choices, combo):
+                coords = self._move_with_paired_chairs(coords, index, x, y, theta)
+            ranked.append((self._subset_violation(coords, principal), coords))
+        ranked.sort(key=lambda pair: pair[0])
+
+        # Stage 2: fill in the remaining furniture, largest first, each at the
+        # free wall spot (or its current spot) that collides least.
+        rest = sorted(
+            (j for j, f in enumerate(self.furnitures) if j not in principal and not f.get("pinned")),
+            key=lambda j: -float(self.furnitures[j]["extent"][0]) * float(self.furnitures[j]["extent"][1]),
+        )
+        completed = []
+        for _, coords in ranked[: self.SEED_COMBOS]:
+            placed = set(principal)
+            for j in rest:
+                options = [tuple(coords[j, [0, 1, 3]])] + [
+                    pose for wall in ABSOLUTE_WALL_NAMES for pose in self._wall_poses(j, wall)
+                ]
+
+                def cost(pose: tuple[float, float, float]) -> tuple[float, float]:
+                    trial = self._move_with_paired_chairs(coords, j, *pose)
+                    return self._subset_violation(trial, placed | {j}, focus=j)
+
+                coords = self._move_with_paired_chairs(coords, j, *min(options, key=cost))
+                placed.add(j)
+            completed.append((self._objective(coords.reshape(-1)), coords.reshape(-1)))
+        completed.sort(key=lambda pair: pair[0])
+        return [coords for _, coords in completed[: self.PRINCIPLE_SEEDS]]
+
+    def _subset_violation(self, coords: np.ndarray, subset: set[int], focus: int | None = None) -> tuple[float, float]:
+        """(max overlap, door/wall/outside penalty) counting only items in `subset`.
+
+        With `focus`, only overlaps involving that item are counted.
+        """
+        obbs = {
+            i: self._obb_corners(coords[i, 0], coords[i, 1], float(self.furnitures[i]["extent"][0]), float(self.furnitures[i]["extent"][1]), coords[i, 3])
+            for i in subset
+        }
+        pairs = [(focus, j) for j in subset if j != focus] if focus is not None else list(itertools.combinations(subset, 2))
+        overlap = max(
+            (self._sat_penetration(obbs[a], obbs[b]) for a, b in pairs if not self._vertically_apart(a, b)),
+            default=0.0,
+        )
+        members = [focus] if focus is not None else list(subset)
+        fixed = self._fixed_element_penalty([obbs[i] for i in members], coords) + sum(
+            self._outside_room_penalty(obbs[i]) for i in members
+        )
+        return float(overlap), float(fixed)
+
+    def _settle_around(self, coords: np.ndarray, index: int) -> np.ndarray:
+        """Let the other furniture make room for an item that was just moved.
+
+        The moved item is pinned (mobility weight 1e6) so the collision passes push
+        everything else out of its way instead of pushing it back.
+        """
+        furniture = self.furnitures[index]
+        was_pinned = furniture.get("pinned")
+        furniture["pinned"] = True
+        try:
+            for _ in range(3):
+                coords = self._resolve_furniture_collisions(coords)
+                coords = self._resolve_wall_collisions(coords)
+                coords = self._resolve_door_clearance_collisions(coords).reshape(-1, 4)
+                coords = self._project_inside_room(coords.reshape(-1)).reshape(-1, 4)
+                if self._max_furniture_penetration(coords) <= 1e-3:
+                    break
+        finally:
+            if was_pinned is None:
+                furniture.pop("pinned", None)
+            else:
+                furniture["pinned"] = was_pinned
+        return coords
+
+    def _hard_violation(self, coords: np.ndarray) -> tuple[float, float]:
+        """(furniture overlap, door-clearance/wall/outside-room penalty) -- never allowed to grow."""
+        obbs = [
+            self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
+            for c, f in zip(coords, self.furnitures)
+        ]
+        fixed = self._fixed_element_penalty(obbs, coords) + sum(self._outside_room_penalty(obb) for obb in obbs)
+        return self._max_furniture_penetration(coords), fixed
+
+    def _must_violations(self, coords: np.ndarray) -> int:
+        """Number of `must` principles broken: P0+P1 per bed, P4 per desk."""
+        context = self._lh_context()
+        if context is None:
+            return 0
+        walls, _, roles = context
+        count = 0
+        for i, item_role in enumerate(roles):
+            if item_role not in {"bed", "single_bed", "desk"}:
+                continue
+            back = lh.back_wall(self.furnitures[i], coords[i, 0], coords[i, 1], coords[i, 3], self.room_width, self.room_depth)
+            if back == walls["door_wall"] or (back is None and item_role != "desk"):
+                count += 1
+        return count
+
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, float]:
+        """Tiered comparison key for finished layouts; lower is better.
+
+        Hard requirements are compared first and are never traded for a better
+        objective: furniture overlap (a chair tucked into its own desk is allowed),
+        then door-clearance / wall / out-of-room violations, then broken `must`
+        principles. The weighted objective only decides between layouts that tie
+        on all of those.
+        """
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        obbs = [
+            self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
+            for c, f in zip(coords, self.furnitures)
+        ]
+        penetration = self._max_furniture_penetration(coords, include_paired=False)
+        # A chair may tuck under its own desk/table only as far as
+        # _allowed_chair_support_penetration permits.
+        ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
+        for chair_idx, chair in enumerate(self.furnitures):
+            support_idx = ids.get(chair.get("pair_with"))
+            if chair["type"] != "chair" or support_idx is None or self.furnitures[support_idx]["type"] not in {"desk", "table"}:
+                continue
+            allowed = self._allowed_chair_support_penetration(chair, coords[chair_idx], self.furnitures[support_idx], coords[support_idx])
+            penetration = max(penetration, self._sat_penetration(obbs[chair_idx], obbs[support_idx]) - allowed)
+        fixed = self._fixed_element_penalty(obbs, coords) + sum(self._outside_room_penalty(obb) for obb in obbs)
+        return (
+            round(penetration, 3) if penetration > 1e-3 else 0.0,
+            round(fixed / self.weights.critical, 2),
+            self._must_violations(coords),
+            float(self._objective(coords.reshape(-1))),
+        )
+
+    def _enforce_lh_principles(self, coords: np.ndarray) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        """Repair violations of the sourced placement principles (see lh_principles.py).
+
+        Runs after the collision passes, like _enforce_minimum_passage, because the
+        earlier post-processing passes move furniture without consulting the objective
+        and would undo a principle expressed only as an objective term. A repair moves
+        one item (with its paired chairs) onto an allowed wall and is only accepted if
+        it does not add any furniture overlap, door-clearance, wall or out-of-room
+        violation. `must` principles take the best safe repair; `prefer` principles
+        only take one that does not also worsen the overall objective.
+        """
+        door = lh.entrance_door(self.fixed_elements)
+        if door is None:
+            return coords, []
+        walls = lh.relative_to_absolute(door["wall"])
+        to_relative = {absolute: relative for relative, absolute in walls.items()}
+        roles = [lh.role(f, self.furnitures) for f in self.furnitures]
+        not_door = [walls["opposite_door"], walls["left_of_door"], walls["right_of_door"]]
+
+        def back(c: np.ndarray, i: int) -> str | None:
+            return lh.back_wall(self.furnitures[i], c[i, 0], c[i, 1], c[i, 3], self.room_width, self.room_depth)
+
+        def view(c: np.ndarray, i: int) -> str:
+            return lh.door_view_from_bed(self.furnitures[i], c[i, 0], c[i, 1], c[i, 3], door, self.room_width, self.room_depth)
+
+        # (principle id, level, roles, violated(coords, i), walls to try).
+        # Bed checks also require the head to stay against a wall (P0): all 26 LH
+        # plans do, so a repair that leaves the pillow end floating is not a repair.
+        checks = [
+            ("P0+P1", "must", {"bed", "single_bed"}, lambda c, i: back(c, i) in {walls["door_wall"], None}, not_door),
+            ("P4", "must", {"desk"}, lambda c, i: back(c, i) == walls["door_wall"], not_door),
+            ("P2", "prefer", {"bed", "single_bed"},
+             lambda c, i: back(c, i) in {walls["door_wall"], None} or view(c, i) != "in_front", not_door),
+            ("P3", "prefer", {"wardrobe"}, lambda c, i: back(c, i) == walls["opposite_door"],
+             [walls["door_wall"], walls["left_of_door"], walls["right_of_door"]]),
+        ]
+
+        report = []
+        for principle, level, applies_to, violated, allowed in checks:
+            for i, item_role in enumerate(roles):
+                if item_role not in applies_to or not violated(coords, i):
+                    continue
+                current_hard = self._hard_violation(coords)
+                # Settling is the expensive step; only settle the few moves that
+                # start out least tangled with the other furniture.
+                raw = sorted(self._against_wall_candidates(coords, i, allowed), key=self._max_furniture_penetration)
+                candidates = [self._settle_around(c, i) for c in raw[: self.SETTLED_REPAIRS]]
+                if item_role in {"bed", "single_bed"}:
+                    # Swapping the pillow end keeps the exact footprint, so it can
+                    # never collide with anything -- the cheapest possible fix.
+                    flipped = coords.copy()
+                    flipped[i, 3] = (flipped[i, 3] + math.pi) % (2.0 * math.pi)
+                    candidates.append(flipped)
+                safe = [
+                    candidate
+                    for candidate in candidates
+                    if not violated(candidate, i)
+                    and all(a <= b + 1e-4 for a, b in zip(self._hard_violation(candidate), current_hard))
+                ]
+                best = min(safe, key=lambda candidate: self._objective(candidate.reshape(-1)), default=None)
+                if best is not None and level == "prefer" and self._objective(best.reshape(-1)) > self._objective(coords.reshape(-1)):
+                    best = None
+                entry = {"principle": principle, "item_id": self.furnitures[i].get("id"),
+                         "from_wall": to_relative.get(back(coords, i))}
+                if best is None:
+                    report.append({**entry, "status": "unresolved"})
+                    continue
+                coords = best
+                report.append({**entry, "status": "repaired", "to_wall": to_relative.get(back(coords, i))})
+        return coords, report
+
+    def _intent_initial(self, initial: np.ndarray) -> np.ndarray:
+        """Starting candidate with every intent item rotated and pushed onto its chosen wall."""
+        coords = initial.reshape(-1, 4).copy()
+        normals = self._wall_outward_normals()
+        for i, furniture in enumerate(self.furnitures):
+            intent = furniture.get("spatial_intent")
+            if not intent or intent["keep"]:
+                continue
+            wall_idx = self.WALL_INDEX[intent["wall"]]
+            coords[i, 3] = self._snapped_theta_for_world_front(furniture, -normals[wall_idx])
+            targets = [wall_idx] + ([self.WALL_INDEX[intent["corner_wall"]]] if intent.get("corner_wall") else [])
+            for target in targets:
+                corners = self._obb_corners(
+                    coords[i, 0], coords[i, 1], float(furniture["extent"][0]), float(furniture["extent"][1]), coords[i, 3]
+                )
+                shift = float(self._distance_to_walls(corners)[target]) - self._wall_band(ABSOLUTE_WALL_NAMES[target])
+                coords[i, :2] += normals[target] * shift
+        return self._sync_paired_chairs(coords.reshape(-1), primary_only=True)
+
     def _back_wall_index(self, furniture: dict[str, Any], theta: float) -> int | None:
         prefs = furniture.get("anchor_preferences", {})
         rules = furniture.get("placement_rules", {})
@@ -311,17 +898,52 @@ class CanonicalLayoutOptimizer:
             normal = -normal
         return normal
 
+    def __getstate__(self) -> dict[str, Any]:
+        # Keyed by id(), which does not survive pickling into DE workers.
+        state = self.__dict__.copy()
+        state.pop("_wall_poly_cache", None)
+        return state
+
     def _wall_obstacle_polygon(self, wall: dict[str, Any], *, buffer: float = 0.0) -> np.ndarray:
+        """Cached: walls and room size never change after __init__. Callers must not mutate the result."""
+        cache = self.__dict__.setdefault("_wall_poly_cache", {})
+        key = (id(wall), buffer)
+        if key not in cache:
+            cache[key] = self._build_wall_obstacle_polygon(wall, buffer=buffer)
+        return cache[key]
+
+    # A scanned wall lying within this distance of the room bounding box is a
+    # boundary wall.
+    BOUNDARY_WALL_TOLERANCE_M = 0.05
+
+    def _is_boundary_wall(self, center: np.ndarray, axis: np.ndarray) -> bool:
+        tol = self.BOUNDARY_WALL_TOLERANCE_M
+        if abs(axis[1]) < 0.05:
+            return center[1] <= tol or center[1] >= self.room_depth - tol
+        if abs(axis[0]) < 0.05:
+            return center[0] <= tol or center[0] >= self.room_width - tol
+        return False
+
+    def _build_wall_obstacle_polygon(self, wall: dict[str, Any], *, buffer: float = 0.0) -> np.ndarray:
+        """Solid part of a wall that furniture must stay out of.
+
+        RoomPlan walls are planes and the room bounding box is built from them, so
+        a boundary wall's thickness lies outside the room: furniture flush with it
+        is touching the wall, not inside it. Interior walls keep their thickness
+        on both sides of the plane.
+        """
         if "center" in wall and "axis" in wall and "length" in wall:
             center = np.array(wall["center"], dtype=float)
             axis = self._normalize(wall["axis"], fallback=(1.0, 0.0))
-            normal = np.array([-axis[1], axis[0]], dtype=float)
             length = float(wall["length"])
+            start = center - axis * (length / 2.0)
+            end = center + axis * (length / 2.0)
+            if self._is_boundary_wall(center, axis):
+                outward = -self._wall_inward_normal(wall) * (max(float(wall.get("thickness", 0.1)), 0.1) + buffer)
+                return np.array([start, end, end + outward, start + outward])
+            normal = np.array([-axis[1], axis[0]], dtype=float)
             thickness = max(float(wall.get("thickness", 0.1)), 0.1) + buffer * 2.0
-            half_length = length / 2.0
             half_thickness = thickness / 2.0
-            start = center - axis * half_length
-            end = center + axis * half_length
             return np.array([
                 start + normal * half_thickness,
                 end + normal * half_thickness,
@@ -334,12 +956,12 @@ class CanonicalLayoutOptimizer:
         end = float(span["end"])
         thickness = max(float(wall.get("thickness", 0.1)), 0.1) + buffer
         if wall["wall"] == "west":
-            return np.array([[0.0, start], [thickness, start], [thickness, end], [0.0, end]])
+            return np.array([[0.0, start], [-thickness, start], [-thickness, end], [0.0, end]])
         if wall["wall"] == "east":
-            return np.array([[self.room_width, start], [self.room_width - thickness, start], [self.room_width - thickness, end], [self.room_width, end]])
+            return np.array([[self.room_width, start], [self.room_width + thickness, start], [self.room_width + thickness, end], [self.room_width, end]])
         if wall["wall"] == "south":
-            return np.array([[start, 0.0], [end, 0.0], [end, thickness], [start, thickness]])
-        return np.array([[start, self.room_depth], [end, self.room_depth], [end, self.room_depth - thickness], [start, self.room_depth - thickness]])
+            return np.array([[start, 0.0], [end, 0.0], [end, -thickness], [start, -thickness]])
+        return np.array([[start, self.room_depth], [end, self.room_depth], [end, self.room_depth + thickness], [start, self.room_depth + thickness]])
 
     def _keep_obb_inside_room(self, coords: np.ndarray, furniture: dict[str, Any]) -> np.ndarray:
         adjusted = np.array(coords, dtype=float)
@@ -492,6 +1114,8 @@ class CanonicalLayoutOptimizer:
 
             for i in range(self.num_f):
                 for j in range(i + 1, self.num_f):
+                    if self._vertically_apart(i, j):
+                        continue
                     obb_i = self._obb_corners(
                         adjusted[i, 0],
                         adjusted[i, 1],
@@ -574,7 +1198,7 @@ class CanonicalLayoutOptimizer:
             moved = False
             for i in range(self.num_f):
                 for j in range(i + 1, self.num_f):
-                    if self._is_paired_relationship(i, j, ids):
+                    if self._is_paired_relationship(i, j, ids) or self._vertically_apart(i, j):
                         continue
 
                     obb_i = self._obb_corners(
@@ -622,14 +1246,18 @@ class CanonicalLayoutOptimizer:
 
         return adjusted
 
-    def _max_furniture_penetration(self, coords: np.ndarray) -> float:
+    def _max_furniture_penetration(self, coords: np.ndarray, *, include_paired: bool = True) -> float:
+        """Worst pairwise overlap. include_paired=False ignores chairs tucked into their own desk/table."""
         max_penetration = 0.0
+        ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
         obbs = [
             self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
             for c, f in zip(coords, self.furnitures)
         ]
         for i in range(self.num_f):
             for j in range(i + 1, self.num_f):
+                if self._vertically_apart(i, j) or (not include_paired and self._is_paired_relationship(i, j, ids)):
+                    continue
                 max_penetration = max(max_penetration, self._sat_penetration(obbs[i], obbs[j]))
         return float(max_penetration)
 
@@ -697,7 +1325,7 @@ class CanonicalLayoutOptimizer:
             if np.any(zone[:, 0] < 0) or np.any(zone[:, 0] > self.room_width) or np.any(zone[:, 1] < 0) or np.any(zone[:, 1] > self.room_depth):
                 blocked = True
             for j, other in enumerate(all_obbs):
-                if j == index:
+                if j == index or self._is_wall_mounted(j):
                     continue
                 if self._sat_overlap(zone, other) > 0:
                     blocked = True
@@ -713,7 +1341,7 @@ class CanonicalLayoutOptimizer:
             total += self.weights.medium
         total += self._fixed_clearance_overlap_penalty(foot_zone, weight=self.weights.high)
         for j, other in enumerate(all_obbs):
-            if j == index:
+            if j == index or self._is_wall_mounted(j):
                 continue
             if self._sat_overlap(foot_zone, other) > 0:
                 total += self.weights.high
@@ -755,7 +1383,7 @@ class CanonicalLayoutOptimizer:
         total += self._fixed_clearance_overlap_penalty(front_zone, weight=self.weights.high)
         total += self._fixed_clearance_overlap_penalty(side_zone, weight=self.weights.medium)
         for j, other in enumerate(all_obbs):
-            if j == index:
+            if j == index or self._is_wall_mounted(j):
                 continue
             other_item = self.furnitures[j]
             is_paired_chair = other_item["type"] == "chair" and other_item.get("pair_with") == furniture.get("id")
@@ -877,7 +1505,7 @@ class CanonicalLayoutOptimizer:
         if np.any(front_zone[:, 0] < 0) or np.any(front_zone[:, 0] > self.room_width) or np.any(front_zone[:, 1] < 0) or np.any(front_zone[:, 1] > self.room_depth):
             total += self.weights.high_med
         for j, other in enumerate(all_obbs):
-            if j == index:
+            if j == index or self._is_wall_mounted(j):
                 continue
             if self._sat_overlap(front_zone, other) > 0:
                 total += self.weights.critical
@@ -886,7 +1514,7 @@ class CanonicalLayoutOptimizer:
         swing_center = coords[:2] + front * (float(furniture["extent"][1]) / 2.0)
         sweep = self._obb_corners(swing_center[0], swing_center[1], hinge_radius, hinge_radius, float(coords[3]))
         for j, other in enumerate(all_obbs):
-            if j == index:
+            if j == index or self._is_wall_mounted(j):
                 continue
             if self._sat_overlap(sweep, other) > 0:
                 total += self.weights.critical
@@ -909,7 +1537,7 @@ class CanonicalLayoutOptimizer:
                 total += weight
             total += self._fixed_clearance_overlap_penalty(zone, weight=weight)
             for j, other in enumerate(all_obbs):
-                if j == index:
+                if j == index or self._is_wall_mounted(j):
                     continue
                 if self._sat_overlap(zone, other) > 0:
                     total += self.weights.critical + self._sat_overlap(zone, other) * weight
@@ -1281,7 +1909,12 @@ class CanonicalLayoutOptimizer:
                 )
                 distances = self._distance_to_walls(corners)
                 adjacent = [idx for idx in (0, 1, 2, 3) if idx != wall_idx and (idx < 2) != (wall_idx < 2)]
-                second_idx = min(adjacent, key=lambda idx: abs(float(distances[idx]) - target_gap))
+                intent_corner = (furniture.get("spatial_intent") or {}).get("corner_wall")
+                second_idx = (
+                    self.WALL_INDEX[intent_corner]
+                    if intent_corner and self.WALL_INDEX[intent_corner] in adjacent
+                    else min(adjacent, key=lambda idx: abs(float(distances[idx]) - target_gap))
+                )
                 second_shift = float(distances[second_idx]) - target_gap
                 if abs(second_shift) > 1e-4:
                     if second_idx == 0:
@@ -1365,6 +1998,8 @@ class CanonicalLayoutOptimizer:
             ]
             for i in range(self.num_f):
                 for j in range(i + 1, self.num_f):
+                    if self._vertically_apart(i, j):
+                        continue
                     overlap = self._sat_overlap(obbs[i], obbs[j])
                     if overlap <= 1e-3:
                         continue
@@ -1932,15 +2567,23 @@ class CanonicalLayoutOptimizer:
         return coords.reshape(-1)
 
     def _floor_occupancy_mask(self, coords: np.ndarray, cell_size: float) -> tuple[np.ndarray, float]:
-        """Vectorized boolean occupancy grid over the room floor (True = covered by furniture)."""
+        """Vectorized boolean occupancy grid over the room floor (True = covered by furniture).
+
+        Wall-mounted items leave the floor under them free.
+        """
         cols = max(1, int(round(self.room_width / cell_size)))
         rows = max(1, int(round(self.room_depth / cell_size)))
-        xs = (np.arange(cols) + 0.5) * (self.room_width / cols)
-        ys = (np.arange(rows) + 0.5) * (self.room_depth / rows)
-        grid_x, grid_y = np.meshgrid(xs, ys)
+        grids = self.__dict__.setdefault("_floor_grid_cache", {})
+        if cell_size not in grids:
+            xs = (np.arange(cols) + 0.5) * (self.room_width / cols)
+            ys = (np.arange(rows) + 0.5) * (self.room_depth / rows)
+            grids[cell_size] = np.meshgrid(xs, ys)
+        grid_x, grid_y = grids[cell_size]
         occupied = np.zeros_like(grid_x, dtype=bool)
 
         for i, furniture in enumerate(self.furnitures):
+            if self._is_wall_mounted(i):
+                continue
             cx, cy, _, theta = coords[i]
             width, depth = float(furniture["extent"][0]), float(furniture["extent"][1])
             c, s = math.cos(-float(theta)), math.sin(-float(theta))
@@ -1953,23 +2596,28 @@ class CanonicalLayoutOptimizer:
         cell_area = (self.room_width / cols) * (self.room_depth / rows)
         return occupied, cell_area
 
-    def _open_floor_area(self, coords: np.ndarray, cell_size: float = 0.25) -> float:
-        """Cheap, fragmentation-agnostic open-area estimate for use inside the hot objective loop."""
+    @staticmethod
+    def _largest_region_cells(free: np.ndarray) -> int:
+        labeled, num_features = ndimage.label(free)
+        if num_features == 0:
+            return 0
+        return int(np.bincount(labeled.ravel())[1:].max())
+
+    def _largest_open_area(self, coords: np.ndarray, cell_size: float = 0.1) -> float:
+        """Area of the largest connected free-floor region.
+
+        Total free area is nearly constant (room minus furniture footprints), so
+        the objective rewards keeping the free floor in one piece instead.
+        """
         occupied, cell_area = self._floor_occupancy_mask(coords, cell_size)
-        return float(np.sum(~occupied)) * cell_area
+        return self._largest_region_cells(~occupied) * cell_area
 
     def _open_floor_report(self, coords: np.ndarray, cell_size: float = 0.1) -> dict[str, float]:
         """Post-hoc, connectivity-aware open-floor metrics for the final result only."""
-        from scipy import ndimage
-
         occupied, cell_area = self._floor_occupancy_mask(coords, cell_size)
         free = ~occupied
         total_open = float(np.sum(free)) * cell_area
-        labeled, num_features = ndimage.label(free)
-        largest_open = 0.0
-        if num_features > 0:
-            sizes = ndimage.sum(free, labeled, index=range(1, num_features + 1))
-            largest_open = float(np.max(sizes)) * cell_area
+        largest_open = self._largest_region_cells(free) * cell_area
         room_area = self.room_width * self.room_depth
         return {
             "room_area_m2": round(room_area, 3),
@@ -2003,7 +2651,7 @@ class CanonicalLayoutOptimizer:
                     other["type"] == "chair"
                     and ids.get(other.get("pair_with")) == i
                 )
-                if is_support_pair:
+                if is_support_pair or self._vertically_apart(i, j):
                     continue
 
                 penetration = self._sat_penetration(corners, obbs[j])
@@ -2022,6 +2670,8 @@ class CanonicalLayoutOptimizer:
             elif furniture["type"] == "shelf":
                 total += self._shelf_penalty(furniture, coords[i], corners, obbs, i)
 
+            total += self._intent_penalty(furniture, coords[i], corners)
+            total += self._principle_penalty(i, coords[i], corners)
             total += self._window_penalty(furniture, coords[i], corners)
             total += self._rotation_penalty(furniture, coords[i], ids, coords)
             total += self._wall_anchor_penalty(furniture, coords[i], corners)
@@ -2031,7 +2681,7 @@ class CanonicalLayoutOptimizer:
             total += self.weights.low * 2 / (center_distance + 0.2)
 
         total += self._fixed_element_penalty(obbs, coords)
-        total -= self._open_floor_area(coords) * self.weights.open_floor_reward
+        total -= self._largest_open_area(coords) * self.weights.open_region_reward
         return float(total)
 
     def optimize(
@@ -2063,8 +2713,13 @@ class CanonicalLayoutOptimizer:
                 initial.extend([center_x, center_y, center_z, rotation])
                 continue
 
-            x_bounds = center_axis_bounds(self.room_width, float(furniture["extent"][0]))
-            y_bounds = center_axis_bounds(self.room_depth, float(furniture["extent"][1]))
+            # The footprint's axis-aligned size depends on rotation, which is a
+            # search variable too; bounding by the short side lets a rotated item
+            # sit flush against any wall. _outside_room_penalty and
+            # _project_inside_room handle the rotation-dependent containment.
+            short_side = min(float(furniture["extent"][0]), float(furniture["extent"][1]))
+            x_bounds = center_axis_bounds(self.room_width, short_side)
+            y_bounds = center_axis_bounds(self.room_depth, short_side)
             bounds.extend(
                 [
                     x_bounds,
@@ -2083,6 +2738,11 @@ class CanonicalLayoutOptimizer:
         print("optimizer: wall anchor initial done", flush=True)
         support_initial = np.clip(self._chair_support_initial(wall_initial), lower_bounds, upper_bounds)
         print("optimizer: chair support initial done", flush=True)
+        seeds = [original_initial, wall_initial, support_initial]
+        principle_seeds = [np.clip(seed, lower_bounds, upper_bounds) for seed in self._principle_seeds(original_initial)]
+        seeds += principle_seeds
+        if any(furniture.get("spatial_intent") for furniture in self.furnitures):
+            seeds.append(np.clip(np.asarray(self._intent_initial(original_initial)).reshape(-1), lower_bounds, upper_bounds))
 
         if use_global:
             print(
@@ -2101,12 +2761,17 @@ class CanonicalLayoutOptimizer:
                 updating="deferred",
             )
             print("optimizer: differential evolution done", flush=True)
-            candidates = [original_initial, wall_initial, support_initial]
+            candidates = list(seeds)
             if np.isfinite(result_global.fun):
                 candidates.append(result_global.x)
+            print(
+                "optimizer: candidate objectives "
+                + ", ".join(f"{self._objective(candidate):,.0f}" for candidate in candidates),
+                flush=True,
+            )
             initial_guess = min(candidates, key=self._objective)
         else:
-            initial_guess = min((original_initial, wall_initial, support_initial), key=self._objective)
+            initial_guess = min(seeds, key=self._objective)
 
         print("optimizer: initial candidate selected", flush=True)
         result_local = minimize(
@@ -2124,17 +2789,31 @@ class CanonicalLayoutOptimizer:
         )
 
         stage_trace: list[dict[str, Any]] = []
+        # The post-processing passes below each chase one rule without consulting
+        # the objective, so a later pass can undo a better layout an earlier one
+        # produced. Every stage is kept and the best by _layout_rank is shipped.
+        snapshots: list[tuple[str, np.ndarray]] = []
 
         def _record_stage(name: str, arr: np.ndarray) -> None:
-            coords = arr.reshape(-1, 4) if arr.ndim == 1 else arr
+            coords = np.array(arr, dtype=float).reshape(-1, 4)
+            for i in range(self.num_f):
+                coords[i, 3] = self._snap_theta(float(coords[i, 3]))
+            rank = self._layout_rank(coords)
+            snapshots.append((name, coords))
             stage_trace.append(
                 {
                     "stage": name,
                     "max_penetration_m": round(float(self._max_furniture_penetration(coords)), 4),
+                    "rank": [rank[0], rank[1], rank[2], round(rank[3], 1)],
                 }
             )
 
         print("optimizer: post-processing start", flush=True)
+        # Principle seeds are complete layouts on their own (no overlap, nothing
+        # in a door swing, must principles kept), so they compete directly with
+        # whatever the search and post-processing produce.
+        for k, seed in enumerate(principle_seeds):
+            _record_stage(f"principle_seed_{k}", seed)
         _record_stage("local_minimize", result_local.x)
         optimized_x = self._wall_anchored_initial(result_local.x)
         optimized_x = self._sync_paired_chairs(optimized_x)
@@ -2216,8 +2895,26 @@ class CanonicalLayoutOptimizer:
                 break
         _record_stage("final_collision_recheck", optimized)
 
-        optimized = self._enforce_minimum_passage(optimized)
-        _record_stage("minimum_passage_widening", optimized)
+        selected_stage, optimized = min(snapshots, key=lambda snapshot: self._layout_rank(snapshot[1]))
+        optimized = optimized.copy()
+
+        # The last two passes act on the selected layout and are kept only if
+        # they do not make it rank worse.
+        repaired, lh_report = self._enforce_lh_principles(optimized)
+        if self._layout_rank(repaired) <= self._layout_rank(optimized):
+            optimized = repaired
+            if any(entry["status"] == "repaired" for entry in lh_report):
+                selected_stage += "+lh_principles"
+        else:
+            lh_report = [{**entry, "status": "discarded"} if entry["status"] == "repaired" else entry for entry in lh_report]
+        _record_stage("lh_principles", optimized)
+
+        widened = self._enforce_minimum_passage(optimized)
+        if self._layout_rank(widened) <= self._layout_rank(optimized):
+            if not np.allclose(widened, optimized):
+                selected_stage += "+minimum_passage"
+            optimized = widened
+        _record_stage("minimum_passage_widening", widened)
 
         # Every scanned room is, by construction, a real arrangement that
         # already exists without furniture colliding (at worst it has the
@@ -2228,8 +2925,10 @@ class CanonicalLayoutOptimizer:
         # furniture where it was scanned, ship the untouched scanned layout
         # instead of a moved-but-worse one.
         original_coords = original_initial.reshape(-1, 4)
-        original_penetration = self._max_furniture_penetration(original_coords)
-        fallback_to_scan = self._max_furniture_penetration(optimized) > original_penetration + 1e-4
+        # A chair tucked into its own desk is an allowed overlap; counting it would
+        # let the scan's tucked chair excuse a real collision elsewhere.
+        original_penetration = self._max_furniture_penetration(original_coords, include_paired=False)
+        fallback_to_scan = self._max_furniture_penetration(optimized, include_paired=False) > original_penetration + 1e-4
         if fallback_to_scan:
             optimized = original_coords.copy()
             _record_stage("fallback_to_scanned_layout", optimized)
@@ -2255,7 +2954,9 @@ class CanonicalLayoutOptimizer:
             },
             "floor_efficiency": self._open_floor_report(optimized),
             "stage_trace": stage_trace,
+            "selected_stage": "scanned_layout" if fallback_to_scan else selected_stage,
             "fallback_to_scanned_layout": fallback_to_scan,
+            "lh_principles": lh_report,
         }
         print("optimizer: output built", flush=True)
         return output
