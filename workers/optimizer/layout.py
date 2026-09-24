@@ -47,8 +47,11 @@ class PenaltyWeights:
     rotation_snap: float = 25_000.0
     wall_anchor: float = 15_000.0
     body_collision: float = 50_000_000.0
-    # Per m2 of the largest connected free-floor region.
+    # Per m2 of usable open floor (see CanonicalLayoutOptimizer._usable_open_area).
     open_region_reward: float = 2_000.0
+    # Furniture inside the 0.8m in front of a shelf (placement_rules default in
+    # server/services/transform/problem.py, no cited source).
+    shelf_front_blocked: float = 1_000_000.0
 
 
 class CanonicalLayoutOptimizer:
@@ -441,8 +444,11 @@ class CanonicalLayoutOptimizer:
     SETTLED_REPAIRS = 3
     SEED_COMBOS = 6
 
-    SEED_SEARCH_CHECKS = 20000
-    SEED_SEARCH_SOLUTIONS = 40
+    # Clean layouts enumerated at most, screened on the soft tiers, and scored
+    # on the full objective.
+    SEED_ENUMERATION_LIMIT = 20000
+    SEED_SCREENED = 2000
+    SEED_SCORED = 60
 
     def _place_chairs_in_front(self, coords: np.ndarray, support: int, chairs: list[int]) -> None:
         """Put a support's paired chairs at its front edge, spread along its width."""
@@ -473,13 +479,20 @@ class CanonicalLayoutOptimizer:
                     break
                 coords[chair, :2] += front * excess
 
-    def _search_clean_layouts(self, base: np.ndarray, walls: dict[str, str], roles: list[str]) -> list[np.ndarray]:
-        """Exhaustively try wall placements for every movable item (bounded by a check budget).
+    # Roles that may sit flush beside a larger piece (e.g. a drawer unit beside
+    # a desk, a desk beside the bed head as in LH P6), and roles they may join.
+    ATTACHABLE_ROLES = {"low_storage", "wardrobe", "table", "desk"}
+    ANCHOR_ROLES = {"bed", "single_bed", "desk", "table", "low_storage", "wardrobe"}
 
-        Returns layouts with no floor-furniture overlap, nothing in a door swing,
-        wall or outside the room, the bed head on a non-door wall and the desk off
-        the door wall -- the kind of arrangement the LH unit plans show. Items keep
-        their backs to a wall; wall-mounted items stay put as obstacles.
+    def _search_clean_layouts(self, base: np.ndarray, walls: dict[str, str], roles: list[str]) -> list[np.ndarray]:
+        """Enumerate clean placements for every movable item and return the best few.
+
+        Each item goes with its back against a wall -- at a corner, mid-wall, or
+        flush beside a larger item already against that wall -- and paired chairs
+        follow their desk. A clean layout has no floor-furniture overlap, nothing
+        in a door swing, wall or outside the room, the bed head on a non-door wall
+        and the desk off the door wall -- the kind of arrangement the LH unit
+        plans show. Wall-mounted items stay put as obstacles.
         """
         furnitures = self.furnitures
         ids = {f["id"]: i for i, f in enumerate(furnitures)}
@@ -489,60 +502,153 @@ class CanonicalLayoutOptimizer:
                 chairs_of.setdefault(ids[f["pair_with"]], []).append(j)
         paired_chairs = {chair for chairs in chairs_of.values() for chair in chairs}
         fixed = {j for j, f in enumerate(furnitures) if f.get("pinned")}
-        order = sorted(
-            (j for j in range(self.num_f) if j not in fixed and j not in paired_chairs),
-            key=lambda j: -float(furnitures[j]["extent"][0]) * float(furnitures[j]["extent"][1]),
-        )
 
-        def allowed(j: int) -> list[str]:
+        def area(j: int) -> float:
+            return float(furnitures[j]["extent"][0]) * float(furnitures[j]["extent"][1])
+
+        order = sorted((j for j in range(self.num_f) if j not in fixed and j not in paired_chairs), key=lambda j: -area(j))
+
+        def allowed(j: int) -> set[str]:
             if roles[j] in {"bed", "single_bed", "desk"}:
-                return [wall for wall in ABSOLUTE_WALL_NAMES if wall != walls["door_wall"]]
-            return list(ABSOLUTE_WALL_NAMES)
-
-        poses = {j: [pose for wall in allowed(j) for pose in self._wall_poses(j, wall)] for j in order}
+                return {wall for wall in ABSOLUTE_WALL_NAMES if wall != walls["door_wall"]}
+            return set(ABSOLUTE_WALL_NAMES)
 
         def paired(a: int, b: int) -> bool:
             return a in chairs_of.get(b, []) or b in chairs_of.get(a, []) or any(
                 a in chairs and b in chairs for chairs in chairs_of.values()
             )
 
-        def fits(coords: np.ndarray, placed: set[int], group: list[int]) -> bool:
-            for a in group:
-                obb_a = self._obb_corners(coords[a, 0], coords[a, 1], float(furnitures[a]["extent"][0]), float(furnitures[a]["extent"][1]), coords[a, 3])
-                if self._fixed_element_penalty([obb_a], coords) > 0 or self._outside_room_penalty(obb_a) > 0:
-                    return False
-                for b in placed:
-                    if b == a or paired(a, b) or self._vertically_apart(a, b):
+        def obb(j: int, row: np.ndarray) -> np.ndarray:
+            return self._obb_corners(row[0], row[1], float(furnitures[j]["extent"][0]), float(furnitures[j]["extent"][1]), row[3])
+
+        def half_extent(j: int, theta: float, axis: np.ndarray) -> float:
+            projected = self._obb_corners(0.0, 0.0, float(furnitures[j]["extent"][0]), float(furnitures[j]["extent"][1]), theta) @ axis
+            return float(projected.max() - projected.min()) / 2.0
+
+        def with_chairs(j: int, x: float, y: float, theta: float) -> dict[int, np.ndarray]:
+            trial = base.copy()
+            trial[j, 0], trial[j, 1], trial[j, 3] = x, y, theta
+            if chairs_of.get(j):
+                self._place_chairs_in_front(trial, j, chairs_of[j])
+            return {member: trial[member].copy() for member in [j] + chairs_of.get(j, [])}
+
+        def valid(rows: dict[int, np.ndarray]) -> bool:
+            trial = base.copy()
+            for member, row in rows.items():
+                trial[member] = row
+            return all(
+                self._fixed_element_penalty([obb(member, row)], trial) == 0
+                and self._outside_room_penalty(obb(member, row)) == 0
+                and all(
+                    paired(member, b) or self._vertically_apart(member, b)
+                    or self._sat_penetration(obb(member, row), obb(b, base[b])) <= 1e-3
+                    for b in fixed
+                )
+                for member, row in rows.items()
+            )
+
+        # Candidate poses per item: (rows for the item and its chairs, wall its
+        # back is on, (anchor item, anchor pose index) or None).
+        candidates: dict[int, list[tuple[dict[int, np.ndarray], str, tuple[int, int] | None]]] = {}
+        for rank_j, j in enumerate(order):
+            entries = []
+            for wall in sorted(allowed(j)):
+                for x, y, theta in self._wall_poses(j, wall):
+                    rows = with_chairs(j, x, y, theta)
+                    if valid(rows):
+                        entries.append((rows, wall, None))
+            if roles[j] in self.ATTACHABLE_ROLES:
+                for a in order[:rank_j]:
+                    if roles[a] not in self.ANCHOR_ROLES:
                         continue
-                    obb_b = self._obb_corners(coords[b, 0], coords[b, 1], float(furnitures[b]["extent"][0]), float(furnitures[b]["extent"][1]), coords[b, 3])
-                    if self._sat_penetration(obb_a, obb_b) > 1e-3:
-                        return False
-            return True
+                    for pa, (anchor_rows, wall, anchor_of_a) in enumerate(candidates[a]):
+                        if anchor_of_a is not None or wall not in allowed(j):
+                            continue
+                        anchor = anchor_rows[a]
+                        front = self._world_front(furnitures[a], float(anchor[3]))
+                        lateral = np.array([-front[1], front[0]])
+                        theta = self._snapped_theta_for_world_front(furnitures[j], front)
+                        # Backs aligned on the anchor's wall, sides touching.
+                        back_line = anchor[:2] - front * half_extent(a, float(anchor[3]), front)
+                        reach = half_extent(a, float(anchor[3]), lateral) + half_extent(j, theta, lateral)
+                        for side in (1.0, -1.0):
+                            center = back_line + front * half_extent(j, theta, front) + lateral * side * reach
+                            rows = with_chairs(j, float(center[0]), float(center[1]), theta)
+                            if valid(rows):
+                                entries.append((rows, wall, (a, pa)))
+            candidates[j] = entries
 
-        solutions: list[np.ndarray] = []
-        # A work budget, not a time limit, so the result does not depend on machine speed or load.
-        budget = [self.SEED_SEARCH_CHECKS]
+        # Every pose is a multiple of 90 degrees, so footprints are axis-aligned
+        # boxes and all pose pairs can be checked at once.
+        boxes: dict[tuple[int, int], np.ndarray] = {}
+        for j in order:
+            members = [j] + chairs_of.get(j, [])
+            for member in members:
+                corner_sets = [obb(member, rows[member]) for rows, _, _ in candidates[j]]
+                boxes[(j, member)] = np.array(
+                    [[c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max()] for c in corner_sets]
+                ).reshape(-1, 4)
 
-        def search(k: int, coords: np.ndarray, placed: set[int]) -> None:
-            if len(solutions) >= self.SEED_SEARCH_SOLUTIONS or budget[0] <= 0:
-                return
+        compatible: dict[tuple[int, int], np.ndarray] = {}
+        for ia, a in enumerate(order):
+            for b in order[ia + 1:]:
+                table = np.ones((len(candidates[a]), len(candidates[b])), dtype=bool)
+                for ma in [a] + chairs_of.get(a, []):
+                    for mb in [b] + chairs_of.get(b, []):
+                        if paired(ma, mb) or self._vertically_apart(ma, mb):
+                            continue
+                        A, B = boxes[(a, ma)][:, None, :], boxes[(b, mb)][None, :, :]
+                        overlap_x = np.minimum(A[..., 2], B[..., 2]) - np.maximum(A[..., 0], B[..., 0])
+                        overlap_y = np.minimum(A[..., 3], B[..., 3]) - np.maximum(A[..., 1], B[..., 1])
+                        table &= ~((overlap_x > 1e-3) & (overlap_y > 1e-3))
+                for pb, (_, _, anchor_of_b) in enumerate(candidates[b]):
+                    if anchor_of_b is not None and anchor_of_b[0] == a:
+                        keep = table[anchor_of_b[1], pb]
+                        table[:, pb] = False
+                        table[anchor_of_b[1], pb] = keep
+                compatible[(a, b)] = table
+
+        # Enumerate clean combinations as pose indices. Each branch gets a fair
+        # share of the cap (unused share passes on to later siblings), so a
+        # capped enumeration still spans different arrangements instead of
+        # variations on the first poses of the largest items.
+        combos: list[tuple[int, ...]] = []
+
+        def search(k: int, chosen: list[int], quota: int) -> int:
             if k == len(order):
-                solutions.append(coords.copy())
-                return
-            j = order[k]
-            for x, y, theta in poses[j]:
-                trial = coords.copy()
-                trial[j, 0], trial[j, 1], trial[j, 3] = x, y, theta
-                group = [j] + chairs_of.get(j, [])
-                if chairs_of.get(j):
-                    self._place_chairs_in_front(trial, j, chairs_of[j])
-                budget[0] -= 1
-                if fits(trial, placed, group):
-                    search(k + 1, trial, placed | set(group))
+                combos.append(tuple(chosen))
+                return 1
+            b = order[k]
+            feasible = np.ones(len(candidates[b]), dtype=bool)
+            for ia, pa in enumerate(chosen):
+                feasible &= compatible[(order[ia], b)][pa]
+            options = np.flatnonzero(feasible)
+            found = 0
+            for n, pb in enumerate(options):
+                remaining = quota - found
+                if remaining <= 0:
+                    break
+                found += search(k + 1, chosen + [int(pb)], max(1, remaining // (len(options) - n)))
+            return found
 
-        search(0, base.copy(), set(fixed))
-        solutions.sort(key=lambda coords: self._objective(coords.reshape(-1)))
-        return [coords.reshape(-1) for coords in solutions[: self.PRINCIPLE_SEEDS]]
+        search(0, [], self.SEED_ENUMERATION_LIMIT)
+
+        # Every layout here already passes the hard and must tiers of
+        # _layout_rank, so screen an evenly spaced sample on the cheap soft tiers
+        # and score the objective only for the best of those.
+        if len(combos) > self.SEED_SCREENED:
+            picks = sorted({int(round(v)) for v in np.linspace(0, len(combos) - 1, self.SEED_SCREENED)})
+            combos = [combos[i] for i in picks]
+        solutions: list[np.ndarray] = []
+        for combo in combos:
+            coords = base.copy()
+            for j, pose in zip(order, combo):
+                for member, row in candidates[j][pose][0].items():
+                    coords[member] = row
+            solutions.append(coords)
+        screened = sorted(((self._soft_rank(coords), k) for k, coords in enumerate(solutions)))[: self.SEED_SCORED]
+        best = sorted(screened, key=lambda item: (item[0], self._objective(solutions[item[1]].reshape(-1))))
+        return [solutions[k].reshape(-1) for _, k in best[: self.PRINCIPLE_SEEDS]]
 
     def _principle_seeds(self, initial: np.ndarray) -> list[np.ndarray]:
         """Starting layouts built directly from the sourced principles.
@@ -691,35 +797,78 @@ class CanonicalLayoutOptimizer:
                 count += 1
         return count
 
-    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, float]:
+    def _collision_penetration(self, coords: np.ndarray) -> float:
+        """Worst real furniture overlap.
+
+        A chair tucked under its own desk/table is not a collision as long as it
+        stays within _allowed_chair_support_penetration; only the excess counts.
+        """
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        penetration = self._max_furniture_penetration(coords, include_paired=False)
+        ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
+        for chair_idx, chair in enumerate(self.furnitures):
+            support_idx = ids.get(chair.get("pair_with"))
+            if chair["type"] != "chair" or support_idx is None or self.furnitures[support_idx]["type"] not in {"desk", "table"}:
+                continue
+            support = self.furnitures[support_idx]
+            chair_obb = self._obb_corners(coords[chair_idx, 0], coords[chair_idx, 1], float(chair["extent"][0]), float(chair["extent"][1]), coords[chair_idx, 3])
+            support_obb = self._obb_corners(coords[support_idx, 0], coords[support_idx, 1], float(support["extent"][0]), float(support["extent"][1]), coords[support_idx, 3])
+            allowed = self._allowed_chair_support_penetration(chair, coords[chair_idx], support, coords[support_idx])
+            penetration = max(penetration, self._sat_penetration(chair_obb, support_obb) - allowed)
+        return float(penetration)
+
+    def _prefer_violations(self, coords: np.ndarray) -> int:
+        """Number of sourced `prefer` principles broken: P2 per bed, P3 per wardrobe."""
+        context = self._lh_context()
+        if context is None:
+            return 0
+        walls, door, roles = context
+        count = 0
+        for i, item_role in enumerate(roles):
+            furniture = self.furnitures[i]
+            if item_role in {"bed", "single_bed"}:
+                view = lh.door_view_from_bed(furniture, coords[i, 0], coords[i, 1], coords[i, 3], door, self.room_width, self.room_depth)
+                count += view != "in_front"
+            elif item_role == "wardrobe":
+                back = lh.back_wall(furniture, coords[i, 0], coords[i, 1], coords[i, 3], self.room_width, self.room_depth)
+                count += back == walls["opposite_door"]
+        return count
+
+    # Usable open area is compared in bands this wide so grid noise does not
+    # override everything ranked after it.
+    USABLE_AREA_BAND_M2 = 0.25
+    # Minimum width of floor counted as usable; None uses the LH passage width.
+    USABLE_OPEN_WIDTH_M: float | None = None
+
+    def _soft_rank(self, coords: np.ndarray) -> tuple[int, float]:
+        """Sourced soft criteria, best first: prefer principles, then usable open floor."""
+        band = math.floor(self._usable_open_area(coords) / self.USABLE_AREA_BAND_M2)
+        return self._prefer_violations(coords), -band * self.USABLE_AREA_BAND_M2
+
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, float]:
         """Tiered comparison key for finished layouts; lower is better.
 
-        Hard requirements are compared first and are never traded for a better
-        objective: furniture overlap (a chair tucked into its own desk is allowed),
-        then door-clearance / wall / out-of-room violations, then broken `must`
-        principles. The weighted objective only decides between layouts that tie
-        on all of those.
+        Each tier is compared only when every tier before it ties, so nothing
+        below can buy its way past a tier above with a large weight:
+        1. furniture overlap (a chair tucked into its own desk within the
+           allowance is fine), 2. door-clearance / wall / out-of-room
+        violations, 3. broken `must` principles, 4. broken `prefer`
+        principles, 5. usable open floor (LH passage width, in bands), and
+        6. the weighted objective, which still holds the older unsourced
+        clearance rules.
         """
         coords = np.asarray(coords, dtype=float).reshape(-1, 4)
         obbs = [
             self._obb_corners(c[0], c[1], float(f["extent"][0]), float(f["extent"][1]), c[3])
             for c, f in zip(coords, self.furnitures)
         ]
-        penetration = self._max_furniture_penetration(coords, include_paired=False)
-        # A chair may tuck under its own desk/table only as far as
-        # _allowed_chair_support_penetration permits.
-        ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
-        for chair_idx, chair in enumerate(self.furnitures):
-            support_idx = ids.get(chair.get("pair_with"))
-            if chair["type"] != "chair" or support_idx is None or self.furnitures[support_idx]["type"] not in {"desk", "table"}:
-                continue
-            allowed = self._allowed_chair_support_penetration(chair, coords[chair_idx], self.furnitures[support_idx], coords[support_idx])
-            penetration = max(penetration, self._sat_penetration(obbs[chair_idx], obbs[support_idx]) - allowed)
+        penetration = self._collision_penetration(coords)
         fixed = self._fixed_element_penalty(obbs, coords) + sum(self._outside_room_penalty(obb) for obb in obbs)
         return (
             round(penetration, 3) if penetration > 1e-3 else 0.0,
             round(fixed / self.weights.critical, 2),
             self._must_violations(coords),
+            *self._soft_rank(coords),
             float(self._objective(coords.reshape(-1))),
         )
 
@@ -1532,7 +1681,10 @@ class CanonicalLayoutOptimizer:
         drawer_zone, _ = self._activity_area(furniture, coords, depth_override=drawer_clearance)
         front_zone, _ = self._activity_area(furniture, coords, depth_override=front_clearance)
 
-        for zone, weight in ((drawer_zone, self.weights.high), (front_zone, self.weights.high_med)):
+        for zone, weight, blocked in (
+            (drawer_zone, self.weights.high, self.weights.critical),
+            (front_zone, self.weights.high_med, self.weights.shelf_front_blocked),
+        ):
             if np.any(zone[:, 0] < 0) or np.any(zone[:, 0] > self.room_width) or np.any(zone[:, 1] < 0) or np.any(zone[:, 1] > self.room_depth):
                 total += weight
             total += self._fixed_clearance_overlap_penalty(zone, weight=weight)
@@ -1540,7 +1692,7 @@ class CanonicalLayoutOptimizer:
                 if j == index or self._is_wall_mounted(j):
                     continue
                 if self._sat_overlap(zone, other) > 0:
-                    total += self.weights.critical + self._sat_overlap(zone, other) * weight
+                    total += blocked + self._sat_overlap(zone, other) * weight
 
         wall_distances = self._distance_to_walls(corners)
         if min(wall_distances) < 0.05 and sum(distance < 0.12 for distance in wall_distances) >= 2:
@@ -2603,14 +2755,30 @@ class CanonicalLayoutOptimizer:
             return 0
         return int(np.bincount(labeled.ravel())[1:].max())
 
-    def _largest_open_area(self, coords: np.ndarray, cell_size: float = 0.1) -> float:
-        """Area of the largest connected free-floor region.
+    def _usable_open_area(self, coords: np.ndarray, cell_size: float = 0.1) -> float:
+        """Largest connected floor area a person can move around in.
 
-        Total free area is nearly constant (room minus furniture footprints), so
-        the objective rewards keeping the free floor in one piece instead.
+        Only floor at least the LH passage width (Anthropometrics.
+        furniture_passage_recommended) wide counts: the union of every
+        passage-width disk that fits between furniture and walls. Total free
+        area is nearly constant (room minus furniture footprints) and a
+        connected-region measure also counts narrow gaps, so neither tells
+        gathered open space from space split up by furniture.
         """
         occupied, cell_area = self._floor_occupancy_mask(coords, cell_size)
-        return self._largest_region_cells(~occupied) * cell_area
+        free = ~occupied
+        # Walls count as obstacles: pad the grid with occupied cells.
+        clearance = ndimage.distance_transform_edt(np.pad(free, 1, constant_values=False))[1:-1, 1:-1]
+        radius = (self.USABLE_OPEN_WIDTH_M or self.body.furniture_passage_recommended) / 2.0 / cell_size
+        # Cell-centre distances overstate clearance by half a cell.
+        centers = clearance >= radius + 0.5
+        disks = self.__dict__.setdefault("_disk_cache", {})
+        if (cell_size, radius) not in disks:
+            k = int(math.ceil(radius))
+            yy, xx = np.mgrid[-k : k + 1, -k : k + 1]
+            disks[(cell_size, radius)] = (xx * xx + yy * yy) <= radius * radius
+        usable = ndimage.binary_dilation(centers, structure=disks[(cell_size, radius)]) & free
+        return self._largest_region_cells(usable) * cell_area
 
     def _open_floor_report(self, coords: np.ndarray, cell_size: float = 0.1) -> dict[str, float]:
         """Post-hoc, connectivity-aware open-floor metrics for the final result only."""
@@ -2624,6 +2792,7 @@ class CanonicalLayoutOptimizer:
             "open_floor_area_m2": round(total_open, 3),
             "open_floor_ratio": round(total_open / room_area, 4) if room_area > 0 else 0.0,
             "largest_open_region_m2": round(largest_open, 3),
+            "usable_open_area_m2": round(self._usable_open_area(coords), 3),
         }
 
     def _objective(self, x: np.ndarray) -> float:
@@ -2681,7 +2850,7 @@ class CanonicalLayoutOptimizer:
             total += self.weights.low * 2 / (center_distance + 0.2)
 
         total += self._fixed_element_penalty(obbs, coords)
-        total -= self._largest_open_area(coords) * self.weights.open_region_reward
+        total -= self._usable_open_area(coords) * self.weights.open_region_reward
         return float(total)
 
     def optimize(
@@ -2769,9 +2938,9 @@ class CanonicalLayoutOptimizer:
                 + ", ".join(f"{self._objective(candidate):,.0f}" for candidate in candidates),
                 flush=True,
             )
-            initial_guess = min(candidates, key=self._objective)
+            initial_guess = min(candidates, key=self._layout_rank)
         else:
-            initial_guess = min(seeds, key=self._objective)
+            initial_guess = min(seeds, key=self._layout_rank)
 
         print("optimizer: initial candidate selected", flush=True)
         result_local = minimize(
@@ -2804,7 +2973,7 @@ class CanonicalLayoutOptimizer:
                 {
                     "stage": name,
                     "max_penetration_m": round(float(self._max_furniture_penetration(coords)), 4),
-                    "rank": [rank[0], rank[1], rank[2], round(rank[3], 1)],
+                    "rank": [*rank[:5], round(rank[5], 1)],
                 }
             )
 
@@ -2946,7 +3115,10 @@ class CanonicalLayoutOptimizer:
         output["optimization"] = {
             "objective_value": round(float(result_local.fun), 3),
             "solver": "differential_evolution + SLSQP",
-            "remaining_collision_penetration_m": round(self._max_furniture_penetration(optimized), 4),
+            # Real collisions only; a chair tucked under its own desk within the
+            # allowance is reported separately (see _collision_penetration).
+            "remaining_collision_penetration_m": round(self._collision_penetration(optimized), 4),
+            "max_overlap_including_tucked_chairs_m": round(self._max_furniture_penetration(optimized), 4),
             "anthropometrics_m": {
                 "shoulder_width": self.body.shoulder_width,
                 "sitting_popliteal": self.body.sitting_popliteal,
