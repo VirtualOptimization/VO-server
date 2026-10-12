@@ -43,6 +43,7 @@ from server.schemas.room_view import (
     VersionDetailResponse,
 )
 from server.schemas.scan import VersionAssetsResponse
+from server.services.display_colors import backfill_layout_colors
 from shared.db import SessionLocal
 from shared.models.furniture_model import FurnitureModel
 from shared.models.room import Room
@@ -330,6 +331,11 @@ async def get_room_version_detail(
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
         owner_segment = _user_s3_segment(version.room.user)
+        ios_key = _key_from_s3_uri(version.s3_json_url)
+        unity_key = _key_from_s3_uri(_unity_layout_uri(version))
+        if unity_key and await head_object(unity_key) is None:
+            unity_key = None
+        await backfill_layout_colors(ios_key, unity_key)
         prefixes = await _resolve_prefixes(str(room_id), owner_segment)
         if prefixes is None:
             return _to_version_detail_response(version)
@@ -523,6 +529,7 @@ async def get_origin_assets(room_id: int, current_user: User = Depends(get_curre
         empty_exists = await head_object(empty_key) is not None
         glb_exists = await head_object(glb_key) is not None
         unity_data_exists = await head_object(unity_data_key) is not None
+        await backfill_layout_colors(data_key, unity_data_key if unity_data_exists else None)
 
         if not full_exists and not empty_exists and not glb_exists:
             raise HTTPException(status_code=404, detail="방 껍데기 GLB 또는 Room.usdz를 찾을 수 없습니다.")
@@ -577,6 +584,7 @@ async def get_optimized_assets(room_id: int, current_user: User = Depends(get_cu
         if await head_object(data_key) is None:
             raise HTTPException(status_code=404, detail="최적화 데이터가 아직 없습니다.")
         unity_data_exists = await head_object(unity_data_key) is not None
+        await backfill_layout_colors(data_key, unity_data_key if unity_data_exists else None)
 
         full_key  = f"{raw}/Room.usdz"
         empty_key = f"{raw}/Room_empty.usdz"

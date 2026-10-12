@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from server.services.display_colors import ensure_display_colors
 import math
 from typing import Any
 
@@ -73,6 +74,7 @@ def fix_unity_transforms_from_rotation(room_data: dict[str, Any]) -> dict[str, A
     rotation[] the source of truth before saving or converting to RoomPlan.
     """
     data = json.loads(json.dumps(room_data))
+    ensure_display_colors(data)
     for item in data.get("objects", []):
         yaw = _yaw_from_rotation(item.get("rotation"))
         if yaw is None:
@@ -185,6 +187,7 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
     """Return a RoomPlan-like payload aligned to a Unity-friendly +X/+Z floor frame."""
     floor_theta, floor_y, min_x, min_z = _floor_normalization_context(room_data)
     normalized = json.loads(json.dumps(room_data))
+    ensure_display_colors(normalized)
     normalized["coordinateSystem"] = "Unity normalized RoomPlan (Y-up, meters, floor aligned to +X/+Z)"
     _attach_model_keys(normalized)
 
@@ -222,6 +225,7 @@ def normalize_roomplan_for_unity(room_data: dict[str, Any]) -> dict[str, Any]:
 def normalize_roomplan_for_ios_view(room_data: dict[str, Any]) -> dict[str, Any]:
     """Return an iOS RoomPlan-frame payload without Unity floor normalization."""
     payload = json.loads(json.dumps(room_data))
+    ensure_display_colors(payload)
     if isinstance(payload.get("unityNormalization"), dict):
         return denormalize_roomplan_from_unity(payload)
 
@@ -254,6 +258,7 @@ def denormalize_roomplan_from_unity(room_data: dict[str, Any]) -> dict[str, Any]
     min_z = float(context["minZ"])
 
     denormalized = json.loads(json.dumps(room_data))
+    ensure_display_colors(denormalized)
     denormalized["coordinateSystem"] = "RoomPlan"
     denormalized.pop("unityNormalization", None)
 
