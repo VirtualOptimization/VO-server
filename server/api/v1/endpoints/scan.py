@@ -274,6 +274,9 @@ async def _create_origin_unity_json(raw_prefix: str) -> str:
     room_data_key = f"{raw_prefix}/room_data.json"
     unity_room_data_key = f"{raw_prefix}/room_data.unity.json"
     room_data = await get_json(room_data_key)
+    from server.services.display_colors import ensure_display_colors
+    if ensure_display_colors(room_data):
+        await upload_json(room_data_key, room_data)
     unity_room_data = normalize_roomplan_for_unity(room_data)
     await upload_json(unity_room_data_key, unity_room_data)
     return unity_room_data_key

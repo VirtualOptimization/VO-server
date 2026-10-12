@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from server.services.display_colors import ensure_display_colors
 import math
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,7 @@ def export_optimized_layout_to_roomplan(
 ) -> dict[str, Any]:
     """Return a RoomPlan-like payload with optimized object poses applied."""
     result = json.loads(json.dumps(raw_roomplan))
+    ensure_display_colors(result)
     floor_theta, floor_y, min_x, min_z = _extract_floor_context(raw_roomplan)
 
     optimized_items = {

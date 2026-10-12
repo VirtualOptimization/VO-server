@@ -22,6 +22,7 @@ from server.schemas.room_view import (
     UserEditedVersionRenameRequest,
     UserEditedVersionRenameResponse,
 )
+from server.services.display_colors import ensure_display_colors
 from server.services.transform.unity_roomplan import (
     denormalize_roomplan_from_unity,
     fix_unity_transforms_from_rotation,
@@ -375,6 +376,47 @@ def _version_s3_prefix(version: Version) -> str | None:
     return f"{prefix}/"
 
 
+async def build_edited_layouts(
+    parent_version: Version,
+    ios_objects: list[dict] | None,
+    objects: list[dict] | None,
+) -> tuple[dict, dict]:
+    """Apply edited furniture poses to a parent version.
+
+    iOS sends `ios_objects` (RoomPlan frame), Unity sends `objects` (Unity frame).
+    Returns (iOS RoomPlan layout, Unity layout), each derived from the other when
+    only one side was edited.
+    """
+    ios_layout = await _load_json_from_s3_uri(parent_version.s3_json_url, "iOS")
+    ensure_display_colors(ios_layout)
+
+    if ios_objects is not None:
+        if ios_objects:
+            ios_layout = normalize_roomplan_for_ios_view(
+                _patch_objects(ios_layout, ios_objects, "iOS", "roomplan")
+            )
+        if objects:
+            unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
+            unity_layout = _patch_objects(unity_layout, objects, "Unity", "unity")
+            unity_layout = fix_unity_transforms_from_rotation(unity_layout)
+        elif ios_objects:
+            unity_layout = normalize_roomplan_for_unity(ios_layout)
+            unity_layout = fix_unity_transforms_from_rotation(unity_layout)
+        else:
+            unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
+    else:
+        unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
+        if objects:
+            ensure_display_colors(unity_layout, ios_layout)
+            unity_layout = _patch_objects(unity_layout, objects, "Unity", "unity")
+            unity_layout = fix_unity_transforms_from_rotation(unity_layout)
+            ios_layout = denormalize_roomplan_from_unity(unity_layout)
+            ios_layout = normalize_roomplan_for_ios_view(ios_layout)
+    ensure_display_colors(ios_layout)
+    ensure_display_colors(unity_layout, ios_layout)
+    return ios_layout, unity_layout
+
+
 # ── POST /rooms/{room_id}/versions ───────────────────────────────────────────
 # Unity에서 수정한 가구 배치를 room_id 아래 새 USER_EDITED 버전으로 저장
 
@@ -439,29 +481,9 @@ async def create_user_edited_version(
             )
 
         version_name = payload.version_name or f"User Edit {next_version_no}"
-        ios_layout = await _load_json_from_s3_uri(parent_version.s3_json_url, "iOS")
-
-        if payload.ios_objects is not None:
-            if payload.ios_objects:
-                ios_layout = normalize_roomplan_for_ios_view(
-                    _patch_objects(ios_layout, payload.ios_objects, "iOS", "roomplan")
-                )
-            if payload.objects:
-                unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
-                unity_layout = _patch_objects(unity_layout, payload.objects, "Unity", "unity")
-                unity_layout = fix_unity_transforms_from_rotation(unity_layout)
-            elif payload.ios_objects:
-                unity_layout = normalize_roomplan_for_unity(ios_layout)
-                unity_layout = fix_unity_transforms_from_rotation(unity_layout)
-            else:
-                unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
-        else:
-            unity_layout = await _load_json_from_s3_uri(_unity_layout_uri(parent_version), "Unity")
-            if payload.objects:
-                unity_layout = _patch_objects(unity_layout, payload.objects, "Unity", "unity")
-                unity_layout = fix_unity_transforms_from_rotation(unity_layout)
-                ios_layout = denormalize_roomplan_from_unity(unity_layout)
-                ios_layout = normalize_roomplan_for_ios_view(ios_layout)
+        ios_layout, unity_layout = await build_edited_layouts(
+            parent_version, payload.ios_objects, payload.objects
+        )
 
         owner_segment = _user_s3_segment(room.user)
         edit_prefix = f"{_scan_root(str(room.id), owner_segment)}/user_edits/version_{next_version_no}"
