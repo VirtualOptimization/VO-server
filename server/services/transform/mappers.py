@@ -61,10 +61,8 @@ def infer_catalog_model_key(category: str, model_file_name: str | None) -> str |
     if not base_name or not variant:
         return None
 
-    # S3 catalog GLB names use this lowercase variant, and DB keys mirror it
-    # with the .rooms.usdc source extension.
-    model_name = base_name.replace("_lShaped", "_lshaped")
-    return f"{category_dir}/{variant}/{model_name}.rooms.usdc"
+    # DB keys mirror the S3 catalog GLB path with the .rooms.usdc source extension.
+    return f"{category_dir}/{variant}/{base_name}.rooms.usdc"
 
 
 def build_optimizer_metadata(category: str) -> dict[str, Any]:

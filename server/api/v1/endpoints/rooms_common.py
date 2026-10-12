@@ -69,8 +69,7 @@ def _catalog_model_key(category: str, model_filename: str) -> str:
     filename = path.name
     base_name = filename.removesuffix(".rooms.usdc")
     variant = CATALOG_VARIANT_BY_FILENAME.get(base_name, path.parent.name if path.parent.name else base_name)
-    glb_name = base_name.replace("_lShaped", "_lshaped")
-    return f"{CATALOG_PREFIX}/{category_dir}/{variant}/{glb_name}.rooms.glb"
+    return f"{CATALOG_PREFIX}/{category_dir}/{variant}/{base_name}.rooms.glb"
 
 
 def _catalog_db_model_key(category: str, model_filename: str) -> str:
@@ -132,11 +131,18 @@ def _find_model_asset_url(asset_urls: dict[str, str], model_key: str | None) -> 
     if model_key in asset_urls:
         return asset_urls[model_key]
 
-    filename = PurePosixPath(model_key.replace("\\", "/")).name
+    # Saved room JSON can carry older key casing (e.g. "_lshaped"), so match
+    # case-insensitively before falling back to the filename alone.
+    lowered = model_key.lower()
+    matches = [url for candidate_key, url in asset_urls.items() if candidate_key.lower() == lowered]
+    if len(matches) == 1:
+        return matches[0]
+
+    filename = PurePosixPath(model_key.replace("\\", "/")).name.lower()
     matches = [
         url
         for candidate_key, url in asset_urls.items()
-        if PurePosixPath(candidate_key).name == filename
+        if PurePosixPath(candidate_key).name.lower() == filename
     ]
     return matches[0] if len(matches) == 1 else None
 

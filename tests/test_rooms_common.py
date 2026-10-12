@@ -3,8 +3,11 @@ from unittest.mock import AsyncMock, patch
 
 from server.api.v1.endpoints.rooms_common import (
     _attach_model_asset_urls,
+    _catalog_db_model_key,
+    _catalog_model_key,
     _get_catalog_model_asset_urls,
 )
+from server.services.transform.mappers import infer_catalog_model_key
 
 
 class CatalogModelAssetUrlsTest(IsolatedAsyncioTestCase):
@@ -86,3 +89,28 @@ class CatalogModelAssetUrlsTest(IsolatedAsyncioTestCase):
         self.assertEqual(result[0]["center"], [1.0, 0.5, 2.0])
         self.assertEqual(result[0]["rotation"], [0.0, 1.570796, 0.0])
         self.assertEqual(result[0]["dimensions"], [0.5, 1.0, 0.5])
+
+    def test_l_shaped_table_keys_match_s3_catalog_casing(self) -> None:
+        # S3: asset/Table/Unidentified_lShaped/Unidentified_lShaped.rooms.glb
+        self.assertEqual(
+            _catalog_model_key("table", "Unidentified_lShaped.rooms.usdc"),
+            "asset/Table/Unidentified_lShaped/Unidentified_lShaped.rooms.glb",
+        )
+        expected_key = "Table/Unidentified_lShaped/Unidentified_lShaped.rooms.usdc"
+        self.assertEqual(_catalog_db_model_key("table", "Unidentified_lShaped.rooms.usdc"), expected_key)
+        self.assertEqual(infer_catalog_model_key("table", "Unidentified_lShaped.rooms.usdc"), expected_key)
+
+    def test_attaches_urls_to_saved_lowercase_l_shaped_model_key(self) -> None:
+        objects = [
+            {
+                "identifier": "desk-1",
+                "model_key": "Table/Unidentified_lShaped/Unidentified_lshaped.rooms.usdc",
+            }
+        ]
+        model_urls = {
+            "Table/Unidentified_lShaped/Unidentified_lShaped.rooms.usdc": "signed:desk.glb",
+        }
+
+        result = _attach_model_asset_urls(objects, model_urls, {})
+
+        self.assertEqual(result[0]["glb_url"], "signed:desk.glb")
