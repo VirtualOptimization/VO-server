@@ -232,9 +232,14 @@ def _opening_on_wall(wall: dict[str, Any], opening: dict[str, Any], wall_thickne
     return {"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y}
 
 
-def _wall_segments(wall: dict[str, Any], openings: list[dict[str, float]]) -> list[tuple[float, float, float, float]]:
+def _wall_segments(
+    wall: dict[str, Any],
+    openings: list[dict[str, float]],
+    extend_start: float = 0.0,
+    extend_end: float = 0.0,
+) -> list[tuple[float, float, float, float]]:
     wall_length, wall_height, _ = _element_dimensions(wall, DEFAULT_WALL_THICKNESS)
-    x_breaks = {-wall_length / 2.0, wall_length / 2.0}
+    x_breaks = {-wall_length / 2.0 - extend_start, wall_length / 2.0 + extend_end}
     y_breaks = {-wall_height / 2.0, wall_height / 2.0}
 
     for opening in openings:
@@ -280,11 +285,81 @@ def _add_floor(builder: MeshBuilder, floor: dict[str, Any], floor_thickness: flo
     )
 
 
+class _WallPlan:
+    """A wall's footprint on the floor plane (XZ), used to work out which side is outside."""
+
+    def __init__(self, wall: dict[str, Any]) -> None:
+        axis_x, _, axis_z, center = _matrix_axes(wall["transform"])
+        length, _, _ = _element_dimensions(wall, DEFAULT_WALL_THICKNESS)
+        self.center = np.array([center[0], center[2]], dtype=float)
+        self.direction = _normalize(np.array([axis_x[0], axis_x[2]], dtype=float))
+        self.normal = _normalize(np.array([axis_z[0], axis_z[2]], dtype=float))
+        self.start = self.center - self.direction * (length / 2.0)
+        self.end = self.center + self.direction * (length / 2.0)
+
+
+def _ray_hits_segment(origin: np.ndarray, direction: np.ndarray, start: np.ndarray, end: np.ndarray) -> bool:
+    edge = end - start
+    denom = direction[0] * edge[1] - direction[1] * edge[0]
+    if abs(denom) < 1e-9:
+        return False
+    offset = start - origin
+    t = (offset[0] * edge[1] - offset[1] * edge[0]) / denom
+    s = (offset[0] * direction[1] - offset[1] * direction[0]) / denom
+    return t > 1e-6 and 0.0 <= s <= 1.0
+
+
+def _outward_sign(plan: _WallPlan, plans: list[_WallPlan]) -> float:
+    """Return +1 when the wall's +Z normal points outside the room, -1 otherwise.
+
+    A ray cast from the wall into the room crosses the other walls an odd number
+    of times (point-in-polygon parity), so this also works for L-shaped rooms.
+    Falls back to "away from the walls' centroid" when the scan has gaps.
+    """
+    others = [other for other in plans if other is not plan]
+    origin = plan.center + plan.normal * 0.01
+    hits_pos = sum(_ray_hits_segment(origin, plan.normal, o.start, o.end) for o in others)
+    origin = plan.center - plan.normal * 0.01
+    hits_neg = sum(_ray_hits_segment(origin, -plan.normal, o.start, o.end) for o in others)
+    if hits_pos % 2 != hits_neg % 2:
+        return -1.0 if hits_pos % 2 == 1 else 1.0
+
+    centroid = np.mean([other.center for other in plans], axis=0)
+    return -1.0 if float(np.dot(centroid - plan.center, plan.normal)) > 0.0 else 1.0
+
+
+def _corner_extension(
+    endpoint: np.ndarray,
+    extend_direction: np.ndarray,
+    plan: _WallPlan,
+    plans: list[_WallPlan],
+    outward: dict[int, np.ndarray],
+    wall_thickness: float,
+) -> float:
+    """Extend a wall end by its thickness when it meets another wall at an outside corner.
+
+    Pushing walls outward leaves a thickness x thickness notch at convex corners.
+    At concave corners the walls already overlap, and extending would poke into the room.
+    """
+    tolerance = max(wall_thickness * 2.0, 0.1)
+    for other in plans:
+        if other is plan:
+            continue
+        if min(np.linalg.norm(endpoint - other.start), np.linalg.norm(endpoint - other.end)) > tolerance:
+            continue
+        if float(np.dot(extend_direction, outward[id(other)])) > 0.5:
+            return wall_thickness
+    return 0.0
+
+
 def _add_wall(
     builder: MeshBuilder,
     wall: dict[str, Any],
     all_openings: list[dict[str, Any]],
     wall_thickness: float,
+    outward_sign: float = 0.0,
+    extend_start: float = 0.0,
+    extend_end: float = 0.0,
 ) -> None:
     wall_x, wall_y, wall_z, wall_center = _matrix_axes(wall["transform"])
     wall_length, wall_height, wall_depth = _element_dimensions(wall, wall_thickness)
@@ -294,17 +369,21 @@ def _add_wall(
         for opening in (_opening_on_wall(wall, item, wall_thickness) for item in all_openings)
         if opening is not None
     ]
+    # RoomPlan gives the wall as a zero-thickness plane on the room's inner surface,
+    # with furniture flush against it. Grow the thickness outward only so the
+    # inner face of the mesh stays on that plane.
+    box_center = wall_center + wall_z * (outward_sign * depth / 2.0)
 
     if not openings:
         builder.add_box(
-            center=wall_center,
+            center=box_center + wall_x * ((extend_end - extend_start) / 2.0),
             axes=(wall_x, wall_y, wall_z),
-            extents=(wall_length, wall_height, depth),
+            extents=(wall_length + extend_start + extend_end, wall_height, depth),
         )
         return
 
-    for x0, x1, y0, y1 in _wall_segments(wall, openings):
-        center = wall_center + wall_x * ((x0 + x1) / 2.0) + wall_y * ((y0 + y1) / 2.0)
+    for x0, x1, y0, y1 in _wall_segments(wall, openings, extend_start, extend_end):
+        center = box_center + wall_x * ((x0 + x1) / 2.0) + wall_y * ((y0 + y1) / 2.0)
         builder.add_box(
             center=center,
             axes=(wall_x, wall_y, wall_z),
@@ -324,8 +403,20 @@ def build_room_shell_mesh(
         _add_floor(builder, floor, floor_thickness)
 
     openings = list(room_data.get("doors", [])) + list(room_data.get("windows", []))
-    for wall in room_data.get("walls", []):
-        _add_wall(builder, wall, openings, wall_thickness)
+    walls = list(room_data.get("walls", []))
+    plans = [_WallPlan(wall) for wall in walls]
+    signs = [_outward_sign(plan, plans) for plan in plans]
+    outward = {id(plan): plan.normal * sign for plan, sign in zip(plans, signs)}
+    for wall, plan, sign in zip(walls, plans, signs):
+        _add_wall(
+            builder,
+            wall,
+            openings,
+            wall_thickness,
+            outward_sign=sign,
+            extend_start=_corner_extension(plan.start, -plan.direction, plan, plans, outward, wall_thickness),
+            extend_end=_corner_extension(plan.end, plan.direction, plan, plans, outward, wall_thickness),
+        )
 
     mesh = builder.to_mesh()
     vertices, _ = mesh
