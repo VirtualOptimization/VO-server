@@ -306,6 +306,43 @@ def update_room_name(
 
 # ── GET /rooms/{room_id}/versions/{version_id} ───────────────────────────────
 
+async def build_version_detail(db, version: Version) -> VersionDetailResponse:
+    """Everything a client needs to render a version: layout JSON, room shell and model URLs.
+
+    `version.room.user` must be loaded. Callers check access to the version.
+    """
+    room_id = version.room_id
+    owner_segment = _user_s3_segment(version.room.user)
+    ios_key = _key_from_s3_uri(version.s3_json_url)
+    unity_key = _key_from_s3_uri(_unity_layout_uri(version))
+    if unity_key and await head_object(unity_key) is None:
+        unity_key = None
+    await backfill_layout_colors(ios_key, unity_key)
+    prefixes = await _resolve_prefixes(str(room_id), owner_segment)
+    if prefixes is None:
+        return _to_version_detail_response(version)
+
+    raw, _ = prefixes
+    empty_key = f"{raw}/Room_empty.usdz"
+    empty_exists = await head_object(empty_key) is not None
+    model_urls, model_usdz_urls = await _get_catalog_model_asset_urls(raw)
+
+    ios_key = _key_from_s3_uri(version.s3_json_url)
+    unity_key = _key_from_s3_uri(_unity_layout_uri(version))
+
+    ios_objects = _get_room_objects_with_model_ids(db, ios_key) if ios_key else []
+    objects = _get_room_objects_with_model_ids(db, unity_key) if unity_key else []
+
+    return _to_version_detail_response(
+        version,
+        usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
+        model_urls=model_urls,
+        model_usdz_urls=model_usdz_urls,
+        objects=_attach_model_asset_urls(objects, model_urls, model_usdz_urls),
+        ios_objects=_attach_model_asset_urls(ios_objects, model_urls, model_usdz_urls),
+    )
+
+
 @router.get("/{room_id}/versions/{version_id}", response_model=VersionDetailResponse)
 async def get_room_version_detail(
     room_id: int,
@@ -330,35 +367,7 @@ async def get_room_version_detail(
         if version is None:
             raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
 
-        owner_segment = _user_s3_segment(version.room.user)
-        ios_key = _key_from_s3_uri(version.s3_json_url)
-        unity_key = _key_from_s3_uri(_unity_layout_uri(version))
-        if unity_key and await head_object(unity_key) is None:
-            unity_key = None
-        await backfill_layout_colors(ios_key, unity_key)
-        prefixes = await _resolve_prefixes(str(room_id), owner_segment)
-        if prefixes is None:
-            return _to_version_detail_response(version)
-
-        raw, _ = prefixes
-        empty_key = f"{raw}/Room_empty.usdz"
-        empty_exists = await head_object(empty_key) is not None
-        model_urls, model_usdz_urls = await _get_catalog_model_asset_urls(raw)
-
-        ios_key = _key_from_s3_uri(version.s3_json_url)
-        unity_key = _key_from_s3_uri(_unity_layout_uri(version))
-
-        ios_objects = _get_room_objects_with_model_ids(db, ios_key) if ios_key else []
-        objects = _get_room_objects_with_model_ids(db, unity_key) if unity_key else []
-
-        return _to_version_detail_response(
-            version,
-            usdz_empty_url=generate_presigned_url(empty_key) if empty_exists else None,
-            model_urls=model_urls,
-            model_usdz_urls=model_usdz_urls,
-            objects=_attach_model_asset_urls(objects, model_urls, model_usdz_urls),
-            ios_objects=_attach_model_asset_urls(ios_objects, model_urls, model_usdz_urls),
-        )
+        return await build_version_detail(db, version)
     finally:
         db.close()
 

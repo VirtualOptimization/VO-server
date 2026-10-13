@@ -113,8 +113,16 @@ def _rotated_2d_vertices(element: dict[str, Any], floor_theta: float) -> list[tu
     return [(rx, rz)]
 
 
-def convert_roomplan_to_optimizer_payload(src: dict[str, Any]) -> dict[str, Any]:
-    """Normalize RoomPlan JSON into a scan-preserving canonical schema."""
+def convert_roomplan_to_optimizer_payload(
+    src: dict[str, Any], *, frame_src: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Normalize RoomPlan JSON into a scan-preserving canonical schema.
+
+    The room frame (bounding box) is taken from every element of `frame_src`,
+    or of `src` when it is not given. Scoring an edited layout passes the
+    room's original scan here so that furniture dragged past a wall does not
+    enlarge the room.
+    """
     floors = src.get("floors", [])
     if not floors:
         raise ValueError("RoomPlan payload must include at least one floor.")
@@ -123,11 +131,12 @@ def convert_roomplan_to_optimizer_payload(src: dict[str, Any]) -> dict[str, Any]
     floor_theta = math.atan2(floor_transform[0][2], floor_transform[0][0])
     floor_y = float(floors[0]["center"][1])
 
+    frame = frame_src if frame_src is not None else src
     all_elements = (
-        src.get("objects", [])
-        + src.get("doors", [])
-        + src.get("windows", [])
-        + src.get("walls", [])
+        frame.get("objects", [])
+        + frame.get("doors", [])
+        + frame.get("windows", [])
+        + frame.get("walls", [])
     )
     if not all_elements:
         raise ValueError("RoomPlan payload must include at least one object, door, or wall.")
