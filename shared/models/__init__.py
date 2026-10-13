@@ -3,6 +3,7 @@
 from shared.db import Base
 from shared.models.conversion_task import ConversionTask
 from shared.models.email_verification_code import EmailVerificationCode
+from shared.models.event import Event, EventAttempt, EventParticipant
 from shared.models.furniture_model import FurnitureModel
 from shared.models.neufert_chunk import NeufertChunk
 from shared.models.refresh_token import RefreshToken
@@ -20,4 +21,7 @@ __all__ = [
     "Version",
     "FurnitureModel",
     "NeufertChunk",
+    "Event",
+    "EventParticipant",
+    "EventAttempt",
 ]
