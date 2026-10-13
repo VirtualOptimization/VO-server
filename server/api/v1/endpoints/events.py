@@ -44,6 +44,7 @@ from server.services.event_rules import (
     normalize_name,
     normalize_phone,
 )
+from server.services.event_ranking import best_attempts, participant_rank
 from server.services.layout_scoring import compute_ai_record, room_frame, score_roomplan_layout
 from shared.db import SessionLocal
 from shared.models.event import Event, EventAttempt, EventParticipant
@@ -127,43 +128,8 @@ def _participant(
         db.close()
 
 
-def _best_attempts(db, event_id: int):
-    """Each participant's best valid attempt, in leaderboard order:
-    score, then usable area, then elapsed time, then submission time."""
-    order = (
-        EventAttempt.total_score.desc(),
-        EventAttempt.usable_area_m2.desc(),
-        EventAttempt.elapsed_seconds.asc().nulls_last(),
-        EventAttempt.created_at.asc(),
-    )
-    ranked = (
-        db.query(
-            EventAttempt.id.label("attempt_id"),
-            func.row_number().over(partition_by=EventAttempt.participant_id, order_by=order).label("nth"),
-        )
-        .filter(EventAttempt.event_id == event_id, EventAttempt.disqualified.is_(False))
-        .subquery()
-    )
-    return (
-        db.query(EventAttempt)
-        .join(ranked, ranked.c.attempt_id == EventAttempt.id)
-        .options(joinedload(EventAttempt.participant))
-        .filter(ranked.c.nth == 1)
-        .order_by(*order)
-    )
-
-
-def _rank(db, event_id: int, participant_id: int) -> tuple[int | None, int]:
-    """(rank of the participant's best attempt, number of ranked participants)."""
-    rows = _best_attempts(db, event_id).all()
-    for position, attempt in enumerate(rows, start=1):
-        if attempt.participant_id == participant_id:
-            return position, len(rows)
-    return None, len(rows)
-
-
 def _attempt_response(db, event: Event, attempt: EventAttempt, remaining: int) -> AttemptResponse:
-    rank, total = _rank(db, event.id, attempt.participant_id)
+    rank, total = participant_rank(db, event.id, attempt.participant_id)
     return AttemptResponse(
         attempt_id=attempt.id,
         total_score=attempt.total_score,
@@ -431,7 +397,7 @@ async def get_leaderboard(event_id: int, limit: int = Query(20, ge=1, le=100)):
     db = SessionLocal()
     try:
         event = _event_or_404(db, event_id)
-        best = _best_attempts(db, event.id)
+        best = best_attempts(db, event.id)
         entries = [
             LeaderboardEntry(
                 rank=position,
