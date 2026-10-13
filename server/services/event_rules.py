@@ -62,12 +62,3 @@ def issue_participant_token() -> tuple[str, str]:
     """A new participant token and the hash stored for it (the token itself is never stored)."""
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
     return token, hash_token(token)
-
-
-def bearer_token(authorization: str | None) -> str | None:
-    if not authorization:
-        return None
-    scheme, _, value = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not value.strip():
-        return None
-    return value.strip()

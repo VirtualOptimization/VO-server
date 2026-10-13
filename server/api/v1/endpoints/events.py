@@ -11,7 +11,8 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload
@@ -38,7 +39,6 @@ from server.services.event_rules import (
     CRITERIA,
     DISQUALIFY_RULES,
     InvalidInput,
-    bearer_token,
     hash_token,
     issue_participant_token,
     normalize_name,
@@ -56,6 +56,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 INACTIVE_DETAIL = "진행 중인 이벤트가 아니에요."
+# A separate security scheme so Swagger's Authorize dialog has its own field for
+# the participant token (it never shows a plain "Authorization" header input).
+participant_scheme = HTTPBearer(
+    auto_error=False,
+    scheme_name="ParticipantToken",
+    description="참가 등록 응답의 participant_token",
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -100,11 +107,11 @@ def _admin_response(event: Event) -> EventAdminResponse:
 
 def _participant(
     event_id: int,
-    authorization: str | None = Header(default=None),
+    credentials: HTTPAuthorizationCredentials | None = Security(participant_scheme),
 ) -> int:
     """Authenticate a visitor by the token issued at registration; returns the participant id."""
-    token = bearer_token(authorization)
-    if token is None:
+    token = credentials.credentials.strip() if credentials and credentials.credentials else None
+    if not token:
         raise HTTPException(status_code=401, detail="참가 등록을 먼저 해주세요.")
     db = SessionLocal()
     try:

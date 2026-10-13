@@ -3,7 +3,6 @@ import pytest
 from server.services.event_rules import (
     CRITERIA,
     InvalidInput,
-    bearer_token,
     hash_token,
     issue_participant_token,
     normalize_name,
@@ -42,11 +41,3 @@ def test_token_is_stored_only_as_hash():
     assert token_hash == hash_token(token)
     assert token not in token_hash
     assert issue_participant_token()[0] != token
-
-
-@pytest.mark.parametrize(
-    "header, expected",
-    [("Bearer pt_abc", "pt_abc"), ("bearer pt_abc ", "pt_abc"), ("Token pt_abc", None), ("Bearer ", None), (None, None)],
-)
-def test_bearer_token_parsing(header, expected):
-    assert bearer_token(header) == expected
