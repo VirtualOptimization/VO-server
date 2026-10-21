@@ -34,6 +34,7 @@ from server.schemas.event import (
     LeaderboardResponse,
     ParticipantCreateRequest,
     ParticipantCreateResponse,
+    ParticipantSessionResponse,
 )
 from server.services.event_rules import (
     CRITERIA,
@@ -72,6 +73,13 @@ def _event_or_404(db, event_id: int) -> Event:
     event = db.query(Event).filter(Event.id == event_id).first()
     if event is None:
         raise HTTPException(status_code=404, detail="이벤트를 찾을 수 없어요.")
+    return event
+
+
+def _current_event_or_404(db) -> Event:
+    event = db.query(Event).filter(Event.is_active.is_(True)).order_by(Event.id.desc()).first()
+    if event is None:
+        raise HTTPException(status_code=404, detail="진행 중인 이벤트가 없어요.")
     return event
 
 
@@ -230,6 +238,16 @@ async def update_event(event_id: int, payload: EventUpdateRequest, current_user:
         db.close()
 
 
+# Static route must precede /{event_id}.
+@router.get("/current", response_model=EventResponse, summary="현재 활성 챌린지 정보")
+async def get_current_event():
+    db = SessionLocal()
+    try:
+        return _event_response(_current_event_or_404(db))
+    finally:
+        db.close()
+
+
 # ── GET /events/{event_id} (공개) ─────────────────────────────────────────────
 
 @router.get("/{event_id}", response_model=EventResponse, summary="전시 이벤트 정보와 채점 기준")
@@ -289,11 +307,31 @@ async def register_participant(event_id: int, payload: ParticipantCreateRequest)
 
 # ── GET /events/{event_id}/challenge (참가자) ─────────────────────────────────
 
+@router.get("/{event_id}/session", response_model=ParticipantSessionResponse, summary="참가 세션 복구")
+async def get_participant_session(event_id: int, participant_id: int = Depends(_participant)):
+    db = SessionLocal()
+    try:
+        event = _event_or_404(db, event_id)
+        remaining = _remaining(db, event, participant_id)
+        latest = db.query(EventAttempt).filter(
+            EventAttempt.participant_id == participant_id,
+            EventAttempt.event_id == event_id,
+        ).order_by(EventAttempt.id.desc()).first()
+        return ParticipantSessionResponse(
+            remaining_attempts=remaining,
+            latest_result=_attempt_response(db, event, latest, remaining) if latest else None,
+            elapsed_seconds=latest.elapsed_seconds if latest else None,
+        )
+    finally:
+        db.close()
+
 @router.get("/{event_id}/challenge", response_model=ChallengeResponse, summary="시작 배치 조회")
 async def get_challenge(event_id: int, participant_id: int = Depends(_participant)):
     db = SessionLocal()
     try:
         event = _event_or_404(db, event_id)
+        if not event.is_active:
+            raise HTTPException(status_code=409, detail=INACTIVE_DETAIL)
         start = (
             db.query(Version)
             .options(joinedload(Version.room).joinedload(Room.user))
@@ -319,16 +357,17 @@ async def submit_attempt(
     participant_id: int = Depends(_participant),
     idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=64),
 ):
-    if not payload.ios_objects and not payload.objects:
-        raise HTTPException(status_code=400, detail="배치한 가구 정보가 없어요.")
-
     db = SessionLocal()
     try:
         event = _event_or_404(db, event_id)
-        # Lock the participant so parallel submissions cannot exceed the attempt limit.
+        # Check cheaply before doing S3/scoring work. The final lock/check below
+        # happens only after all awaits: a synchronous SQLAlchemy row lock held
+        # across await can deadlock this worker's event loop on a second request.
         participant = (
-            db.query(EventParticipant).filter(EventParticipant.id == participant_id).with_for_update().first()
+            db.query(EventParticipant).filter(EventParticipant.id == participant_id).first()
         )
+        if participant is None:
+            raise HTTPException(status_code=401, detail="참가 정보를 찾을 수 없어요.")
         previous = (
             db.query(EventAttempt)
             .filter(EventAttempt.participant_id == participant_id, EventAttempt.idempotency_key == idempotency_key)
@@ -352,7 +391,11 @@ async def submit_attempt(
         if start is None or frame is None:
             raise HTTPException(status_code=409, detail="이벤트 방 정보를 불러올 수 없어요.")
 
-        ios_layout, _ = await build_edited_layouts(start, payload.ios_objects, payload.objects)
+        if payload.ios_objects == []:
+            # No Unity asset is needed to score the original iOS layout.
+            ios_layout = await _load_json_from_s3_uri(start.s3_json_url, "시작 배치")
+        else:
+            ios_layout, _ = await build_edited_layouts(start, payload.ios_objects, payload.objects)
         score = await score_roomplan_layout(ios_layout, frame, _ai_usable(event))
 
         room = start.room
@@ -361,6 +404,26 @@ async def submit_attempt(
             f"/events/{event.id}/attempt_{uuid.uuid4().hex}.roomplan.json"
         )
         layout_url = await upload_json(key, ios_layout)
+
+        # Serialize only the short database commit. A concurrent request may
+        # have committed or the operator may have closed the event while the
+        # layout was being scored; recheck all three conditions under the lock.
+        participant = db.query(EventParticipant).filter(
+            EventParticipant.id == participant_id
+        ).with_for_update().first()
+        if participant is None:
+            raise HTTPException(status_code=401, detail="참가 정보를 찾을 수 없어요.")
+        db.refresh(event)
+        previous = db.query(EventAttempt).filter(
+            EventAttempt.participant_id == participant_id,
+            EventAttempt.idempotency_key == idempotency_key,
+        ).first()
+        if previous is not None:
+            return _attempt_response(db, event, previous, _remaining(db, event, participant_id))
+        if not event.is_active:
+            raise HTTPException(status_code=409, detail=INACTIVE_DETAIL)
+        if _remaining(db, event, participant_id) <= 0:
+            raise HTTPException(status_code=409, detail="참여 가능 횟수를 모두 사용했어요.")
 
         attempt = EventAttempt(
             event_id=event.id,
@@ -423,9 +486,7 @@ async def get_current_leaderboard(limit: int = Query(20, ge=1, le=100)):
     """Return the newest active event so the public website needs no hard-coded event id."""
     db = SessionLocal()
     try:
-        event = db.query(Event).filter(Event.is_active.is_(True)).order_by(Event.id.desc()).first()
-        if event is None:
-            raise HTTPException(status_code=404, detail="진행 중인 이벤트가 없어요.")
+        event = _current_event_or_404(db)
         best = best_attempts(db, event.id)
         entries = [
             LeaderboardEntry(
