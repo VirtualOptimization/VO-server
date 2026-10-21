@@ -360,10 +360,14 @@ async def submit_attempt(
     db = SessionLocal()
     try:
         event = _event_or_404(db, event_id)
-        # Lock the participant so parallel submissions cannot exceed the attempt limit.
+        # Check cheaply before doing S3/scoring work. The final lock/check below
+        # happens only after all awaits: a synchronous SQLAlchemy row lock held
+        # across await can deadlock this worker's event loop on a second request.
         participant = (
-            db.query(EventParticipant).filter(EventParticipant.id == participant_id).with_for_update().first()
+            db.query(EventParticipant).filter(EventParticipant.id == participant_id).first()
         )
+        if participant is None:
+            raise HTTPException(status_code=401, detail="참가 정보를 찾을 수 없어요.")
         previous = (
             db.query(EventAttempt)
             .filter(EventAttempt.participant_id == participant_id, EventAttempt.idempotency_key == idempotency_key)
@@ -400,6 +404,26 @@ async def submit_attempt(
             f"/events/{event.id}/attempt_{uuid.uuid4().hex}.roomplan.json"
         )
         layout_url = await upload_json(key, ios_layout)
+
+        # Serialize only the short database commit. A concurrent request may
+        # have committed or the operator may have closed the event while the
+        # layout was being scored; recheck all three conditions under the lock.
+        participant = db.query(EventParticipant).filter(
+            EventParticipant.id == participant_id
+        ).with_for_update().first()
+        if participant is None:
+            raise HTTPException(status_code=401, detail="참가 정보를 찾을 수 없어요.")
+        db.refresh(event)
+        previous = db.query(EventAttempt).filter(
+            EventAttempt.participant_id == participant_id,
+            EventAttempt.idempotency_key == idempotency_key,
+        ).first()
+        if previous is not None:
+            return _attempt_response(db, event, previous, _remaining(db, event, participant_id))
+        if not event.is_active:
+            raise HTTPException(status_code=409, detail=INACTIVE_DETAIL)
+        if _remaining(db, event, participant_id) <= 0:
+            raise HTTPException(status_code=409, detail="참여 가능 횟수를 모두 사용했어요.")
 
         attempt = EventAttempt(
             event_id=event.id,

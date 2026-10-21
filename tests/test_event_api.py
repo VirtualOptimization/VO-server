@@ -161,3 +161,18 @@ def test_rank_uses_best_valid_attempt_and_has_a_deterministic_final_tie_break(ch
     assert [row["total_score"] for row in board["entries"]] == [90,90]
     assert client.get("/api/events/1/session",headers=first).json()["latest_result"]["rank"] == 1
     assert client.get("/api/events/1/session",headers=second).json()["latest_result"]["rank"] == 2
+
+
+def test_event_closing_during_scoring_prevents_a_new_attempt(challenge, monkeypatch):
+    client, factory = challenge
+    headers = register(client)
+    result = copy.deepcopy(events.score_roomplan_layout.return_value)
+    async def score_then_close(*args):
+        with factory() as db:
+            db.get(Event, 1).is_active = False
+            db.commit()
+        return result
+    monkeypatch.setattr(events, "score_roomplan_layout", score_then_close)
+    assert submit(client, headers).status_code == 409
+    with factory() as db:
+        assert db.query(EventAttempt).count() == 0
