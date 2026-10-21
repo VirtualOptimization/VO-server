@@ -17,6 +17,7 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            set -euo pipefail
             cd ~/VO-server
             git fetch origin
             git checkout dev
@@ -32,4 +33,6 @@ jobs:
             source .venv/bin/activate
             pip install -r requirements.txt -q
             bash scripts/setup_gltf2usdz.sh
+            alembic upgrade head
             sudo systemctl restart vo-server
+            curl --fail --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1/health

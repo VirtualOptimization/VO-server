@@ -16,6 +16,7 @@ def best_attempts(db: Session, event_id: int) -> Query:
         EventAttempt.usable_area_m2.desc(),
         EventAttempt.elapsed_seconds.asc().nulls_last(),
         EventAttempt.created_at.asc(),
+        EventAttempt.id.asc(),
     )
     ranked = (
         db.query(
