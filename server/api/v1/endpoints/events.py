@@ -416,3 +416,32 @@ async def get_leaderboard(event_id: int, limit: int = Query(20, ge=1, le=100)):
         )
     finally:
         db.close()
+
+
+@router.get("/leaderboard/current", response_model=LeaderboardResponse, summary="현재 활성 이벤트 공개 순위표")
+async def get_current_leaderboard(limit: int = Query(20, ge=1, le=100)):
+    """Return the newest active event so the public website needs no hard-coded event id."""
+    db = SessionLocal()
+    try:
+        event = db.query(Event).filter(Event.is_active.is_(True)).order_by(Event.id.desc()).first()
+        if event is None:
+            raise HTTPException(status_code=404, detail="진행 중인 이벤트가 없어요.")
+        best = best_attempts(db, event.id)
+        entries = [
+            LeaderboardEntry(
+                rank=position,
+                name=attempt.participant.name,
+                total_score=attempt.total_score,
+                elapsed_seconds=attempt.elapsed_seconds,
+                submitted_at=attempt.created_at,
+            )
+            for position, attempt in enumerate(best.limit(limit).all(), start=1)
+        ]
+        return LeaderboardResponse(
+            event_id=event.id,
+            total_ranked=best.count(),
+            ai_score=_ai_score(event),
+            entries=entries,
+        )
+    finally:
+        db.close()
