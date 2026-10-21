@@ -43,6 +43,10 @@ class Settings(BaseSettings):
         validation_alias="EMAIL_VERIFICATION_DEBUG",
     )
     api_docs_enabled: bool = Field(default=True, validation_alias="API_DOCS_ENABLED")
+    cors_origins: str = Field(
+        default="https://vo-space.creambay6.chatgpt.site,http://localhost:4173",
+        validation_alias="CORS_ORIGINS",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env" if os.getenv("ENV", "local") == "local" else None,
