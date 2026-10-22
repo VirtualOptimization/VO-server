@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from server.api.v1.endpoints import assistant, auth, events, furniture, rooms, rooms_edit, scan
+from server.api.v1.endpoints import assistant, auth, events, furniture, guestbook, rooms, rooms_edit, scan
 
 router = APIRouter()
 
@@ -11,3 +11,4 @@ router.include_router(auth.router, prefix="/auth", tags=["인증"])
 router.include_router(furniture.router, prefix="/furniture", tags=["가구 보관함"])
 router.include_router(assistant.router, prefix="/assistant", tags=["AI 배치 상담"])
 router.include_router(events.router, prefix="/events", tags=["전시 이벤트"])
+router.include_router(guestbook.router, prefix="/guests", tags=["방명록"])
