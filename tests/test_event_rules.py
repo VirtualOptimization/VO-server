@@ -2,6 +2,7 @@ import pytest
 
 from server.services.event_rules import (
     CRITERIA,
+    DISQUALIFY_RULES,
     InvalidInput,
     hash_token,
     issue_participant_token,
@@ -41,3 +42,7 @@ def test_token_is_stored_only_as_hash():
     assert token_hash == hash_token(token)
     assert token not in token_hash
     assert issue_participant_token()[0] != token
+
+
+def test_no_automatic_zero_or_disqualification_rules():
+    assert DISQUALIFY_RULES == []

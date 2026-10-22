@@ -4,7 +4,7 @@ The score reuses the optimizer's own checks so a user's layout and the AI
 layout are judged by the same rules. Every part gives partial credit, so small
 moves change the score and ties are rare.
 
-    Disqualified  furniture overlapping, or pushed out of the room
+    Overlap/out-of-room placements receive ordinary scores with feedback.
     Safety      30  door clearance kept free (15)
                     + room to use each piece: bed side, desk front, storage front (15)
     Principles  30  LH standard bedroom plan principles (see lh_principles.py)
@@ -32,9 +32,8 @@ MAX_PRINCIPLES = 30
 MAX_SPACE = 40
 MAX_TOTAL = MAX_SAFETY + MAX_PRINCIPLES + MAX_SPACE
 
-# Overlap or protrusion users can leave by dragging imprecisely, and that a scan
-# itself shows (a chair tucked under its desk is allowed separately).
-DISQUALIFY_TOLERANCE_M = 0.03
+# Feedback tolerance for imprecise dragging/scans (paired chairs are handled separately).
+PLACEMENT_FEEDBACK_TOLERANCE_M = 0.03
 
 # role -> (which side needs room, distance in metres, Korean label)
 USE_CLEARANCE: dict[str, tuple[str, float, str]] = {
@@ -246,13 +245,11 @@ def score_layout(problem: dict[str, Any], reference_usable_m2: float | None = No
 
     overlap = optimizer._collision_penetration(coords)
     protrusion = _protrusion(optimizer, footprints)
-    if overlap > DISQUALIFY_TOLERANCE_M or protrusion > DISQUALIFY_TOLERANCE_M:
-        reasons = []
-        if overlap > DISQUALIFY_TOLERANCE_M:
-            reasons.append("가구끼리 겹쳐 있어요")
-        if protrusion > DISQUALIFY_TOLERANCE_M:
-            reasons.append("가구가 방 밖으로 나가 있어요")
-        return {**result, "disqualified": True, "total_score": 0.0, "breakdown": None, "beat_ai": False, "hints": reasons}
+    placement_hints = []
+    if overlap > PLACEMENT_FEEDBACK_TOLERANCE_M:
+        placement_hints.append("가구끼리 겹쳐 있어요")
+    if protrusion > PLACEMENT_FEEDBACK_TOLERANCE_M:
+        placement_hints.append("가구가 방 밖으로 나가 있어요")
 
     roles = [lh.role(f, optimizer.furnitures) for f in optimizer.furnitures]
     door_credit, door_hints = _door_credit(optimizer, footprints)
@@ -266,7 +263,7 @@ def score_layout(problem: dict[str, Any], reference_usable_m2: float | None = No
     use = round(MAX_USE * use_credit, 1)
     principles = round(MAX_PRINCIPLES * principle_credit, 1)
     space = round(MAX_SPACE * min(space_ratio, 1.0), 1)
-    hints = door_hints + use_hints + principle_hints
+    hints = placement_hints + door_hints + use_hints + principle_hints
     if space_ratio < 0.99:
         hints.append(f"빈 공간이 AI 배치의 {round(space_ratio * 100)}%예요")
     return {
