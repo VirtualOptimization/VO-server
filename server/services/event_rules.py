@@ -31,7 +31,8 @@ CRITERIA = [
         "description": "폭 80cm 이상으로 넓게 모인 빈 공간이 AI 배치와 비교해 얼마나 넓은지",
     },
 ]
-DISQUALIFY_RULES = ["가구끼리 겹치면 0점", "가구가 방 밖으로 나가면 0점"]
+# Kept in the response schema for older clients; all layouts now receive ordinary scores.
+DISQUALIFY_RULES: list[str] = []
 
 
 class InvalidInput(ValueError):

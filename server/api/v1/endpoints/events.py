@@ -185,11 +185,6 @@ async def create_event(payload: EventCreateRequest, current_user: User = Depends
         if frame is None:
             raise HTTPException(status_code=400, detail="원본 스캔이 없는 방은 채점할 수 없어요.")
         ai_record = await compute_ai_record(target, frame, _load_json_from_s3_uri)
-        if ai_record["disqualified"]:
-            raise HTTPException(
-                status_code=400,
-                detail="AI 버전 배치에 가구 겹침이나 방 밖으로 나간 가구가 있어 기준으로 쓸 수 없어요.",
-            )
 
         event = Event(
             owner_user_id=current_user.id,

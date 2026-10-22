@@ -41,20 +41,24 @@ def test_clean_layout_scores_within_range_with_full_space_credit():
     assert result["beat_ai"] is True
 
 
-def test_overlapping_furniture_is_disqualified():
+def test_overlapping_furniture_receives_ordinary_score_and_feedback():
     problem = _room()
     problem["movable_items"][1]["pos"] = [2.6, 0.6, 0.75]  # desk dropped onto the bed
     result = score_layout(problem, reference_usable_m2=3.0)
-    assert result["disqualified"]
-    assert result["total_score"] == 0
+    assert not result["disqualified"]
+    assert 0 < result["total_score"] <= MAX_TOTAL
+    assert result["total_score"] == round(sum(result["breakdown"][k] for k in ("safety", "principles", "space")), 1)
     assert any("겹쳐" in hint for hint in result["hints"])
 
 
-def test_furniture_outside_the_room_is_disqualified():
+def test_furniture_outside_the_room_receives_ordinary_score_and_feedback():
     problem = _room()
     problem["movable_items"][1]["pos"] = [1.8, 3.3, 0.75]
     result = score_layout(problem, reference_usable_m2=3.0)
-    assert result["disqualified"]
+    assert not result["disqualified"]
+    assert 0 < result["total_score"] <= MAX_TOTAL
+    assert result["breakdown"] is not None
+    assert any("방 밖" in hint for hint in result["hints"])
 
 
 def test_blocking_the_door_costs_door_points():
