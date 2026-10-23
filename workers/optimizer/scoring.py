@@ -4,7 +4,8 @@ The score reuses the optimizer's own checks so a user's layout and the AI
 layout are judged by the same rules. Every part gives partial credit, so small
 moves change the score and ties are rare.
 
-    Overlap/out-of-room placements receive ordinary scores with feedback.
+    Penalty         furniture overlapping (-20), or pushed out of the room (-20);
+                    the total never goes below 0
     Safety      30  door clearance kept free (15)
                     + room to use each piece: bed side, desk front, storage front (15)
     Principles  30  LH standard bedroom plan principles (see lh_principles.py)
@@ -32,8 +33,12 @@ MAX_PRINCIPLES = 30
 MAX_SPACE = 40
 MAX_TOTAL = MAX_SAFETY + MAX_PRINCIPLES + MAX_SPACE
 
-# Feedback tolerance for imprecise dragging/scans (paired chairs are handled separately).
+# Overlap or protrusion users can leave by dragging imprecisely, and that a scan
+# itself shows (a chair tucked under its desk is allowed separately).
 PLACEMENT_FEEDBACK_TOLERANCE_M = 0.03
+# Fixed deductions, each applied once however many pieces are affected.
+OVERLAP_PENALTY = 20
+OUT_OF_ROOM_PENALTY = 20
 
 # role -> (which side needs room, distance in metres, Korean label)
 USE_CLEARANCE: dict[str, tuple[str, float, str]] = {
@@ -246,10 +251,13 @@ def score_layout(problem: dict[str, Any], reference_usable_m2: float | None = No
     overlap = optimizer._collision_penetration(coords)
     protrusion = _protrusion(optimizer, footprints)
     placement_hints = []
+    penalty = 0
     if overlap > PLACEMENT_FEEDBACK_TOLERANCE_M:
-        placement_hints.append("가구끼리 겹쳐 있어요")
+        penalty += OVERLAP_PENALTY
+        placement_hints.append(f"가구끼리 겹쳐 있어요 (-{OVERLAP_PENALTY}점)")
     if protrusion > PLACEMENT_FEEDBACK_TOLERANCE_M:
-        placement_hints.append("가구가 방 밖으로 나가 있어요")
+        penalty += OUT_OF_ROOM_PENALTY
+        placement_hints.append(f"가구가 방 밖으로 나가 있어요 (-{OUT_OF_ROOM_PENALTY}점)")
 
     roles = [lh.role(f, optimizer.furnitures) for f in optimizer.furnitures]
     door_credit, door_hints = _door_credit(optimizer, footprints)
@@ -269,13 +277,14 @@ def score_layout(problem: dict[str, Any], reference_usable_m2: float | None = No
     return {
         **result,
         "disqualified": False,
-        "total_score": round(door + use + principles + space, 1),
+        "total_score": max(0.0, round(door + use + principles + space - penalty, 1)),
         "breakdown": {
             "safety": round(door + use, 1),
             "door_clearance": door,
             "furniture_use": use,
             "principles": principles,
             "space": space,
+            "penalty": float(penalty),
         },
         "beat_ai": bool(reference_usable_m2) and usable > reference_usable_m2 + BEAT_AI_MARGIN_M2,
         "hints": hints,

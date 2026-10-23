@@ -39,6 +39,7 @@ from server.schemas.event import (
 from server.services.event_rules import (
     CRITERIA,
     DISQUALIFY_RULES,
+    PENALTY_RULES,
     InvalidInput,
     hash_token,
     issue_participant_token,
@@ -101,6 +102,7 @@ def _event_response(event: Event) -> EventResponse:
         max_score=MAX_TOTAL,
         criteria=CRITERIA,
         disqualify_rules=DISQUALIFY_RULES,
+        penalty_rules=PENALTY_RULES,
     )
 
 

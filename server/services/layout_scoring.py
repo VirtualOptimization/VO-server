@@ -12,7 +12,7 @@ from shared.models.version import Version
 from workers.optimizer.scoring import score_layout
 
 # Bump when the scoring rules change; stored with each AI record.
-SCORE_VERSION = 3
+SCORE_VERSION = 4
 
 LoadJson = Callable[[str | None, str], Awaitable[dict]]
 

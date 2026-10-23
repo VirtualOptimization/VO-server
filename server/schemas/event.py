@@ -32,6 +32,7 @@ class ScoreBreakdown(BaseModel):
     furniture_use: float
     principles: float
     space: float
+    penalty: float = 0.0
 
 
 class Criterion(BaseModel):
@@ -49,6 +50,7 @@ class EventResponse(BaseModel):
     max_score: int
     criteria: list[Criterion]
     disqualify_rules: list[str]
+    penalty_rules: list[str]
 
 
 class EventAdminResponse(EventResponse):
