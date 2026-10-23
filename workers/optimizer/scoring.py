@@ -4,8 +4,8 @@ The score reuses the optimizer's own checks so a user's layout and the AI
 layout are judged by the same rules. Every part gives partial credit, so small
 moves change the score and ties are rare.
 
-    Penalty         furniture overlapping (-20), or pushed out of the room (-20);
-                    the total never goes below 0
+    Penalty         -5 per overlapping furniture pair, -5 per piece pushed out of
+                    the room; the total never goes below 0
     Safety      30  door clearance kept free (15)
                     + room to use each piece: bed side, desk front, storage front (15)
     Principles  30  LH standard bedroom plan principles (see lh_principles.py)
@@ -36,9 +36,9 @@ MAX_TOTAL = MAX_SAFETY + MAX_PRINCIPLES + MAX_SPACE
 # Overlap or protrusion users can leave by dragging imprecisely, and that a scan
 # itself shows (a chair tucked under its desk is allowed separately).
 PLACEMENT_FEEDBACK_TOLERANCE_M = 0.03
-# Fixed deductions, each applied once however many pieces are affected.
-OVERLAP_PENALTY = 20
-OUT_OF_ROOM_PENALTY = 20
+# Deducted per overlapping furniture pair / per piece outside the room.
+OVERLAP_PENALTY = 5
+OUT_OF_ROOM_PENALTY = 5
 
 # role -> (which side needs room, distance in metres, Korean label)
 USE_CLEARANCE: dict[str, tuple[str, float, str]] = {
@@ -67,17 +67,38 @@ def _footprints(optimizer: CanonicalLayoutOptimizer, coords: np.ndarray) -> list
     ]
 
 
-def _protrusion(optimizer: CanonicalLayoutOptimizer, footprints: list[np.ndarray]) -> float:
-    worst = 0.0
-    for corners in footprints:
-        worst = max(
-            worst,
-            float(-corners[:, 0].min()),
-            float(corners[:, 0].max() - optimizer.room_width),
-            float(-corners[:, 1].min()),
-            float(corners[:, 1].max() - optimizer.room_depth),
-        )
-    return worst
+def _protrusion(optimizer: CanonicalLayoutOptimizer, corners: np.ndarray) -> float:
+    return max(
+        0.0,
+        float(-corners[:, 0].min()),
+        float(corners[:, 0].max() - optimizer.room_width),
+        float(-corners[:, 1].min()),
+        float(corners[:, 1].max() - optimizer.room_depth),
+    )
+
+
+def _overlapping_pairs(optimizer: CanonicalLayoutOptimizer, coords: np.ndarray, footprints: list[np.ndarray]) -> int:
+    """Furniture pairs overlapping beyond the tolerance, judged like _collision_penetration:
+    a chair tucked under its own desk/table only counts past its allowance, and two
+    chairs sharing one desk are never counted."""
+    ids = {f["id"]: idx for idx, f in enumerate(optimizer.furnitures)}
+    count = 0
+    for i in range(optimizer.num_f):
+        for j in range(i + 1, optimizer.num_f):
+            if optimizer._vertically_apart(i, j):
+                continue
+            depth = optimizer._sat_penetration(footprints[i], footprints[j])
+            if optimizer._is_paired_relationship(i, j, ids):
+                fi, fj = optimizer.furnitures[i], optimizer.furnitures[j]
+                if fi["type"] == "chair" and fj["type"] == "chair":
+                    continue
+                chair, support = (i, j) if fi["type"] == "chair" else (j, i)
+                depth -= optimizer._allowed_chair_support_penetration(
+                    optimizer.furnitures[chair], coords[chair], optimizer.furnitures[support], coords[support]
+                )
+            if depth > PLACEMENT_FEEDBACK_TOLERANCE_M:
+                count += 1
+    return count
 
 
 def _inside(points: np.ndarray, corners: np.ndarray) -> np.ndarray:
@@ -248,16 +269,14 @@ def score_layout(problem: dict[str, Any], reference_usable_m2: float | None = No
         "room_area_m2": round(optimizer.room_width * optimizer.room_depth, 2),
     }
 
-    overlap = optimizer._collision_penetration(coords)
-    protrusion = _protrusion(optimizer, footprints)
+    overlapping = _overlapping_pairs(optimizer, coords, footprints)
+    outside = sum(_protrusion(optimizer, corners) > PLACEMENT_FEEDBACK_TOLERANCE_M for corners in footprints)
     placement_hints = []
-    penalty = 0
-    if overlap > PLACEMENT_FEEDBACK_TOLERANCE_M:
-        penalty += OVERLAP_PENALTY
-        placement_hints.append(f"가구끼리 겹쳐 있어요 (-{OVERLAP_PENALTY}점)")
-    if protrusion > PLACEMENT_FEEDBACK_TOLERANCE_M:
-        penalty += OUT_OF_ROOM_PENALTY
-        placement_hints.append(f"가구가 방 밖으로 나가 있어요 (-{OUT_OF_ROOM_PENALTY}점)")
+    penalty = OVERLAP_PENALTY * overlapping + OUT_OF_ROOM_PENALTY * outside
+    if overlapping:
+        placement_hints.append(f"가구 {overlapping}쌍이 겹쳐 있어요 (-{OVERLAP_PENALTY * overlapping}점)")
+    if outside:
+        placement_hints.append(f"가구 {outside}개가 방 밖으로 나가 있어요 (-{OUT_OF_ROOM_PENALTY * outside}점)")
 
     roles = [lh.role(f, optimizer.furnitures) for f in optimizer.furnitures]
     door_credit, door_hints = _door_credit(optimizer, footprints)

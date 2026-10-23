@@ -59,7 +59,24 @@ def test_overlapping_furniture_is_penalized_not_zeroed():
     assert result["breakdown"]["penalty"] == OVERLAP_PENALTY
     assert result["total_score"] == max(0.0, round(_parts(result) - OVERLAP_PENALTY, 1))
     assert 0 < result["total_score"] <= MAX_TOTAL
-    assert any("겹쳐" in hint for hint in result["hints"])
+    assert any("1쌍이 겹쳐" in hint for hint in result["hints"])
+
+
+def test_each_overlapping_pair_costs_points():
+    problem = _room()
+    problem["movable_items"][1]["pos"] = [2.6, 0.6, 0.75]  # desk dropped onto the bed
+    problem["movable_items"].append(
+        {"id": "shelf", "type": "shelf", "extent": [0.8, 0.4, 1.2], "pos": [2.6, 1.2, 1.2], "rotation_y_deg": 0.0,
+         "front_vector_2d": [0.0, 1.0]}
+    )  # a shelf on top of the bed as well
+    result = score_layout(problem, reference_usable_m2=3.0)
+    assert result["breakdown"]["penalty"] >= 2 * OVERLAP_PENALTY
+    assert any("쌍이 겹쳐" in hint for hint in result["hints"])
+
+
+def test_chair_tucked_under_its_desk_is_not_penalized():
+    result = score_layout(_room(), reference_usable_m2=3.0)
+    assert result["breakdown"]["penalty"] == 0
 
 
 def test_furniture_outside_the_room_is_penalized_not_zeroed():
@@ -67,7 +84,7 @@ def test_furniture_outside_the_room_is_penalized_not_zeroed():
     problem["movable_items"][1]["pos"] = [1.8, 3.3, 0.75]
     result = score_layout(problem, reference_usable_m2=3.0)
     assert not result["disqualified"]
-    assert result["breakdown"]["penalty"] >= OUT_OF_ROOM_PENALTY
+    assert result["breakdown"]["penalty"] == OUT_OF_ROOM_PENALTY
     assert result["total_score"] == max(0.0, round(_parts(result) - result["breakdown"]["penalty"], 1))
     assert 0 < result["total_score"] <= MAX_TOTAL
     assert any("방 밖" in hint for hint in result["hints"])

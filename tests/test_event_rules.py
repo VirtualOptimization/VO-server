@@ -50,4 +50,4 @@ def test_no_automatic_zero_or_disqualification_rules():
 
 
 def test_penalty_rules_name_the_deductions():
-    assert PENALTY_RULES == ["가구끼리 겹치면 -20점", "가구가 방 밖으로 나가면 -20점"]
+    assert PENALTY_RULES == ["겹친 가구 한 쌍마다 -5점", "방 밖으로 나간 가구 하나마다 -5점"]

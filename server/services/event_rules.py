@@ -34,8 +34,8 @@ CRITERIA = [
 # Kept in the response schema for older clients; no layout is scored 0 outright.
 DISQUALIFY_RULES: list[str] = []
 PENALTY_RULES = [
-    f"가구끼리 겹치면 -{OVERLAP_PENALTY}점",
-    f"가구가 방 밖으로 나가면 -{OUT_OF_ROOM_PENALTY}점",
+    f"겹친 가구 한 쌍마다 -{OVERLAP_PENALTY}점",
+    f"방 밖으로 나간 가구 하나마다 -{OUT_OF_ROOM_PENALTY}점",
 ]
 
 
