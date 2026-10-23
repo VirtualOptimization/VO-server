@@ -6,7 +6,7 @@ import hashlib
 import re
 import secrets
 
-from workers.optimizer.scoring import MAX_PRINCIPLES, MAX_SAFETY, MAX_SPACE
+from workers.optimizer.scoring import MAX_PRINCIPLES, MAX_SAFETY, MAX_SPACE, OUT_OF_ROOM_PENALTY, OVERLAP_PENALTY
 
 NAME_MAX_LENGTH = 12
 TOKEN_PREFIX = "pt_"
@@ -31,8 +31,12 @@ CRITERIA = [
         "description": "폭 80cm 이상으로 넓게 모인 빈 공간이 AI 배치와 비교해 얼마나 넓은지",
     },
 ]
-# Kept in the response schema for older clients; all layouts now receive ordinary scores.
+# Kept in the response schema for older clients; no layout is scored 0 outright.
 DISQUALIFY_RULES: list[str] = []
+PENALTY_RULES = [
+    f"겹친 가구 한 쌍마다 -{OVERLAP_PENALTY}점",
+    f"방 밖으로 나간 가구 하나마다 -{OUT_OF_ROOM_PENALTY}점",
+]
 
 
 class InvalidInput(ValueError):
