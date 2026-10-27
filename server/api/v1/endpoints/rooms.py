@@ -306,10 +306,17 @@ def update_room_name(
 
 # ── GET /rooms/{room_id}/versions/{version_id} ───────────────────────────────
 
-async def build_version_detail(db, version: Version) -> VersionDetailResponse:
+async def build_version_detail(
+    db,
+    version: Version,
+    *,
+    ios_json_key: str | None = None,
+) -> VersionDetailResponse:
     """Everything a client needs to render a version: layout JSON, room shell and model URLs.
 
     `version.room.user` must be loaded. Callers check access to the version.
+    `ios_json_key` reads the iOS furniture from another layout of the same room
+    (e.g. a challenge submission) instead of the version's own.
     """
     room_id = version.room_id
     owner_segment = _user_s3_segment(version.room.user)
@@ -327,7 +334,7 @@ async def build_version_detail(db, version: Version) -> VersionDetailResponse:
     empty_exists = await head_object(empty_key) is not None
     model_urls, model_usdz_urls = await _get_catalog_model_asset_urls(raw)
 
-    ios_key = _key_from_s3_uri(version.s3_json_url)
+    ios_key = ios_json_key or _key_from_s3_uri(version.s3_json_url)
     unity_key = _key_from_s3_uri(_unity_layout_uri(version))
 
     ios_objects = _get_room_objects_with_model_ids(db, ios_key) if ios_key else []

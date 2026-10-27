@@ -70,6 +70,8 @@ class ParticipantCreateResponse(BaseModel):
     participant_id: int
     participant_token: str
     remaining_attempts: int
+    # True when the phone was already registered and this re-entered that entry.
+    is_returning: bool = False
 
 
 class ChallengeResponse(BaseModel):
@@ -134,6 +136,14 @@ class ParticipantSessionResponse(BaseModel):
     remaining_attempts: int
     latest_result: AttemptResponse | None
     elapsed_seconds: int | None
+
+
+class MyLayoutResponse(BaseModel):
+    """The participant's latest submission next to the starting layout, both renderable."""
+
+    result: AttemptResponse
+    submitted: VersionDetailResponse
+    start: VersionDetailResponse
 
 
 class LeaderboardEntry(BaseModel):
