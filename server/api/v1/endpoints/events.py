@@ -11,14 +11,14 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Security
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload
 
 from server.api.v1.deps import get_current_user
-from server.api.v1.endpoints.rooms import build_version_detail
+from server.api.v1.endpoints.rooms import _key_from_s3_uri, build_version_detail
 from server.api.v1.endpoints.rooms_common import _scan_root, _user_s3_segment
 from server.api.v1.endpoints.rooms_edit import _load_json_from_s3_uri, build_edited_layouts
 from server.core.s3 import upload_json
@@ -32,6 +32,7 @@ from server.schemas.event import (
     EventUpdateRequest,
     LeaderboardEntry,
     LeaderboardResponse,
+    MyLayoutResponse,
     ParticipantCreateRequest,
     ParticipantCreateResponse,
     ParticipantSessionResponse,
@@ -264,7 +265,10 @@ async def get_event(event_id: int):
     status_code=201,
     summary="참가 등록",
 )
-async def register_participant(event_id: int, payload: ParticipantCreateRequest):
+async def register_participant(event_id: int, payload: ParticipantCreateRequest, response: Response):
+    """Register, or re-enter an existing entry: the same phone with the same name gets a
+    fresh token (200, is_returning=true), so a visitor can come back to their result.
+    Re-entering signs out any other device still holding the old token."""
     if not payload.privacy_consent:
         raise HTTPException(status_code=400, detail="개인정보 수집·이용에 동의해야 참여할 수 있어요.")
     try:
@@ -291,7 +295,25 @@ async def register_participant(event_id: int, payload: ParticipantCreateRequest)
             db.commit()
         except IntegrityError:
             db.rollback()
-            raise HTTPException(status_code=409, detail="이미 참여하신 번호예요.")
+            existing = (
+                db.query(EventParticipant)
+                .filter(EventParticipant.event_id == event.id, EventParticipant.phone == phone)
+                .first()
+            )
+            if existing is None or existing.name != name:
+                raise HTTPException(
+                    status_code=409,
+                    detail="이미 다른 닉네임으로 참여한 번호예요. 처음 입력한 닉네임으로 다시 시도해 주세요.",
+                )
+            existing.token_hash = token_hash
+            db.commit()
+            response.status_code = 200
+            return ParticipantCreateResponse(
+                participant_id=existing.id,
+                participant_token=token,
+                remaining_attempts=_remaining(db, event, existing.id),
+                is_returning=True,
+            )
         db.refresh(participant)
         return ParticipantCreateResponse(
             participant_id=participant.id,
@@ -321,6 +343,55 @@ async def get_participant_session(event_id: int, participant_id: int = Depends(_
         )
     finally:
         db.close()
+
+@router.delete("/{event_id}/session", status_code=204, summary="참가 세션 나가기")
+async def leave_participant_session(event_id: int, participant_id: int = Depends(_participant)):
+    """Invalidate the token on the server, so a shared exhibition device can't reuse it."""
+    db = SessionLocal()
+    try:
+        participant = db.query(EventParticipant).filter(EventParticipant.id == participant_id).first()
+        if participant is not None:
+            _, participant.token_hash = issue_participant_token()
+            db.commit()
+        return Response(status_code=204)
+    finally:
+        db.close()
+
+
+@router.get("/{event_id}/my-layout", response_model=MyLayoutResponse, summary="내가 제출한 배치 보기")
+async def get_my_layout(event_id: int, participant_id: int = Depends(_participant)):
+    """The latest submission and the starting layout in the same shape, for side-by-side viewing
+    on iOS (the ranking runs on iOS only, so only the iOS layout is stored and returned).
+    Works after the event has closed too."""
+    db = SessionLocal()
+    try:
+        event = _event_or_404(db, event_id)
+        latest = db.query(EventAttempt).filter(
+            EventAttempt.participant_id == participant_id,
+            EventAttempt.event_id == event_id,
+        ).order_by(EventAttempt.id.desc()).first()
+        if latest is None or not latest.layout_s3_url:
+            raise HTTPException(status_code=404, detail="아직 제출한 배치가 없어요.")
+        start = (
+            db.query(Version)
+            .options(joinedload(Version.room).joinedload(Room.user))
+            .filter(Version.id == event.start_version_id)
+            .first()
+        )
+        if start is None:
+            raise HTTPException(status_code=404, detail="시작 배치를 찾을 수 없어요.")
+        submitted = await build_version_detail(db, start, ios_json_key=_key_from_s3_uri(latest.layout_s3_url))
+        return MyLayoutResponse(
+            result=_attempt_response(db, event, latest, _remaining(db, event, participant_id)),
+            # Only ios_objects come from the submission; drop the start version's Unity data.
+            submitted=submitted.model_copy(
+                update={"objects": [], "layout_json_url": None, "unity_layout_json_url": None}
+            ),
+            start=await build_version_detail(db, start),
+        )
+    finally:
+        db.close()
+
 
 @router.get("/{event_id}/challenge", response_model=ChallengeResponse, summary="시작 배치 조회")
 async def get_challenge(event_id: int, participant_id: int = Depends(_participant)):
