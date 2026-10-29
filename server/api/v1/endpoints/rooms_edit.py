@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
@@ -38,6 +39,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_VERSION_COUNT = 5
+DISPLAY_NAME_MAX_LENGTH = 30
+CREATE_OPERATION = "create"
+_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 PATCHABLE_OBJECT_FIELDS = {
     "center",
     "rotation",
@@ -329,6 +333,58 @@ async def _load_json_from_s3_uri(uri: str | None, label: str) -> dict:
     return await get_json(key)
 
 
+def _display_name(value, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail=f"{label} display_name을 입력해 주세요.")
+    name = value.strip()
+    if len(name) > DISPLAY_NAME_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} display_name은 {DISPLAY_NAME_MAX_LENGTH}자까지 쓸 수 있어요.",
+        )
+    return name
+
+
+def _number_triple(value, field: str, label: str, *, positive: bool = False) -> list[float]:
+    if (
+        not isinstance(value, list)
+        or len(value) < 3
+        or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in value[:3])
+    ):
+        raise HTTPException(status_code=400, detail=f"{label} 새 가구의 {field}는 [x, y, z] 숫자 배열이어야 합니다.")
+    if positive and any(float(v) <= 0 for v in value[:3]):
+        raise HTTPException(status_code=400, detail=f"{label} 새 가구의 {field}는 0보다 커야 합니다.")
+    return [_round6(v) for v in value[:3]]
+
+
+def _new_object(update: dict, label: str, coordinate_space: str) -> dict:
+    """A furniture object the user added on the device, in the same shape as scanned ones."""
+    category = update.get("category") or "custom"
+    if not isinstance(category, str):
+        raise HTTPException(status_code=400, detail=f"{label} 새 가구의 category는 문자열이어야 합니다.")
+    rotation = update.get("rotation") or [0.0, 0.0, 0.0]
+    if not isinstance(rotation, list):
+        raise HTTPException(status_code=400, detail="rotation은 배열 형식이어야 합니다.")
+    yaw = _yaw_from_rotation(rotation)
+
+    item = {
+        "identifier": update["identifier"],
+        "category": category,
+        "display_name": _display_name(update.get("display_name"), label),
+        "center": _number_triple(update.get("center"), "center", label),
+        "dimensions": _number_triple(update.get("dimensions"), "dimensions", label, positive=True),
+    }
+    color = update.get("color_hex")
+    if isinstance(color, str) and _HEX_COLOR.fullmatch(color):
+        item["display_color_hex"] = color.upper()
+
+    _apply_yaw_to_transform(item, yaw, coordinate_space)
+    item["transform"][3][0:3] = item["center"]
+    _sync_vectors_from_transform(item, coordinate_space)
+    _sync_obb_vertices(item)
+    return item
+
+
 def _patch_objects(base_layout: dict, updates: list[dict], label: str, coordinate_space: str) -> dict:
     if not updates:
         raise HTTPException(status_code=400, detail=f"{label} 수정 object 목록이 비어 있습니다.")
@@ -348,6 +404,20 @@ def _patch_objects(base_layout: dict, updates: list[dict], label: str, coordinat
         if not identifier:
             raise HTTPException(status_code=400, detail=f"{label} 수정 object에 identifier가 필요합니다.")
 
+        operation = update.get("operation")
+        if operation == CREATE_OPERATION:
+            if identifier in object_by_identifier:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{label} JSON에 identifier={identifier} object가 이미 있습니다.",
+                )
+            item = _new_object(update, label, coordinate_space)
+            base_objects.append(item)
+            object_by_identifier[identifier] = item
+            continue
+        if operation not in (None, "update"):
+            raise HTTPException(status_code=400, detail=f"{label} 지원하지 않는 operation={operation}입니다.")
+
         target = object_by_identifier.get(identifier)
         if target is None:
             raise HTTPException(
@@ -356,6 +426,8 @@ def _patch_objects(base_layout: dict, updates: list[dict], label: str, coordinat
             )
 
         _apply_pose_update(target, update, coordinate_space)
+        if "display_name" in update:
+            target["display_name"] = _display_name(update["display_name"], label)
 
     return base_layout
 
