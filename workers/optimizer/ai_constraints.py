@@ -88,29 +88,65 @@ def build_failure_context(optimized: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def prepare_ai_retry_problem(problem: dict[str, Any]) -> dict[str, Any]:
+def prepare_ai_retry_problem(
+    problem: dict[str, Any],
+    first_output: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Create a retry payload where excluded items are pinned, not deleted.
 
     Dropping an excluded item from movable_items would also drop it from
     every collision check, so other furniture could end up placed right on
     top of where it physically still sits. Pinning it instead keeps it as a
     real (immovable) obstacle for the rest of the retry optimization.
+
+    When the first pass is given, the item is pinned where that pass placed
+    it rather than where it was scanned. The scanned spot can be the middle
+    of the room, and freezing an item there leaves it stranded in the result.
     """
     retry_problem = deepcopy(problem)
     excluded = set(problem.get("ai_excluded_object_ids", []))
+    first_by_id = {
+        item.get("id"): item for item in (first_output or {}).get("movable_items", [])
+    }
     if excluded:
         for item in retry_problem.get("movable_items", []):
             if item.get("id") in excluded:
                 item["pinned"] = True
+                _move_to_first_pass_pose(item, first_by_id.get(item.get("id")))
     return retry_problem
 
 
-def _placement_quality(output: dict[str, Any]) -> tuple[float, int]:
-    """Lower is better: (remaining collision penetration, failed rule count)."""
+def _move_to_first_pass_pose(item: dict[str, Any], first_item: dict[str, Any] | None) -> None:
+    """Rebase an item's scanned pose onto its first-pass optimized pose."""
+    if not first_item or "optimized_pos" not in first_item:
+        return
+    optimized_pos = first_item["optimized_pos"]
+    item["pos"] = [float(optimized_pos[0]), float(optimized_pos[1]), *item["pos"][2:]]
+
+    original = float(item.get("rotation_y_deg", 0.0))
+    optimized = float(first_item.get("optimized_rotation_y_deg", original))
+    item["rotation_y_deg"] = optimized
+    # Facing vectors are stored for the scanned rotation; turn them with the item.
+    delta = math.radians(optimized - original)
+    c, s = math.cos(delta), math.sin(delta)
+    for key in ("front_vector_2d", "back_vector_2d"):
+        vector = item.get(key)
+        if vector:
+            x, y = float(vector[0]), float(vector[1])
+            item[key] = [x * c - y * s, x * s + y * c]
+
+
+def _placement_quality(output: dict[str, Any]) -> tuple[float, int, float]:
+    """Lower is better: (collision penetration, failed rule count, -usable open floor).
+
+    Open floor breaks ties, so a retry that fails as many rules as the first
+    pass but leaves less usable floor does not replace it.
+    """
     optimization = output.get("optimization", {})
     penetration = float(optimization.get("remaining_collision_penetration_m", 0.0) or 0.0)
     fail_count = int(output.get("neufert_validation", {}).get("summary", {}).get("fail", 0) or 0)
-    return (penetration, fail_count)
+    usable = float(optimization.get("floor_efficiency", {}).get("usable_open_area_m2", 0.0) or 0.0)
+    return (penetration, fail_count, -round(usable, 2))
 
 
 def merge_ai_retry_output(
@@ -142,9 +178,7 @@ def merge_ai_retry_output(
             for key in ("optimized_pos", "optimized_rotation_y_deg"):
                 if key in retry_item:
                     item[key] = retry_item[key]
-        elif item.get("id") in excluded:
-            item["optimized_pos"] = item.get("pos")
-            item["optimized_rotation_y_deg"] = item.get("rotation_y_deg", 0.0)
+        # An excluded item missing from the retry keeps its first-pass pose.
 
     merged["optimization"] = deepcopy(retry_output.get("optimization", {}))
     merged["optimization"]["recovery_rejected"] = False
