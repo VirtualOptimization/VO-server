@@ -10,8 +10,14 @@ from server.core.config import settings
 @lru_cache(maxsize=1)
 def get_s3_client():
     import boto3
+    from botocore.config import Config
 
-    client_kwargs = {"region_name": settings.aws_region}
+    # Virtual addressing keeps presigned URLs on the regional host. The default
+    # global host (bucket.s3.amazonaws.com) fails for new non-us-east-1 buckets.
+    client_kwargs = {
+        "region_name": settings.aws_region,
+        "config": Config(s3={"addressing_style": "virtual"}),
+    }
     if settings.aws_access_key_id and settings.aws_secret_access_key:
         client_kwargs.update(
             aws_access_key_id=settings.aws_access_key_id,
