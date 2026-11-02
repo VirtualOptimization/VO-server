@@ -1,10 +1,11 @@
 """Convert RoomPlan furniture catalog USDC files to GLB, upload to S3, and sync DB.
 
-Example:
+The upload and DB sync here use the legacy key layout (assets/roomplan-catalog/v1,
+"chair:Name" keys). For the current asset/ catalog, convert only, then upload
+tmp/roomplan-catalog/glb/ under asset/ and run seed_base_furniture_models_from_s3.py:
     .venv/bin/python scripts/prepare_roomplan_catalog.py \
         --catalog-root /path/to/RoomPlanCatalog.bundle \
-        --bucket project7-65-sydney-vo-s3 \
-        --prefix assets/roomplan-catalog/v1
+        --skip-upload --skip-db
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -89,9 +91,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fallback-converter",
-        choices=("auto", "blender", "none"),
+        choices=("auto", "strip-uv", "blender", "none"),
         default=os.getenv("MODEL_CATALOG_FALLBACK_CONVERTER", "auto"),
-        help="Fallback converter to use when usd2gltf fails.",
+        help="Fallback converter to use when usd2gltf fails. auto tries strip-uv, then Blender.",
     )
     parser.add_argument(
         "--force-convert",
@@ -188,11 +190,14 @@ bpy.ops.export_scene.gltf(
     export_apply=True,
 )
 """
-    result = subprocess.run(
-        [blender_bin, "--background", "--python-expr", script],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [blender_bin, "--background", "--python-expr", script],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return f"Blender executable not found: {blender_bin}"
 
     if result.returncode == 0 and output_path.exists():
         if result.stdout:
@@ -201,6 +206,42 @@ bpy.ops.export_scene.gltf(
             print(result.stderr.strip())
         return None
 
+    return "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+
+
+def run_usd2gltf_without_uvs(usd2gltf_bin: str, input_path: Path, output_path: Path) -> str | None:
+    """Convert a copy of the model with its UV primvars removed.
+
+    Some RoomPlan catalog chairs (the starLegs models) carry UV indices that do
+    not match their faces, and usd2gltf fails while triangulating them. The
+    catalog models have no textures and are recolored with solid colors later,
+    so dropping the UVs loses nothing. The source USDC is left untouched.
+    """
+    try:
+        from pxr import Usd, UsdGeom
+    except ModuleNotFoundError:
+        return "pxr module is not installed; cannot strip UVs"
+
+    stage = Usd.Stage.Open(Usd.Stage.Open(str(input_path)).Flatten())
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        primvars = UsdGeom.PrimvarsAPI(prim)
+        for primvar in primvars.GetPrimvars():
+            if primvar.GetTypeName().role == "TextureCoordinate" or primvar.GetPrimvarName() in ("st", "uv", "st0"):
+                primvars.RemovePrimvar(primvar.GetPrimvarName())
+
+    with tempfile.TemporaryDirectory(prefix="vo-catalog-") as tmp_dir:
+        stripped_path = Path(tmp_dir) / input_path.name
+        stage.Export(str(stripped_path))
+        result = subprocess.run(
+            [usd2gltf_bin, "-i", str(stripped_path), "-o", str(output_path)],
+            capture_output=True,
+            text=True,
+        )
+
+    if result.returncode == 0 and output_path.exists():
+        return None
     return "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
 
 
@@ -303,20 +344,23 @@ def convert_usdc_to_glb(
     if fallback_converter == "none":
         return usd2gltf_error
 
+    errors = [f"usd2gltf failed:\n{usd2gltf_error}"]
+
+    if fallback_converter in {"auto", "strip-uv"}:
+        print("  [FALLBACK] usd2gltf failed; retrying without UVs...")
+        strip_error = run_usd2gltf_without_uvs(usd2gltf_bin, input_path, output_path)
+        if strip_error is None:
+            return None
+        errors.append(f"UV-stripped fallback failed:\n{strip_error}")
+
     if fallback_converter in {"auto", "blender"}:
-        print("  [FALLBACK] usd2gltf failed; retrying with Blender...")
+        print("  [FALLBACK] retrying with Blender...")
         blender_error = run_blender_usd_to_glb(blender_bin, input_path, output_path)
         if blender_error is None:
             return None
+        errors.append(f"Blender fallback failed:\n{blender_error}")
 
-        return (
-            "usd2gltf failed:\n"
-            f"{usd2gltf_error}\n\n"
-            "Blender fallback failed:\n"
-            f"{blender_error}"
-        )
-
-    return usd2gltf_error
+    return "\n\n".join(errors)
 
 
 def convert_and_fix_usdc_to_glb(
