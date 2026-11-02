@@ -223,7 +223,8 @@ def _get_room_objects_with_model_ids(
     model_map: dict[str, tuple[int, str]] = {}
     for model in models:
         for alias in _catalog_model_db_aliases(model):
-            model_map.setdefault(alias, (model.id, model.model_key))
+            # Case-insensitive: saved room JSON can carry older key casing (e.g. "_lshaped").
+            model_map.setdefault(alias.lower(), (model.id, model.model_key))
 
     objects_result = []
     for obj in raw_objects:
@@ -231,7 +232,7 @@ def _get_room_objects_with_model_ids(
             continue
         model_key = object_model_key(obj)
         identifier = obj.get("identifier")
-        matched_model = model_map.get(model_key)
+        matched_model = model_map.get(model_key.lower()) if model_key else None
         resolved_model_key = matched_model[1] if matched_model else model_key
         resolved_model_id = matched_model[0] if matched_model else None
 

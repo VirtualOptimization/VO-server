@@ -24,7 +24,10 @@ DEFAULT_MODEL_VARIANT_BY_FILENAME = {
     "shelf_vertical": "Shelf",
     # RoomPlan의 modelFileName(otherLegType)과 실제 카탈로그 폴더명(unidentifiedLegs)
     # 표기가 달라 폴더명 추측이 어긋난다.
+    "Unidentified_wBack_otherLegType_noArms": "Unidentified_wBack_unidentifiedLegs_noArms",
     "Unidentified_wBack_otherLegType_wArms": "Unidentified_wBack_unidentifiedLegs_wArms",
+    # 파일명은 lshaped, 폴더명은 lShaped로 대소문자가 다르다.
+    "CoffeeTable_lshaped": "CoffeeTable_lShaped",
 }
 
 
@@ -61,10 +64,8 @@ def infer_catalog_model_key(category: str, model_file_name: str | None) -> str |
     if not base_name or not variant:
         return None
 
-    # S3 catalog GLB names use this lowercase variant, and DB keys mirror it
-    # with the .rooms.usdc source extension.
-    model_name = base_name.replace("_lShaped", "_lshaped")
-    return f"{category_dir}/{variant}/{model_name}.rooms.usdc"
+    # DB keys mirror the S3 catalog GLB path with the .rooms.usdc source extension.
+    return f"{category_dir}/{variant}/{base_name}.rooms.usdc"
 
 
 def build_optimizer_metadata(category: str) -> dict[str, Any]:
