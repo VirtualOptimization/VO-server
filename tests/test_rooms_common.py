@@ -9,6 +9,52 @@ from server.api.v1.endpoints.rooms_common import (
 )
 from server.services.transform.mappers import infer_catalog_model_key
 
+# RoomPlanCatalog.bundle/Resources layout, mirrored 1:1 under s3://<bucket>/asset/ as .glb.
+CATALOG_BUNDLE_PATHS = [
+    "Chair/Default/DefaultChair.rooms.usdc",
+    "Chair/DiningChair_wBack_fourLegs_noArms/DiningChair_wBack_fourLegs_noArms.rooms.usdc",
+    "Chair/DiningChair_wBack_fourLegs_wArms/DiningChair_wBack_fourLegs_wArms.rooms.usdc",
+    "Chair/Stool_noBack_fourLegs_noArms/Stool_noBack_fourLegs_noArms.rooms.usdc",
+    "Chair/Stool_noBack_fourLegs_wArms/Stool_noBack_fourLegs_wArms.rooms.usdc",
+    "Chair/Stool_noBack_starLegs_noArms/Stool_noBack_starLegs_noArms.rooms.usdc",
+    "Chair/Stool_noBack_starLegs_wArms/Stool_noBack_starLegs_wArms.rooms.usdc",
+    "Chair/Stool_noBack_unidentifiedLegs_noArms/Stool_noBack_unidentifiedLegs_noArms.rooms.usdc",
+    "Chair/Stool_noBack_unidentifiedLegs_wArms/Stool_noBack_unidentifiedLegs_wArms.rooms.usdc",
+    "Chair/Swivel_wBack_starLegs_noArms/Swivel_wBack_starLegs_noArms.rooms.usdc",
+    "Chair/Swivel_wBack_starLegs_wArms/Swivel_wBack_starLegs_wArms.rooms.usdc",
+    "Chair/Unidentified_noBack_fourLegs_noArms/Stool_noBack_fourLegs_noArms.rooms.usdc",
+    "Chair/Unidentified_noBack_fourLegs_wArms/Stool_noBack_fourLegs_wArms.rooms.usdc",
+    "Chair/Unidentified_noBack_starLegs_noArms/Stool_noBack_starLegs_noArms.rooms.usdc",
+    "Chair/Unidentified_noBack_starLegs_wArms/Stool_noBack_starLegs_wArms.rooms.usdc",
+    "Chair/Unidentified_noBack_unidentifiedLegs_noArms/Stool_noBack_unidentifiedLegs_noArms.rooms.usdc",
+    "Chair/Unidentified_noBack_unidentifiedLegs_wArms/Stool_noBack_unidentifiedLegs_wArms.rooms.usdc",
+    "Chair/Unidentified_wBack_fourLegs_noArms/Unidentified_wBack_fourLegs_noArms.rooms.usdc",
+    "Chair/Unidentified_wBack_fourLegs_wArms/Unidentified_wBack_fourLegs_wArms.rooms.usdc",
+    "Chair/Unidentified_wBack_starLegs_noArms/Swivel_wBack_starLegs_noArms.rooms.usdc",
+    "Chair/Unidentified_wBack_starLegs_wArms/Swivel_wBack_starLegs_wArms.rooms.usdc",
+    "Chair/Unidentified_wBack_unidentifiedLegs_noArms/Unidentified_wBack_otherLegType_noArms.rooms.usdc",
+    "Chair/Unidentified_wBack_unidentifiedLegs_wArms/Unidentified_wBack_otherLegType_wArms.rooms.usdc",
+    "Sofa/Default/Rectangular.rooms.usdc",
+    "Sofa/LShaped/LShaped.rooms.usdc",
+    "Sofa/LShapedExtension/LShapedExtension.rooms.usdc",
+    "Sofa/Rectangular/Rectangular.rooms.usdc",
+    "Sofa/SingleSeat/SingleSeat.rooms.usdc",
+    "Sofa/Unidentified/Rectangular.rooms.usdc",
+    "Storage/Shelf/shelf_vertical.rooms.usdc",
+    "Table/CoffeeTable_circularElliptic/CoffeeTable_circularElliptic.rooms.usdc",
+    "Table/CoffeeTable_lShaped/CoffeeTable_lshaped.rooms.usdc",
+    "Table/CoffeeTable_rectangular/CoffeeTable_rectangular.rooms.usdc",
+    "Table/CoffeeTable_unidentifiedShape/CoffeeTable_rectangular.rooms.usdc",
+    "Table/Default/DefaultTable.rooms.usdc",
+    "Table/DiningTable_circularElliptic/DiningTable_circularElliptic.rooms.usdc",
+    "Table/DiningTable_rectangular/DiningTable_rectangular.rooms.usdc",
+    "Table/DiningTable_unidentifiedShape/DiningTable_rectangular.rooms.usdc",
+    "Table/Unidentified_circularElliptic/Unidentified_circularElliptic.rooms.usdc",
+    "Table/Unidentified_lShaped/Unidentified_lShaped.rooms.usdc",
+    "Table/Unidentified_rectangular/Unidentified_rectangular.rooms.usdc",
+    "Table/Unidentified_unidentifiedShape/Unidentified_rectangular.rooms.usdc",
+]
+
 
 class CatalogModelAssetUrlsTest(IsolatedAsyncioTestCase):
     async def test_returns_glb_and_only_existing_usdz_urls(self) -> None:
@@ -114,3 +160,15 @@ class CatalogModelAssetUrlsTest(IsolatedAsyncioTestCase):
         result = _attach_model_asset_urls(objects, model_urls, {})
 
         self.assertEqual(result[0]["glb_url"], "signed:desk.glb")
+
+    def test_every_catalog_file_resolves_to_an_uploaded_asset(self) -> None:
+        # iOS sends only the file name (lastPathComponent) and the RoomPlan category.
+        s3_keys = {f"asset/{path.removesuffix('.usdc')}.glb" for path in CATALOG_BUNDLE_PATHS}
+        db_keys = set(CATALOG_BUNDLE_PATHS)
+        for path in CATALOG_BUNDLE_PATHS:
+            category, filename = path.split("/")[0].lower(), path.split("/")[-1]
+            with self.subTest(path=path):
+                self.assertIn(_catalog_model_key(category, filename), s3_keys)
+                db_key = _catalog_db_model_key(category, filename)
+                self.assertIn(db_key, db_keys)
+                self.assertEqual(infer_catalog_model_key(category, filename), db_key)
