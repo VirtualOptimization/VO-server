@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     database_url: str = Field(validation_alias="DATABASE_URL")
     async_database_url: str = Field(validation_alias="ASYNC_DATABASE_URL")
 
-    aws_region: str = Field(default="ap-southeast-2", validation_alias="AWS_REGION")
+    aws_region: str = Field(default="ap-northeast-2", validation_alias="AWS_REGION")
     s3_bucket_name: str = Field(default="", validation_alias="S3_BUCKET_NAME")
     aws_access_key_id: str = Field(default="", validation_alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str = Field(default="", validation_alias="AWS_SECRET_ACCESS_KEY")
