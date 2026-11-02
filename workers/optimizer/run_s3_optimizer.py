@@ -115,7 +115,7 @@ def main() -> int:
             print("optimizer: first pass failed, requesting Claude recovery strategy", flush=True)
             problem = maybe_apply_ai_constraints(problem, build_failure_context(optimized))
             if problem.get("ai_used"):
-                retry_problem = prepare_ai_retry_problem(problem)
+                retry_problem = prepare_ai_retry_problem(problem, optimized)
                 retry_optimizer = CanonicalLayoutOptimizer(retry_problem)
                 retry_output = retry_optimizer.optimize(
                     global_maxiter=global_maxiter,
