@@ -14,6 +14,7 @@ After=network.target vo-server.service
 User=ubuntu
 WorkingDirectory=${APP_DIR}
 Environment=ENV=local
+Environment=PYTHONPATH=${APP_DIR}
 Environment=PATH=/home/ubuntu/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=${PYTHON_BIN} workers/converter/run_conversion_task_worker.py
 Restart=always

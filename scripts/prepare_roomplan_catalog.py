@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--region",
-        default=os.getenv("AWS_REGION", "ap-southeast-2"),
+        default=os.getenv("AWS_REGION", "ap-northeast-2"),
         help="AWS region for the S3 client.",
     )
     parser.add_argument(

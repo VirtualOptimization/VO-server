@@ -5,12 +5,12 @@ GLB-to-USDZ converter installed. It is a dry run unless ``--apply`` is given.
 
 Example:
     python scripts/recolor_base_furniture_assets.py \
-        --bucket project7-65-sydney-vo-s3 \
-        --region ap-southeast-2
+        --bucket vo-seoul-s3 \
+        --region ap-northeast-2
 
     python scripts/recolor_base_furniture_assets.py \
-        --bucket project7-65-sydney-vo-s3 \
-        --region ap-southeast-2 \
+        --bucket vo-seoul-s3 \
+        --region ap-northeast-2 \
         --apply
 """
 
@@ -95,7 +95,7 @@ def load_env_file(path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bucket", default=os.getenv("S3_BUCKET_NAME"))
-    parser.add_argument("--region", default=os.getenv("AWS_REGION", "ap-southeast-2"))
+    parser.add_argument("--region", default=os.getenv("AWS_REGION", "ap-northeast-2"))
     parser.add_argument("--prefix", default="asset")
     parser.add_argument(
         "--backup-prefix",

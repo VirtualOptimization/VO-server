@@ -8,7 +8,7 @@ DB model_key layout:
 
 Example:
     .venv/bin/python scripts/seed_base_furniture_models_from_s3.py \
-        --bucket project7-65-sydney-vo-s3 \
+        --bucket vo-seoul-s3 \
         --prefix asset
 """
 
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--region",
-        default=os.getenv("AWS_REGION", "ap-southeast-2"),
+        default=os.getenv("AWS_REGION", "ap-northeast-2"),
         help="AWS region for S3.",
     )
     parser.add_argument("--default-width", type=float, default=1.0)
