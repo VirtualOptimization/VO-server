@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import smtplib
 from email.message import EmailMessage
+from html import escape
 
 from fastapi import HTTPException
 
@@ -68,10 +69,68 @@ def send_email_verification_code(email: str, code: str, expires_in_seconds: int)
     )
 
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
-            smtp.starttls()
-            smtp.login(settings.smtp_username, settings.smtp_password)
-            smtp.send_message(message)
+        _send(message)
     except Exception:
         logger.exception("Failed to send verification email to %s", email)
         raise HTTPException(status_code=500, detail="인증번호 이메일 발송에 실패했습니다.")
+
+
+def _send(message: EmailMessage) -> None:
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
+        smtp.starttls()
+        smtp.login(settings.smtp_username, settings.smtp_password)
+        smtp.send_message(message)
+
+
+def send_guestbook_card(to: str, nickname: str, message_text: str, mood: str | None, photo_url: str | None) -> None:
+    """Email a guestbook card. Every visitor-written value is HTML-escaped."""
+    if not is_smtp_configured():
+        raise HTTPException(status_code=503, detail="메일 발송 설정이 필요합니다.")
+
+    from_email = settings.smtp_from_email or settings.smtp_username
+    name, body, feeling = escape(nickname), escape(message_text).replace("\n", "<br>"), escape(mood or "")
+    photo_html = (
+        f'<img src="{escape(photo_url)}" alt="" style="display:block; width:100%; border-radius:12px; margin:0 0 20px;">'
+        if photo_url
+        else ""
+    )
+    mood_html = f'<p style="margin:0 0 16px; font-size:13px; color:#3f6fb5;">{feeling}</p>' if mood else ""
+
+    message = EmailMessage()
+    # Headers cannot hold line breaks a visitor might type into the nickname.
+    message["Subject"] = f"[V-O] {' '.join(nickname.split())}님이 방명록 카드를 보냈어요"
+    message["From"] = f"{settings.smtp_from_name} <{from_email}>"
+    message["To"] = to
+    message.set_content(
+        "\n".join(
+            [f"{nickname}님이 V-O 방명록에 남긴 카드예요.", ""]
+            + ([f"기분: {mood}"] if mood else [])
+            + [message_text, "", "V-O 졸업 전시에서 보낸 메일입니다."]
+        )
+    )
+    message.add_alternative(
+        f"""
+        <!doctype html>
+        <html lang="ko">
+          <body style="margin:0; padding:0; background:#f6f8fb; font-family:Arial, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; color:#1f2937;">
+            <div style="max-width:520px; margin:0 auto; padding:32px 20px;">
+              <div style="background:#ffffff; border:1px solid #e5e7eb; border-radius:16px; padding:32px 28px;">
+                <p style="margin:0 0 12px; font-size:14px; font-weight:700; color:#9bb7e5;">V-O</p>
+                <h1 style="margin:0 0 20px; font-size:22px; line-height:1.4; font-weight:800; color:#111827;">{name}님이 보낸 방명록 카드</h1>
+                {photo_html}
+                {mood_html}
+                <p style="margin:0 0 24px; font-size:16px; line-height:1.7; color:#374151;">{body}</p>
+                <p style="margin:0; font-size:13px; line-height:1.6; color:#9ca3af;">V-O 졸업 전시에서 보낸 메일입니다.</p>
+              </div>
+            </div>
+          </body>
+        </html>
+        """,
+        subtype="html",
+    )
+
+    try:
+        _send(message)
+    except Exception:
+        logger.exception("Failed to send guestbook card to %s", to)
+        raise HTTPException(status_code=502, detail="카드 메일을 보내지 못했어요. 잠시 후 다시 시도해 주세요.") from None

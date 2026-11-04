@@ -113,3 +113,52 @@ class GuestbookApiTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuestbookCardTest(unittest.IsolatedAsyncioTestCase):
+    def _payload(self, **overrides):
+        from server.schemas.guestbook import GuestbookCardRequest
+
+        values = {"to": "friend@example.com", "nickname": "연짱", "message": "수고했어", "mood": "반가워요"}
+        values.update(overrides)
+        return GuestbookCardRequest(**values)
+
+    async def test_card_needs_the_configured_key(self):
+        with patch.object(guestbook.settings, "guestbook_api_key", ""):
+            with self.assertRaises(HTTPException) as ctx:
+                await guestbook.send_card(self._payload(), x_guestbook_key="anything")
+            self.assertEqual(ctx.exception.status_code, 503)
+        with patch.object(guestbook.settings, "guestbook_api_key", "secret"):
+            for key in (None, "wrong"):
+                with self.subTest(key=key), self.assertRaises(HTTPException) as ctx:
+                    await guestbook.send_card(self._payload(), x_guestbook_key=key)
+                self.assertEqual(ctx.exception.status_code, 401)
+
+    async def test_card_is_sent_with_cleaned_fields(self):
+        with patch.object(guestbook.settings, "guestbook_api_key", "secret"), patch.object(
+            guestbook, "send_guestbook_card"
+        ) as send:
+            result = await guestbook.send_card(
+                self._payload(to="  friend@example.com ", photo_url="https://v-o.cloud/p.jpg"), x_guestbook_key="secret"
+            )
+        self.assertTrue(result.sent)
+        send.assert_called_once_with("friend@example.com", "연짱", "수고했어", "반가워요", "https://v-o.cloud/p.jpg")
+
+    async def test_bad_card_input_is_rejected(self):
+        with patch.object(guestbook.settings, "guestbook_api_key", "secret"), patch.object(guestbook, "send_guestbook_card") as send:
+            for overrides in ({"to": "not-an-email"}, {"photo_url": "http://v-o.cloud/p.jpg"}, {"message": ""}):
+                with self.subTest(overrides=overrides), self.assertRaises(HTTPException) as ctx:
+                    await guestbook.send_card(self._payload(**overrides), x_guestbook_key="secret")
+                self.assertEqual(ctx.exception.status_code, 400)
+        send.assert_not_called()
+
+    def test_card_email_escapes_visitor_text(self):
+        from server.services import email_service
+
+        with patch.object(email_service, "is_smtp_configured", return_value=True), patch.object(email_service, "_send") as smtp:
+            email_service.send_guestbook_card("a@example.com", "<b>해커</b>\n", "<script>x</script>", None, None)
+        message = smtp.call_args.args[0]
+        html = message.get_body(("html",)).get_content()
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("\n", message["Subject"])

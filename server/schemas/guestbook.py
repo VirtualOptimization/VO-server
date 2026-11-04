@@ -17,6 +17,19 @@ class GuestbookCreateRequest(BaseModel):
     consent: bool | None = None
 
 
+class GuestbookCardRequest(BaseModel):
+    # Checked in services/guestbook_rules.py, like GuestbookCreateRequest.
+    to: str | None = None
+    nickname: str | None = None
+    message: str | None = None
+    mood: str | None = None
+    photo_url: str | None = None
+
+
+class GuestbookCardResponse(BaseModel):
+    sent: bool
+
+
 class GuestbookEntryResponse(BaseModel):
     id: str
     nickname: str

@@ -5,19 +5,32 @@ stored in S3 and returned as presigned URLs.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import secrets
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 
+from server.core.config import settings
 from server.core.s3 import delete_objects, generate_presigned_url, upload_bytes
-from server.schemas.guestbook import GuestbookCreateRequest, GuestbookEntryResponse, GuestbookListResponse
+from server.schemas.guestbook import (
+    GuestbookCardRequest,
+    GuestbookCardResponse,
+    GuestbookCreateRequest,
+    GuestbookEntryResponse,
+    GuestbookListResponse,
+)
+from server.services.email_service import send_guestbook_card
 from server.services.guestbook_rules import (
     MESSAGE_MAX_LENGTH,
+    MOOD_MAX_LENGTH,
     NICKNAME_MAX_LENGTH,
     InvalidInput,
     decode_photo,
+    normalize_email,
+    normalize_photo_url,
     normalize_text,
     require_consent,
 )
@@ -54,6 +67,30 @@ async def list_guests(limit: int = Query(100, ge=1, le=500)):
         return GuestbookListResponse(entries=[_entry_response(entry) for entry in entries])
     finally:
         db.close()
+
+
+@router.post("/send-card", response_model=GuestbookCardResponse, summary="방명록 카드 메일 보내기 (웹사이트 서버 전용)")
+async def send_card(payload: GuestbookCardRequest, x_guestbook_key: str | None = Header(default=None)):
+    """Email a guestbook card to the address a visitor typed, using V-O's Gmail SMTP.
+
+    Only the website server may call this: without the shared key anyone could
+    send mail in V-O's name.
+    """
+    if not settings.guestbook_api_key:
+        raise HTTPException(status_code=503, detail="카드 메일 발송이 설정되지 않았어요.")
+    if not x_guestbook_key or not secrets.compare_digest(x_guestbook_key, settings.guestbook_api_key):
+        raise HTTPException(status_code=401, detail="인증되지 않은 요청이에요.")
+    try:
+        to = normalize_email(payload.to)
+        nickname = normalize_text(payload.nickname, field="닉네임", max_length=NICKNAME_MAX_LENGTH)
+        message = normalize_text(payload.message, field="내용", max_length=MESSAGE_MAX_LENGTH)
+        mood = (payload.mood or "").strip()[:MOOD_MAX_LENGTH] or None
+        photo_url = normalize_photo_url(payload.photo_url)
+    except InvalidInput as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    await asyncio.to_thread(send_guestbook_card, to, nickname, message, mood, photo_url)
+    return GuestbookCardResponse(sent=True)
 
 
 @router.post("", response_model=GuestbookEntryResponse, status_code=201, summary="방명록 등록")

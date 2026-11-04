@@ -34,6 +34,28 @@ def normalize_text(value: str | None, *, field: str, max_length: int) -> str:
     return text
 
 
+MOOD_MAX_LENGTH = 20
+PHOTO_URL_MAX_LENGTH = 2048
+_EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$")
+
+
+def normalize_email(value: str | None) -> str:
+    email = (value or "").strip()
+    if len(email) > 254 or not _EMAIL.match(email):
+        raise InvalidInput("받는 사람 이메일을 다시 확인해 주세요.")
+    return email
+
+
+def normalize_photo_url(value: str | None) -> str | None:
+    """The card links an image the website already hosts; only plain https URLs."""
+    url = (value or "").strip()
+    if not url:
+        return None
+    if len(url) > PHOTO_URL_MAX_LENGTH or not url.startswith("https://") or any(c in url for c in "\"'<> "):
+        raise InvalidInput("사진 주소가 올바르지 않아요.")
+    return url
+
+
 def require_consent(consent: bool | None) -> None:
     if consent is not True:
         raise InvalidInput("개인정보 수집·이용에 동의해 주세요.")
