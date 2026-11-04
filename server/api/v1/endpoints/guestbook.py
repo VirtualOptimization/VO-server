@@ -25,11 +25,11 @@ from server.schemas.guestbook import (
 from server.services.email_service import send_guestbook_card
 from server.services.guestbook_rules import (
     MESSAGE_MAX_LENGTH,
-    MOOD_MAX_LENGTH,
     NICKNAME_MAX_LENGTH,
     InvalidInput,
     decode_photo,
     normalize_email,
+    normalize_mood,
     normalize_photo_url,
     normalize_text,
     require_consent,
@@ -49,6 +49,7 @@ def _entry_response(entry: GuestbookEntry) -> GuestbookEntryResponse:
         id=entry.id,
         nickname=entry.nickname,
         message=entry.message,
+        mood=entry.mood,
         photo=generate_presigned_url(entry.photo_key, PHOTO_URL_EXPIRES_SECONDS) if entry.photo_key else None,
         created_at=entry.created_at,
     )
@@ -84,7 +85,7 @@ async def send_card(payload: GuestbookCardRequest, x_guestbook_key: str | None =
         to = normalize_email(payload.to)
         nickname = normalize_text(payload.nickname, field="닉네임", max_length=NICKNAME_MAX_LENGTH)
         message = normalize_text(payload.message, field="내용", max_length=MESSAGE_MAX_LENGTH)
-        mood = (payload.mood or "").strip()[:MOOD_MAX_LENGTH] or None
+        mood = normalize_mood(payload.mood)
         photo_url = normalize_photo_url(payload.photo_url)
     except InvalidInput as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
@@ -98,6 +99,7 @@ async def create_guest(payload: GuestbookCreateRequest):
     try:
         nickname = normalize_text(payload.nickname, field="닉네임", max_length=NICKNAME_MAX_LENGTH)
         message = normalize_text(payload.message, field="내용", max_length=MESSAGE_MAX_LENGTH)
+        mood = normalize_mood(payload.mood)
         require_consent(payload.consent)
         photo = decode_photo(payload.photo)
     except InvalidInput as exc:
@@ -121,6 +123,7 @@ async def create_guest(payload: GuestbookCreateRequest):
             id=entry_id,
             nickname=nickname,
             message=message,
+            mood=mood,
             photo_key=photo_key,
             consent_at=now,
             created_at=now,

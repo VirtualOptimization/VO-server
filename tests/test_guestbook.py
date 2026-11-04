@@ -89,9 +89,16 @@ class GuestbookApiTest(unittest.IsolatedAsyncioTestCase):
         await self._post(nickname="두번째", photo=PNG_DATA_URL)
         entries = await self._list()
         self.assertEqual([e["nickname"] for e in entries], ["두번째", "첫번째"])
-        self.assertEqual(set(entries[0]), {"id", "nickname", "message", "photo", "created_at"})
+        self.assertEqual(set(entries[0]), {"id", "nickname", "message", "mood", "photo", "created_at"})
         self.assertEqual(entries[0]["photo"], f"https://signed/guestbook/{entries[0]['id']}.png")
         self.upload.assert_awaited_once()
+
+    async def test_mood_is_optional_and_stored(self):
+        self.assertIsNone((await self._post())["mood"])
+        self.assertEqual((await self._post(mood="  반가워요 "))["mood"], "반가워요")
+        with self.assertRaises(HTTPException) as caught:
+            await self._post(mood="가" * 21)
+        self.assertEqual(caught.exception.status_code, 400)
 
     async def test_invalid_input_returns_400_with_message(self):
         for overrides in (
