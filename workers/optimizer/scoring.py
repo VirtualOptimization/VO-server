@@ -19,6 +19,7 @@ movement dimensions) and the bedroom design guideline on p.188.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -39,6 +40,8 @@ PLACEMENT_FEEDBACK_TOLERANCE_M = 0.03
 # Deducted per overlapping furniture pair / per piece outside the room.
 OVERLAP_PENALTY = 5
 OUT_OF_ROOM_PENALTY = 5
+# How much of its depth a chair may sit under its own desk/table without counting as overlap.
+CHAIR_TUCK_RATIO = 0.7
 
 # role -> (which side needs room, distance in metres, Korean label)
 USE_CLEARANCE: dict[str, tuple[str, float, str]] = {
@@ -93,8 +96,13 @@ def _overlapping_pairs(optimizer: CanonicalLayoutOptimizer, coords: np.ndarray, 
                 if fi["type"] == "chair" and fj["type"] == "chair":
                     continue
                 chair, support = (i, j) if fi["type"] == "chair" else (j, i)
-                depth -= optimizer._allowed_chair_support_penetration(
-                    optimizer.furnitures[chair], coords[chair], optimizer.furnitures[support], coords[support]
+                # Visitors push chairs all the way under their desk, which is how a
+                # desk is normally left; only deeper than that counts as an overlap.
+                depth -= max(
+                    optimizer._allowed_chair_support_penetration(
+                        optimizer.furnitures[chair], coords[chair], optimizer.furnitures[support], coords[support]
+                    ),
+                    CHAIR_TUCK_RATIO * float(optimizer.furnitures[chair]["extent"][1]),
                 )
             if depth > PLACEMENT_FEEDBACK_TOLERANCE_M:
                 count += 1
@@ -180,6 +188,29 @@ def _free_depth(
             break
         free += step
     return min(free, needed)
+
+
+def _best_facing(optimizer: CanonicalLayoutOptimizer, coords: np.ndarray, roles: list[str], evaluate) -> np.ndarray:
+    """Turn front-scored boxes (desks, tables, storage) 180 degrees where that scores higher.
+
+    A rectangular piece looks the same in the editor after a half turn, so a
+    visitor who copies the AI layout can leave a table or shelf "facing" the wall
+    and lose front-clearance, principle and chair-tuck points for a difference
+    they cannot see. Both the AI and visitor layouts are scored in the facing that
+    suits them best. The footprint, and so the open floor, does not change.
+    """
+    coords = coords.copy()
+    best = evaluate(coords)["total_score"]
+    for i in range(optimizer.num_f):
+        rule = USE_CLEARANCE.get(roles[i])
+        if rule is None or rule[0] != "front" or optimizer._is_wall_mounted(i):
+            continue
+        trial = coords.copy()
+        trial[i, 3] = (float(trial[i, 3]) + math.pi) % (2.0 * math.pi)
+        score = evaluate(trial)["total_score"]
+        if score > best:
+            coords, best = trial, score
+    return coords
 
 
 def _use_credit(
@@ -269,42 +300,48 @@ def score_layout(problem: dict[str, Any], reference_usable_m2: float | None = No
         "room_area_m2": round(optimizer.room_width * optimizer.room_depth, 2),
     }
 
-    overlapping = _overlapping_pairs(optimizer, coords, footprints)
-    outside = sum(_protrusion(optimizer, corners) > PLACEMENT_FEEDBACK_TOLERANCE_M for corners in footprints)
-    placement_hints = []
-    penalty = OVERLAP_PENALTY * overlapping + OUT_OF_ROOM_PENALTY * outside
-    if overlapping:
-        placement_hints.append(f"가구 {overlapping}쌍이 겹쳐 있어요 (-{OVERLAP_PENALTY * overlapping}점)")
-    if outside:
-        placement_hints.append(f"가구 {outside}개가 방 밖으로 나가 있어요 (-{OUT_OF_ROOM_PENALTY * outside}점)")
-
     roles = [lh.role(f, optimizer.furnitures) for f in optimizer.furnitures]
-    door_credit, door_hints = _door_credit(optimizer, footprints)
-    use_credit, use_hints = _use_credit(optimizer, coords, footprints, roles)
-    principle_credit, principle_hints = _principle_credit(optimizer, coords)
-
     reference = reference_usable_m2 if reference_usable_m2 and reference_usable_m2 > 0 else 0.5 * result["room_area_m2"]
     space_ratio = usable / reference if reference > 0 else 0.0
+    door_credit, door_hints = _door_credit(optimizer, footprints)
 
-    door = round(MAX_DOOR * door_credit, 1)
-    use = round(MAX_USE * use_credit, 1)
-    principles = round(MAX_PRINCIPLES * principle_credit, 1)
-    space = round(MAX_SPACE * min(space_ratio, 1.0), 1)
-    hints = placement_hints + door_hints + use_hints + principle_hints
-    if space_ratio < 0.99:
-        hints.append(f"빈 공간이 AI 배치의 {round(space_ratio * 100)}%예요")
+    def evaluate(pose: np.ndarray) -> dict[str, Any]:
+        overlapping = _overlapping_pairs(optimizer, pose, footprints)
+        outside = sum(_protrusion(optimizer, corners) > PLACEMENT_FEEDBACK_TOLERANCE_M for corners in footprints)
+        placement_hints = []
+        penalty = OVERLAP_PENALTY * overlapping + OUT_OF_ROOM_PENALTY * outside
+        if overlapping:
+            placement_hints.append(f"가구 {overlapping}쌍이 겹쳐 있어요 (-{OVERLAP_PENALTY * overlapping}점)")
+        if outside:
+            placement_hints.append(f"가구 {outside}개가 방 밖으로 나가 있어요 (-{OUT_OF_ROOM_PENALTY * outside}점)")
+
+        use_credit, use_hints = _use_credit(optimizer, pose, footprints, roles)
+        principle_credit, principle_hints = _principle_credit(optimizer, pose)
+
+        door = round(MAX_DOOR * door_credit, 1)
+        use = round(MAX_USE * use_credit, 1)
+        principles = round(MAX_PRINCIPLES * principle_credit, 1)
+        space = round(MAX_SPACE * min(space_ratio, 1.0), 1)
+        hints = placement_hints + door_hints + use_hints + principle_hints
+        if space_ratio < 0.99:
+            hints.append(f"빈 공간이 AI 배치의 {round(space_ratio * 100)}%예요")
+        return {
+            "total_score": max(0.0, round(door + use + principles + space - penalty, 1)),
+            "breakdown": {
+                "safety": round(door + use, 1),
+                "door_clearance": door,
+                "furniture_use": use,
+                "principles": principles,
+                "space": space,
+                "penalty": float(penalty),
+            },
+            "hints": hints,
+        }
+
+    scored = evaluate(_best_facing(optimizer, coords, roles, evaluate))
     return {
         **result,
         "disqualified": False,
-        "total_score": max(0.0, round(door + use + principles + space - penalty, 1)),
-        "breakdown": {
-            "safety": round(door + use, 1),
-            "door_clearance": door,
-            "furniture_use": use,
-            "principles": principles,
-            "space": space,
-            "penalty": float(penalty),
-        },
+        **scored,
         "beat_ai": bool(reference_usable_m2) and usable > reference_usable_m2 + BEAT_AI_MARGIN_M2,
-        "hints": hints,
     }
