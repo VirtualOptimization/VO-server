@@ -118,10 +118,6 @@ class GuestbookApiTest(unittest.IsolatedAsyncioTestCase):
         self.upload.assert_not_awaited()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GuestbookCardTest(unittest.IsolatedAsyncioTestCase):
     def _payload(self, **overrides):
         from server.schemas.guestbook import GuestbookCardRequest
@@ -142,18 +138,25 @@ class GuestbookCardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ctx.exception.status_code, 401)
 
     async def test_card_is_sent_with_cleaned_fields(self):
+        files = [object()]
         with patch.object(guestbook.settings, "guestbook_api_key", "secret"), patch.object(
             guestbook, "send_guestbook_card"
-        ) as send:
+        ) as send, patch.object(guestbook, "_card_files", AsyncMock(return_value=files)) as card_files:
             result = await guestbook.send_card(
                 self._payload(to="  friend@example.com ", photo_url="https://v-o.cloud/p.jpg"), x_guestbook_key="secret"
             )
         self.assertTrue(result.sent)
-        send.assert_called_once_with("friend@example.com", "연짱", "수고했어", "반가워요", "https://v-o.cloud/p.jpg")
+        card_files.assert_awaited_once_with("연짱", "수고했어", "반가워요", "https://v-o.cloud/p.jpg", None)
+        send.assert_called_once_with("friend@example.com", "연짱", "수고했어", "반가워요", "https://v-o.cloud/p.jpg", files)
 
     async def test_bad_card_input_is_rejected(self):
         with patch.object(guestbook.settings, "guestbook_api_key", "secret"), patch.object(guestbook, "send_guestbook_card") as send:
-            for overrides in ({"to": "not-an-email"}, {"photo_url": "http://v-o.cloud/p.jpg"}, {"message": ""}):
+            for overrides in (
+                {"to": "not-an-email"},
+                {"photo_url": "http://v-o.cloud/p.jpg"},
+                {"message": ""},
+                {"card_image": "data:image/png;base64,bm90LWEtcG5n"},
+            ):
                 with self.subTest(overrides=overrides), self.assertRaises(HTTPException) as ctx:
                     await guestbook.send_card(self._payload(**overrides), x_guestbook_key="secret")
                 self.assertEqual(ctx.exception.status_code, 400)
@@ -169,3 +172,117 @@ class GuestbookCardTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<script>", html)
         self.assertIn("&lt;script&gt;", html)
         self.assertNotIn("\n", message["Subject"])
+
+
+class GuestbookCardFilesTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.upload = AsyncMock(return_value="s3://bucket/key")
+        self.patches = [
+            patch.object(guestbook, "upload_bytes", self.upload),
+            patch.object(guestbook, "render_card", return_value=b"card-png"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    async def test_card_and_photo_get_save_links(self):
+        photo = (b"\xff\xd8\xff-jpeg", "image/jpeg", "jpg")
+        with patch.object(guestbook.settings, "public_base_url", "https://api.v-o.test/"), patch.object(
+            guestbook, "_fetch_photo", AsyncMock(return_value=photo)
+        ):
+            files = await guestbook._card_files("연짱", "수고했어", "반가워요", "https://v-o.cloud/p.jpg")
+        self.assertEqual([f.label for f in files], ["카드 저장하기", "사진 저장하기"])
+        self.assertEqual([f.filename for f in files], ["V-O 방명록 카드.png", "V-O 방명록 사진.jpg"])
+        self.assertEqual(files[1].data, photo[0])
+        for file in files:
+            self.assertRegex(file.link, r"^https://api\.v-o\.test/api/guests/cards/[0-9a-f]{32}/(card\.png|photo\.jpg)$")
+        self.assertEqual(self.upload.await_count, 2)
+
+    async def test_website_capture_is_used_as_the_card(self):
+        capture = (PNG, "image/png", "png")
+        with patch.object(guestbook.settings, "public_base_url", "https://api.v-o.test"), patch.object(
+            guestbook, "_fetch_photo", AsyncMock(return_value=None)
+        ), patch.object(guestbook, "render_card") as render:
+            files = await guestbook._card_files("연짱", "수고했어", None, "https://v-o.cloud/p.jpg", capture)
+        render.assert_not_called()
+        # The photo could not be fetched, but the website's capture still has it.
+        self.assertEqual([(f.label, f.data) for f in files], [("카드 저장하기", PNG)])
+        self.assertTrue(files[0].link.endswith("/card.png"))
+
+    async def test_card_without_photo_has_only_the_card(self):
+        with patch.object(guestbook.settings, "public_base_url", "https://api.v-o.test"):
+            files = await guestbook._card_files("연짱", "수고했어", None, None)
+        self.assertEqual([f.label for f in files], ["카드 저장하기"])
+
+    async def test_without_public_url_files_are_only_attached(self):
+        with patch.object(guestbook.settings, "public_base_url", ""):
+            files = await guestbook._card_files("연짱", "수고했어", None, None)
+        self.assertIsNone(files[0].link)
+        self.upload.assert_not_awaited()
+
+    async def test_unreachable_photo_skips_the_files(self):
+        with patch.object(guestbook, "_fetch_photo", AsyncMock(return_value=None)):
+            files = await guestbook._card_files("연짱", "수고했어", None, "https://v-o.cloud/p.jpg")
+        self.assertEqual(files, [])
+
+    async def test_download_redirects_to_the_stored_file(self):
+        card_id = "a" * 32
+        with patch.object(guestbook, "object_exists", AsyncMock(return_value=True)), patch.object(
+            guestbook, "generate_presigned_url", return_value="https://signed/card"
+        ) as sign:
+            response = await guestbook.download_card_file(card_id, "card.png")
+        self.assertEqual(response.headers["location"], "https://signed/card")
+        sign.assert_called_once_with(
+            f"guestbook-cards/{card_id}/card.png", guestbook.CARD_URL_EXPIRES_SECONDS, download_name="V-O 방명록 카드.png"
+        )
+
+    async def test_download_rejects_other_paths(self):
+        for card_id, name in (("a" * 32, "../x.png"), ("a" * 32, "photo.exe"), ("not-an-id", "card.png")):
+            with self.subTest(card_id=card_id, name=name), self.assertRaises(HTTPException) as ctx:
+                await guestbook.download_card_file(card_id, name)
+            self.assertEqual(ctx.exception.status_code, 404)
+
+
+class GuestbookCardEmailTest(unittest.TestCase):
+    def test_email_has_save_buttons_and_attachments(self):
+        from server.services import email_service
+
+        files = [
+            email_service.CardFile("V-O 방명록 카드.png", PNG, "image/png", "카드 저장하기", "https://api/cards/1/card.png"),
+            email_service.CardFile("V-O 방명록 사진.jpg", b"jpg", "image/jpeg", "사진 저장하기", None),
+        ]
+        with patch.object(email_service, "is_smtp_configured", return_value=True), patch.object(email_service, "_send") as smtp:
+            email_service.send_guestbook_card("a@example.com", "연짱", "수고했어", None, None, files)
+        message = smtp.call_args.args[0]
+        html = message.get_body(("html",)).get_content()
+        self.assertIn('href="https://api/cards/1/card.png"', html)
+        self.assertIn("카드 저장하기", html)
+        self.assertNotIn("사진 저장하기", html)  # no link, so attached only
+        attachments = [(a.get_filename(), a.get_content_type()) for a in message.iter_attachments()]
+        self.assertEqual(attachments, [("V-O 방명록 카드.png", "image/png"), ("V-O 방명록 사진.jpg", "image/jpeg")])
+
+
+class GuestbookCardImageTest(unittest.TestCase):
+    def test_card_is_drawn_with_and_without_photo(self):
+        import io
+        from datetime import date
+
+        from PIL import Image
+
+        from server.services.guestbook_card_image import render_card
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (800, 600), "#88aacc").save(buffer, format="JPEG")
+        for photo in (buffer.getvalue(), None):
+            with self.subTest(photo=bool(photo)):
+                png = render_card("연짱", "수고했어\n" + "아주 긴 글이에요 " * 12, "반가워요", photo, date(2026, 11, 4))
+                image = Image.open(io.BytesIO(png))
+                self.assertEqual(image.format, "PNG")
+                self.assertEqual(image.width, (340 + 2 * 24) * 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

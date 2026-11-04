@@ -47,6 +47,7 @@ Ubuntu 26.04의 기본 Python은 3.14입니다. 스왑은 3D 변환·최적화 �
 `.env.example`을 기준으로 `~/VO-server/.env`를 만들고 `chmod 600 .env` 합니다.
 `DATABASE_URL`, `ASYNC_DATABASE_URL`은 RDS 엔드포인트를 가리키게 합니다.
 JWT 값 3개는 배포 때 GitHub 시크릿으로 덮어씁니다.
+`PUBLIC_BASE_URL`에는 밖에서 이 서버에 들어오는 주소(예: `http://<EC2_IP>`)를 넣습니다. 방명록 카드 메일의 '카드 저장하기'·'사진 저장하기' 버튼이 이 주소로 연결되고, 비워 두면 카드와 사진은 첨부파일로만 갑니다.
 
 `vo_db`가 없다면 먼저 만듭니다.
 

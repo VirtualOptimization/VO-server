@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import smtplib
+from collections.abc import Sequence
+from dataclasses import dataclass
 from email.message import EmailMessage
 from html import escape
 
@@ -82,7 +84,26 @@ def _send(message: EmailMessage) -> None:
         smtp.send_message(message)
 
 
-def send_guestbook_card(to: str, nickname: str, message_text: str, mood: str | None, photo_url: str | None) -> None:
+@dataclass(frozen=True)
+class CardFile:
+    """A file attached to a guestbook card email, with its save button."""
+
+    filename: str
+    data: bytes
+    content_type: str
+    label: str
+    # Where the button downloads it; without one the file is only attached.
+    link: str | None = None
+
+
+def send_guestbook_card(
+    to: str,
+    nickname: str,
+    message_text: str,
+    mood: str | None,
+    photo_url: str | None,
+    files: Sequence[CardFile] = (),
+) -> None:
     """Email a guestbook card. Every visitor-written value is HTML-escaped."""
     if not is_smtp_configured():
         raise HTTPException(status_code=503, detail="메일 발송 설정이 필요합니다.")
@@ -95,6 +116,13 @@ def send_guestbook_card(to: str, nickname: str, message_text: str, mood: str | N
         else ""
     )
     mood_html = f'<p style="margin:0 0 16px; font-size:13px; color:#3f6fb5;">{feeling}</p>' if mood else ""
+    buttons = "".join(
+        f'<a href="{escape(file.link)}" style="display:inline-block; margin:0 8px 8px 0; padding:11px 18px; border-radius:999px;'
+        f' background:#7395c7; color:#ffffff; font-size:14px; font-weight:700; text-decoration:none;">{escape(file.label)}</a>'
+        for file in files
+        if file.link
+    )
+    buttons_html = f'<div style="margin:0 0 20px;">{buttons}</div>' if buttons else ""
 
     message = EmailMessage()
     # Headers cannot hold line breaks a visitor might type into the nickname.
@@ -120,6 +148,7 @@ def send_guestbook_card(to: str, nickname: str, message_text: str, mood: str | N
                 {photo_html}
                 {mood_html}
                 <p style="margin:0 0 24px; font-size:16px; line-height:1.7; color:#374151;">{body}</p>
+                {buttons_html}
                 <p style="margin:0; font-size:13px; line-height:1.6; color:#9ca3af;">V-O 졸업 전시에서 보낸 메일입니다.</p>
               </div>
             </div>
@@ -128,6 +157,9 @@ def send_guestbook_card(to: str, nickname: str, message_text: str, mood: str | N
         """,
         subtype="html",
     )
+    for file in files:
+        maintype, subtype = file.content_type.split("/")
+        message.add_attachment(file.data, maintype=maintype, subtype=subtype, filename=file.filename)
 
     try:
         _send(message)

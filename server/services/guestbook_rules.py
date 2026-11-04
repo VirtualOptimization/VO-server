@@ -20,6 +20,14 @@ PHOTO_TYPES = {
 _DATA_URL = re.compile(r"^data:(?P<type>[\w.+-]+/[\w.+-]+);base64,(?P<data>.*)$", re.DOTALL)
 
 
+def detect_photo_type(data: bytes) -> tuple[str, str] | None:
+    """Return (content type, extension) for a supported image file, or None."""
+    for content_type, (extension, looks_valid) in PHOTO_TYPES.items():
+        if looks_valid(data):
+            return content_type, extension
+    return None
+
+
 class InvalidInput(ValueError):
     """Input a visitor can fix; the message is shown to them as is."""
 
@@ -94,3 +102,11 @@ def decode_photo(photo: str | None) -> tuple[bytes, str, str] | None:
     if not looks_valid(data):
         raise InvalidInput("사진 파일이 올바르지 않아요.")
     return data, content_type, extension
+
+
+def decode_card_image(image: str | None) -> tuple[bytes, str, str] | None:
+    """The website's captured card, checked like a photo: (bytes, content type, extension)."""
+    try:
+        return decode_photo(image)
+    except InvalidInput:
+        raise InvalidInput("카드 이미지는 5MB 이하의 PNG·JPG·WEBP 파일이어야 해요.") from None

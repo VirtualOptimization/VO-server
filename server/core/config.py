@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     )
     # Shared with the website server; required to send guestbook card emails.
     guestbook_api_key: str = Field(default="", validation_alias="GUESTBOOK_API_KEY")
+    # This server's address as seen from the internet (e.g. https://api.example.com).
+    # Card emails link their save buttons here; without it the card and photo are only attached.
+    public_base_url: str = Field(default="", validation_alias="PUBLIC_BASE_URL")
     api_docs_enabled: bool = Field(default=True, validation_alias="API_DOCS_ENABLED")
     cors_origins: str = Field(
         default="https://vo-space.creambay6.chatgpt.site,http://localhost:4173",

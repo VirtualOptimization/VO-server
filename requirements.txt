@@ -10,6 +10,7 @@ psycopg[binary]
 asyncpg
 pgvector
 httpx
+pillow
 boto3
 botocore
 certifi
