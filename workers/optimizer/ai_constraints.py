@@ -62,11 +62,23 @@ def maybe_apply_ai_constraints(
 
 
 def optimizer_needs_recovery(optimized: dict[str, Any]) -> bool:
-    """Return whether the first deterministic pass needs Claude recovery advice."""
+    """Return whether the first deterministic pass needs Claude recovery advice.
+
+    Only a layout the optimizer itself considers broken asks for help: a
+    furniture collision, a blocked door / wall / out-of-room violation, or a
+    broken `must` principle. Neufert validation failures alone do not count;
+    its clearance rules fail for almost every furnished room (anything against
+    a wall reads as 0 m clearance), so they triggered a second full
+    optimization on nearly every run without improving the result.
+    """
     optimization = optimized.get("optimization", {})
     collision = float(optimization.get("remaining_collision_penetration_m", 0.0) or 0.0)
-    validation = optimized.get("neufert_validation", {}).get("summary", {})
-    return collision > 1e-3 or int(validation.get("fail", 0) or 0) > 0
+    hard = optimization.get("hard_violations", {})
+    return (
+        collision > 1e-3
+        or float(hard.get("door_wall_or_outside", 0.0) or 0.0) > 0.0
+        or int(hard.get("must_principles", 0) or 0) > 0
+    )
 
 
 def build_failure_context(optimized: dict[str, Any]) -> dict[str, Any]:

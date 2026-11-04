@@ -3112,8 +3112,14 @@ class CanonicalLayoutOptimizer:
             ]
             furniture["optimized_rotation_y_deg"] = theta_deg
 
+        final_rank = self._layout_rank(optimized)
         output["optimization"] = {
             "objective_value": round(float(result_local.fun), 3),
+            # Tiers 2-3 of _layout_rank: what the optimizer itself treats as broken.
+            "hard_violations": {
+                "door_wall_or_outside": float(final_rank[1]),
+                "must_principles": int(final_rank[2]),
+            },
             "solver": "differential_evolution + SLSQP",
             # Real collisions only; a chair tucked under its own desk within the
             # allowance is reported separately (see _collision_penetration).
