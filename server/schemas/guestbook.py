@@ -13,6 +13,7 @@ class GuestbookCreateRequest(BaseModel):
     # A client-sent `created_at` is ignored; the server records the time.
     nickname: str | None = None
     message: str | None = None
+    mood: str | None = None
     photo: str | None = None
     consent: bool | None = None
 
@@ -34,6 +35,7 @@ class GuestbookEntryResponse(BaseModel):
     id: str
     nickname: str
     message: str
+    mood: str | None = None
     photo: str | None
     created_at: datetime
 

@@ -17,6 +17,8 @@ class GuestbookEntry(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     nickname: Mapped[str] = mapped_column(String(20), nullable=False)
     message: Mapped[str] = mapped_column(String(200), nullable=False)
+    # The card's mood label (e.g. "반가워요"); optional.
+    mood: Mapped[str | None] = mapped_column(String(20))
     # S3 key of the uploaded photo; the API returns a presigned URL instead.
     photo_key: Mapped[str | None] = mapped_column(Text)
     consent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

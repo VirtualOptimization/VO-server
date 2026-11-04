@@ -46,6 +46,13 @@ def normalize_email(value: str | None) -> str:
     return email
 
 
+def normalize_mood(value: str | None) -> str | None:
+    mood = (value or "").strip()
+    if len(mood) > MOOD_MAX_LENGTH:
+        raise InvalidInput(f"기분은 {MOOD_MAX_LENGTH}자까지 쓸 수 있어요.")
+    return mood or None
+
+
 def normalize_photo_url(value: str | None) -> str | None:
     """The card links an image the website already hosts; only plain https URLs."""
     url = (value or "").strip()
