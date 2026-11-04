@@ -1,0 +1,58 @@
+from workers.optimizer.neufert_rules import validate_neufert_rules
+
+
+def _item(item_id, item_type, extent, pos, front, **extra):
+    return {
+        "id": item_id,
+        "type": item_type,
+        "extent": [extent[0], extent[1], 0.8],
+        "pos": [pos[0], pos[1], 0.4],
+        "optimized_pos": [pos[0], pos[1], 0.4],
+        "rotation_y_deg": 0.0,
+        "optimized_rotation_y_deg": 0.0,
+        "front_vector_2d": front,
+        **extra,
+    }
+
+
+def _rule(subject, relation, direction, distance, obj="room"):
+    return {"page_number": 1, "subject": subject, "object": obj, "relation": relation, "direction": direction,
+            "min_distance_m": distance, "priority": "hard"}
+
+
+def _check(rules, items):
+    problem = {"room_metadata": {"dimensions": {"width": 4.0, "depth": 4.0}}, "neufert_rules": rules}
+    return validate_neufert_rules(problem, {"movable_items": items})["neufert_validation"]["checks"]
+
+
+def test_around_rule_needs_only_one_open_side():
+    # Bed in a corner: two sides against walls, the room side wide open.
+    bed = _item("bed", "bed", (1.0, 2.0), (0.5, 1.0), [1.0, 0.0])
+    (check,) = _check([_rule("bed", "around", "around", 0.6)], [bed])
+    assert check["status"] == "pass"
+
+
+def test_around_rule_fails_when_boxed_in():
+    shelf = _item("shelf", "shelf", (0.8, 0.4), (2.0, 0.2), [0.0, 1.0])
+    blockers = [
+        _item("t1", "table", (0.8, 0.5), (2.0, 0.65), [0.0, 1.0]),
+        _item("t2", "table", (0.5, 0.8), (1.35, 0.4), [1.0, 0.0]),
+        _item("t3", "table", (0.5, 0.8), (2.65, 0.4), [-1.0, 0.0]),
+    ]
+    checks = _check([_rule("shelf", "clearance", "around", 0.8)], [shelf, *blockers])
+    assert checks[0]["status"] == "fail"
+
+
+def test_table_front_ignores_chairs():
+    table = _item("table", "table", (1.2, 0.6), (2.0, 3.7), [0.0, -1.0])
+    chair = _item("chair", "chair", (0.5, 0.5), (2.0, 3.1), [0.0, 1.0])
+    (check,) = _check([_rule("table", "clearance", "front", 0.75)], [table, chair])
+    assert check["status"] == "pass"
+
+
+def test_front_rule_fails_when_something_blocks_the_front():
+    shelf = _item("shelf", "shelf", (0.8, 0.4), (2.0, 0.2), [0.0, 1.0])
+    bed = _item("bed", "bed", (2.0, 1.0), (2.0, 0.95), [0.0, 1.0])
+    checks = _check([_rule("shelf", "clearance", "front", 0.9)], [shelf, bed])
+    assert checks[0]["status"] == "fail"
+    assert checks[0]["measured_distance_m"] < 0.1
