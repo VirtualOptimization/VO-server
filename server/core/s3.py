@@ -1,6 +1,7 @@
 import asyncio
 import json
 from functools import lru_cache
+from urllib.parse import quote
 
 from botocore.exceptions import ClientError
 
@@ -145,13 +146,12 @@ def list_keys(prefix: str) -> list[str]:
     return [obj["Key"] for obj in response.get("Contents", [])]
 
 
-def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
-    """S3 객체의 Presigned URL을 반환한다."""
-    return get_s3_client().generate_presigned_url(
-        "get_object",
-        Params={"Bucket": settings.s3_bucket_name, "Key": key},
-        ExpiresIn=expires_in,
-    )
+def generate_presigned_url(key: str, expires_in: int = 3600, download_name: str | None = None) -> str:
+    """S3 객체의 Presigned URL을 반환한다. download_name 을 주면 그 이름으로 내려받게 한다."""
+    params = {"Bucket": settings.s3_bucket_name, "Key": key}
+    if download_name:
+        params["ResponseContentDisposition"] = f"attachment; filename*=UTF-8''{quote(download_name)}"
+    return get_s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=expires_in)
 
 
 async def get_json(key: str) -> dict:

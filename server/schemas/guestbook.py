@@ -25,6 +25,9 @@ class GuestbookCardRequest(BaseModel):
     message: str | None = None
     mood: str | None = None
     photo_url: str | None = None
+    # The website's card captured as a `data:image/png;base64,` URL. When it is
+    # missing the server draws the card itself.
+    card_image: str | None = None
 
 
 class GuestbookCardResponse(BaseModel):
