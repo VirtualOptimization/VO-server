@@ -54,6 +54,15 @@ class PenaltyWeights:
     shelf_front_blocked: float = 1_000_000.0
 
 
+class _Corners(np.ndarray):
+    """A 4x2 corner array that remembers its SAT points and bounding box.
+
+    One objective evaluation tests each footprint against every other piece and
+    every wall and door, so converting it once instead of per pair matters.
+    Corner arrays are never modified after they are built.
+    """
+
+
 class CanonicalLayoutOptimizer:
     """Optimize furniture placement from canonical room JSON."""
 
@@ -91,7 +100,7 @@ class CanonicalLayoutOptimizer:
         rotation = np.array([[c, -s], [s, c]])
         hw, hd = width / 2.0, depth / 2.0
         corners = np.array([[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]])
-        return corners @ rotation.T + [cx, cy]
+        return (corners @ rotation.T + [cx, cy]).view(_Corners)
 
     @staticmethod
     def _coords_from_furniture(furniture: dict[str, Any], optimized: bool = False) -> np.ndarray:
@@ -112,24 +121,33 @@ class CanonicalLayoutOptimizer:
     # The SAT helpers run ~10^6 times per optimization on 4-corner shapes, where
     # numpy's per-call overhead dominates, so they work on plain Python floats.
     @staticmethod
-    def _points(corners: np.ndarray) -> list[tuple[float, float]]:
-        if isinstance(corners, np.ndarray):
-            return [(float(p[0]), float(p[1])) for p in corners.tolist()]
-        return [(float(p[0]), float(p[1])) for p in corners]
+    def _shape(corners: np.ndarray) -> tuple[list[tuple[float, float]], tuple[float, float, float, float]]:
+        """Corner points and (xmin, xmax, ymin, ymax), remembered on _Corners arrays."""
+        cached = getattr(corners, "_sat_shape", None)
+        if cached is not None:
+            return cached
+        rows = corners.tolist() if isinstance(corners, np.ndarray) else corners
+        points = [(float(p[0]), float(p[1])) for p in rows]
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        shape = (points, (min(xs), max(xs), min(ys), max(ys)))
+        if isinstance(corners, _Corners):
+            corners._sat_shape = shape
+        return shape
 
     @staticmethod
-    def _bbox_gap(p1: list[tuple[float, float]], p2: list[tuple[float, float]]) -> float:
-        xs1 = [p[0] for p in p1]
-        ys1 = [p[1] for p in p1]
-        xs2 = [p[0] for p in p2]
-        ys2 = [p[1] for p in p2]
-        return max(min(xs2) - max(xs1), min(xs1) - max(xs2), min(ys2) - max(ys1), min(ys1) - max(ys2))
+    def _bbox_gap(b1: tuple[float, float, float, float], b2: tuple[float, float, float, float]) -> float:
+        return max(b2[0] - b1[1], b1[0] - b2[1], b2[2] - b1[3], b1[2] - b2[3])
 
     @staticmethod
     def _sat_axes(p1: list[tuple[float, float]], p2: list[tuple[float, float]]):
-        """Yield (overlap, separated_by_more_than_1mm) along each edge normal."""
+        """Yield (overlap, separated_by_more_than_1mm) along each edge normal.
+
+        Every shape here is a rectangle, so its opposite edges share a normal and
+        two edges per shape give all the distinct axes.
+        """
         for poly in (p1, p2):
-            for i in range(4):
+            for i in range(2):
                 ax, ay = poly[i]
                 bx, by = poly[(i + 1) % 4]
                 nx, ny = ay - by, bx - ax
@@ -142,11 +160,11 @@ class CanonicalLayoutOptimizer:
 
     @classmethod
     def _sat_overlap(cls, corners1: np.ndarray, corners2: np.ndarray) -> float:
-        p1, p2 = cls._points(corners1), cls._points(corners2)
+        (p1, b1), (p2, b2) = cls._shape(corners1), cls._shape(corners2)
         # Edge normals of a rectangle are within 45 degrees of any separating
         # direction, so a bounding-box gap over sqrt(2) mm always yields an
         # edge-normal gap over 1 mm below.
-        if cls._bbox_gap(p1, p2) > 1.5e-3:
+        if cls._bbox_gap(b1, b2) > 1.5e-3:
             return 0.0
         max_overlap = -1e9
         for overlap, separated in cls._sat_axes(p1, p2):
@@ -157,10 +175,10 @@ class CanonicalLayoutOptimizer:
 
     @classmethod
     def _sat_penetration(cls, corners1: np.ndarray, corners2: np.ndarray) -> float:
-        p1, p2 = cls._points(corners1), cls._points(corners2)
+        (p1, b1), (p2, b2) = cls._shape(corners1), cls._shape(corners2)
         # Disjoint bounding boxes mean the shapes are disjoint, so some edge
         # normal below has overlap <= 0.
-        if cls._bbox_gap(p1, p2) > 0.0:
+        if cls._bbox_gap(b1, b2) > 0.0:
             return 0.0
         min_overlap = 1e9
         for overlap, _ in cls._sat_axes(p1, p2):
@@ -227,12 +245,12 @@ class CanonicalLayoutOptimizer:
         return best_axis * min_overlap
 
     def _world_front(self, furniture: dict[str, Any], theta: float) -> np.ndarray:
-        base = self._normalize(furniture.get("front_vector_2d", [0.0, -1.0]), fallback=(0.0, -1.0))
-        original_theta = math.radians(float(furniture.get("rotation_y_deg", 0.0)))
-        delta = theta - original_theta
+        bx, by = (float(v) for v in furniture.get("front_vector_2d", [0.0, -1.0])[:2])
+        norm = math.hypot(bx, by)
+        bx, by = (bx / norm, by / norm) if norm >= 1e-8 else (0.0, -1.0)
+        delta = theta - math.radians(float(furniture.get("rotation_y_deg", 0.0)))
         c, s = math.cos(delta), math.sin(delta)
-        rotation = np.array([[c, -s], [s, c]])
-        return rotation @ base
+        return np.array([c * bx - s * by, s * bx + c * by])
 
     def _theta_for_world_front(self, furniture: dict[str, Any], desired_front: np.ndarray) -> float:
         front = self._normalize(desired_front, fallback=(0.0, -1.0))
@@ -258,8 +276,7 @@ class CanonicalLayoutOptimizer:
         return max(candidates, key=score) % (2.0 * math.pi)
 
     def _distance_to_walls(self, corners: np.ndarray) -> tuple[float, float, float, float]:
-        min_x, max_x = np.min(corners[:, 0]), np.max(corners[:, 0])
-        min_y, max_y = np.min(corners[:, 1]), np.max(corners[:, 1])
+        _, (min_x, max_x, min_y, max_y) = self._shape(corners)
         return min_x, self.room_width - max_x, min_y, self.room_depth - max_y
 
     @staticmethod
@@ -296,6 +313,28 @@ class CanonicalLayoutOptimizer:
                 [min(a[1], b[1]) - max(a[0], b[0]) <= 0.02 for b in spans] for a in spans
             ]
         return self._apart_cache[i][j]
+
+    def _collision_partners(self, ids: dict[str, int]) -> list[list[int]]:
+        """For each item, the later items its footprint can collide with in _objective.
+
+        A chair and its own desk/table are excused (tucking is handled by the chair
+        penalty), as are items stacked at different heights. Pairs never change
+        during an optimization, so this is worked out once.
+        """
+        if not hasattr(self, "_partners_cache"):
+            partners: list[list[int]] = []
+            for i, furniture in enumerate(self.furnitures):
+                row = []
+                for j in range(i + 1, self.num_f):
+                    other = self.furnitures[j]
+                    is_support_pair = (
+                        furniture["type"] == "chair" and ids.get(furniture.get("pair_with")) == j
+                    ) or (other["type"] == "chair" and ids.get(other.get("pair_with")) == i)
+                    if not is_support_pair and not self._vertically_apart(i, j):
+                        row.append(j)
+                partners.append(row)
+            self._partners_cache = partners
+        return self._partners_cache
 
     def _is_wall_mounted(self, index: int) -> bool:
         return bool(self.furnitures[index].get("wall_mounted"))
@@ -1024,6 +1063,14 @@ class CanonicalLayoutOptimizer:
         return self._obb_corners(center[0], center[1], width, activity_depth, theta), front
 
     def _door_clearance_polygon(self, door: dict[str, Any]) -> np.ndarray:
+        """Cached like _wall_obstacle_polygon. Callers must not mutate the result."""
+        cache = self.__dict__.setdefault("_wall_poly_cache", {})
+        key = ("door", id(door))
+        if key not in cache:
+            cache[key] = np.asarray(self._build_door_clearance_polygon(door), dtype=float).view(_Corners)
+        return cache[key]
+
+    def _build_door_clearance_polygon(self, door: dict[str, Any]) -> np.ndarray:
         wall = door["wall"]
         span = door["span"]
         start = float(span["start"])
@@ -1058,7 +1105,7 @@ class CanonicalLayoutOptimizer:
         cache = self.__dict__.setdefault("_wall_poly_cache", {})
         key = (id(wall), buffer)
         if key not in cache:
-            cache[key] = self._build_wall_obstacle_polygon(wall, buffer=buffer)
+            cache[key] = np.asarray(self._build_wall_obstacle_polygon(wall, buffer=buffer), dtype=float).view(_Corners)
         return cache[key]
 
     # A scanned wall lying within this distance of the room bounding box is a
@@ -2732,6 +2779,7 @@ class CanonicalLayoutOptimizer:
             grids[cell_size] = np.meshgrid(xs, ys)
         grid_x, grid_y = grids[cell_size]
         occupied = np.zeros_like(grid_x, dtype=bool)
+        cell_w, cell_h = self.room_width / cols, self.room_depth / rows
 
         for i, furniture in enumerate(self.furnitures):
             if self._is_wall_mounted(i):
@@ -2739,11 +2787,21 @@ class CanonicalLayoutOptimizer:
             cx, cy, _, theta = coords[i]
             width, depth = float(furniture["extent"][0]), float(furniture["extent"][1])
             c, s = math.cos(-float(theta)), math.sin(-float(theta))
-            dx = grid_x - cx
-            dy = grid_y - cy
+            # Only cells inside the footprint's bounding box can be covered, so test
+            # that window (one cell of margin) instead of the whole room grid.
+            half_x = abs(c) * width / 2.0 + abs(s) * depth / 2.0
+            half_y = abs(s) * width / 2.0 + abs(c) * depth / 2.0
+            c0 = max(0, int(math.floor((cx - half_x) / cell_w - 0.5)) - 1)
+            c1 = min(cols, int(math.ceil((cx + half_x) / cell_w - 0.5)) + 2)
+            r0 = max(0, int(math.floor((cy - half_y) / cell_h - 0.5)) - 1)
+            r1 = min(rows, int(math.ceil((cy + half_y) / cell_h - 0.5)) + 2)
+            if c0 >= c1 or r0 >= r1:
+                continue
+            dx = grid_x[r0:r1, c0:c1] - cx
+            dy = grid_y[r0:r1, c0:c1] - cy
             local_x = dx * c - dy * s
             local_y = dx * s + dy * c
-            occupied |= (np.abs(local_x) <= width / 2.0) & (np.abs(local_y) <= depth / 2.0)
+            occupied[r0:r1, c0:c1] |= (np.abs(local_x) <= width / 2.0) & (np.abs(local_y) <= depth / 2.0)
 
         cell_area = (self.room_width / cols) * (self.room_depth / rows)
         return occupied, cell_area
@@ -2804,25 +2862,14 @@ class CanonicalLayoutOptimizer:
             for c, f in zip(coords, self.furnitures)
         ]
         ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
+        collision_partners = self._collision_partners(ids)
 
         for i, furniture in enumerate(self.furnitures):
             corners = obbs[i]
-            left, right, bottom, top = self._distance_to_walls(corners)
 
             total += self._outside_room_penalty(corners)
 
-            for j in range(i + 1, self.num_f):
-                other = self.furnitures[j]
-                is_support_pair = (
-                    furniture["type"] == "chair"
-                    and ids.get(furniture.get("pair_with")) == j
-                ) or (
-                    other["type"] == "chair"
-                    and ids.get(other.get("pair_with")) == i
-                )
-                if is_support_pair or self._vertically_apart(i, j):
-                    continue
-
+            for j in collision_partners[i]:
                 penetration = self._sat_penetration(corners, obbs[j])
                 if penetration > 0:
                     total += self.weights.body_collision
