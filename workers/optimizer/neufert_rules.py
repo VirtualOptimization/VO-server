@@ -11,6 +11,9 @@ from typing import Any
 ENTITY_ALIASES = {
     "wardrobe": "closet",
     "closet": "closet",
+    "storage": "shelf",
+    "shelf": "shelf",
+    "desk": "table",
     "dining table": "table",
     "bedside table": "bedside_table",
     "banyo küveti": "bathtub",
@@ -144,12 +147,7 @@ def apply_neufert_rules(problem: dict[str, Any], path: str | Path | None) -> dic
 
 
 def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -> dict[str, Any]:
-    """Report rule checks against the final 2-D furniture placement.
-
-    This is intentionally a conservative, axis-aligned check for the first
-    validation pass. Qualitative rules are reported separately instead of
-    being treated as failed numeric constraints.
-    """
+    """Report directional rule checks against the final 2-D placement."""
     room = problem.get("room_metadata", {}).get("dimensions", {})
     room_width = float(room.get("width", 0.0))
     room_depth = float(room.get("depth", 0.0))
@@ -172,39 +170,192 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
         ys = [point[1] for point in poly]
         return min(min(xs), room_width - max(xs), min(ys), room_depth - max(ys))
 
-    def polygon_gap(first: list[tuple[float, float]], second: list[tuple[float, float]]) -> float:
+    def normalize(vector: tuple[float, float], fallback: tuple[float, float]) -> tuple[float, float]:
+        length = math.hypot(vector[0], vector[1])
+        if length <= 1e-9:
+            return fallback
+        return vector[0] / length, vector[1] / length
+
+    def projection(poly: list[tuple[float, float]], axis: tuple[float, float]) -> tuple[float, float]:
+        values = [point[0] * axis[0] + point[1] * axis[1] for point in poly]
+        return min(values), max(values)
+
+    def polygon_axes(poly: list[tuple[float, float]]) -> list[tuple[float, float]]:
         axes: list[tuple[float, float]] = []
-        for poly in (first, second):
-            for index, point in enumerate(poly):
-                other = poly[(index + 1) % len(poly)]
-                edge = (other[0] - point[0], other[1] - point[1])
-                length = math.hypot(edge[0], edge[1]) or 1.0
-                axes.append((-edge[1] / length, edge[0] / length))
+        for index, point in enumerate(poly):
+            other = poly[(index + 1) % len(poly)]
+            edge = (other[0] - point[0], other[1] - point[1])
+            axes.append(normalize((-edge[1], edge[0]), (1.0, 0.0)))
+        return axes
+
+    def polygons_overlap(first: list[tuple[float, float]], second: list[tuple[float, float]]) -> bool:
+        for axis in polygon_axes(first) + polygon_axes(second):
+            first_min, first_max = projection(first, axis)
+            second_min, second_max = projection(second, axis)
+            if min(first_max, second_max) - max(first_min, second_min) <= 1e-6:
+                return False
+        return True
+
+    def point_segment_distance(
+        point: tuple[float, float],
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> float:
+        edge = (end[0] - start[0], end[1] - start[1])
+        length_sq = edge[0] ** 2 + edge[1] ** 2
+        if length_sq <= 1e-12:
+            return math.hypot(point[0] - start[0], point[1] - start[1])
+        offset = (point[0] - start[0], point[1] - start[1])
+        ratio = max(0.0, min(1.0, (offset[0] * edge[0] + offset[1] * edge[1]) / length_sq))
+        nearest = (start[0] + edge[0] * ratio, start[1] + edge[1] * ratio)
+        return math.hypot(point[0] - nearest[0], point[1] - nearest[1])
+
+    def polygon_gap(first: list[tuple[float, float]], second: list[tuple[float, float]]) -> float:
+        if polygons_overlap(first, second):
+            return 0.0
+        distances: list[float] = []
+        for source, target in ((first, second), (second, first)):
+            for point in source:
+                for index, start in enumerate(target):
+                    distances.append(point_segment_distance(point, start, target[(index + 1) % len(target)]))
+        return min(distances)
+
+    def world_front(item: dict[str, Any]) -> tuple[float, float]:
+        base_raw = item.get("front_vector_2d") or [0.0, -1.0]
+        base = normalize((float(base_raw[0]), float(base_raw[1])), (0.0, -1.0))
+        original = math.radians(float(item.get("rotation_y_deg", 0.0)))
+        optimized_theta = math.radians(
+            float(item.get("optimized_rotation_y_deg", item.get("rotation_y_deg", 0.0)))
+        )
+        delta = optimized_theta - original
+        c, s = math.cos(delta), math.sin(delta)
+        return normalize((base[0] * c - base[1] * s, base[0] * s + base[1] * c), (0.0, -1.0))
+
+    def directional_polygon_gap(
+        subject_poly: list[tuple[float, float]],
+        target_poly: list[tuple[float, float]],
+        direction: tuple[float, float],
+    ) -> float | None:
+        forward = normalize(direction, (0.0, -1.0))
+        lateral = (-forward[1], forward[0])
+        subject_cross = projection(subject_poly, lateral)
+        target_cross = projection(target_poly, lateral)
+        cross_overlap = min(subject_cross[1], target_cross[1]) - max(subject_cross[0], target_cross[0])
+        if cross_overlap <= 1e-6:
+            return None
+
+        subject_forward = projection(subject_poly, forward)
+        target_forward = projection(target_poly, forward)
+        subject_center = sum(subject_forward) / 2.0
+        target_center = sum(target_forward) / 2.0
+        if target_center <= subject_center + 1e-6:
+            return None
+        return max(target_forward[0] - subject_forward[1], 0.0)
+
+    def room_gap_in_direction(
+        poly: list[tuple[float, float]],
+        direction: tuple[float, float],
+    ) -> float:
+        dx, dy = normalize(direction, (0.0, -1.0))
+        distances: list[float] = []
+        for x, y in poly:
+            candidates: list[float] = []
+            if dx > 1e-9:
+                candidates.append((room_width - x) / dx)
+            elif dx < -1e-9:
+                candidates.append((0.0 - x) / dx)
+            if dy > 1e-9:
+                candidates.append((room_depth - y) / dy)
+            elif dy < -1e-9:
+                candidates.append((0.0 - y) / dy)
+            positive = [value for value in candidates if value >= 0.0]
+            if positive:
+                distances.append(min(positive))
+        return max(0.0, min(distances, default=0.0))
+
+    def is_functional_pair(first: dict[str, Any], second: dict[str, Any]) -> bool:
+        first_id = first.get("id")
+        second_id = second.get("id")
+        return first.get("pair_with") == second_id or second.get("pair_with") == first_id
+
+    def relevant_targets(item: dict[str, Any], object_name: str) -> list[dict[str, Any]]:
+        if object_name in {"room", "wall"}:
+            # Chairs at a table are how the table is used, not obstacles to it.
+            seats_ignored = _entity(item.get("type")) in {"table", "desk"}
+            return [
+                other
+                for other in items
+                if other is not item
+                and not is_functional_pair(item, other)
+                and not (seats_ignored and _entity(other.get("type")) == "chair")
+            ]
+        return [
+            other
+            for other in by_subject.get(object_name, [])
+            if other is not item and not is_functional_pair(item, other)
+        ]
+
+    def open_side_gap(item: dict[str, Any], targets: list[dict[str, Any]], *, walls_only: bool = False) -> float:
+        """Free distance on the item's most open side.
+
+        An `around` rule asks for room to use the piece, and that room only has to
+        exist on one side: a bed against a wall, or a chair pushed in at a table,
+        is still usable. Measuring the nearest obstacle on any side instead failed
+        nearly every piece that touched anything.
+        """
+        poly = item_corners[id(item)]
+        front = world_front(item)
+        lateral = (-front[1], front[0])
+        best = 0.0
+        for axis in (front, (-front[0], -front[1]), lateral, (-lateral[0], -lateral[1])):
+            free = room_gap_in_direction(poly, axis)
+            if not walls_only:
+                for other in targets:
+                    gap = directional_polygon_gap(poly, item_corners[id(other)], axis)
+                    if gap is not None:
+                        free = min(free, gap)
+            best = max(best, free)
+        return best
+
+    def directional_gaps(
+        item: dict[str, Any],
+        targets: list[dict[str, Any]],
+        direction: str,
+    ) -> list[float]:
+        poly = item_corners[id(item)]
+        front = world_front(item)
+        lateral = (-front[1], front[0])
+        if direction == "front":
+            directions = [front]
+        elif direction == "side":
+            directions = [lateral, (-lateral[0], -lateral[1])]
+        else:
+            return [polygon_gap(poly, item_corners[id(other)]) for other in targets]
+
         gaps: list[float] = []
-        for axis in axes:
-            first_projection = [point[0] * axis[0] + point[1] * axis[1] for point in first]
-            second_projection = [point[0] * axis[0] + point[1] * axis[1] for point in second]
-            gap = max(
-                min(second_projection) - max(first_projection),
-                min(first_projection) - max(second_projection),
-                0.0,
-            )
-            gaps.append(gap)
-        # Two separated convex polygons are guaranteed a positive gap on at
-        # least one candidate axis (the true separating axis); the other
-        # axes typically still show projection overlap and report 0. The
-        # real separation distance is therefore the *largest* gap found,
-        # not the smallest -- mirroring _sat_gap_vector in layout.py.
-        return max(gaps)
+        for axis in directions:
+            for other in targets:
+                gap = directional_polygon_gap(poly, item_corners[id(other)], axis)
+                if gap is not None:
+                    gaps.append(gap)
+        return gaps
+
+    def required_distance(rule: dict[str, Any]) -> float | None:
+        minimum = rule.get("min_distance_m")
+        if minimum is not None:
+            return float(minimum)
+        recommended = rule.get("recommended_distance_m")
+        if recommended is None:
+            return None
+        scale = float(problem.get("small_room_relaxation_scale", 1.0))
+        return float(recommended) * scale
 
     item_corners = {id(item): corners(item) for item in items}
     checks: list[dict[str, Any]] = []
     for rule in problem.get("neufert_rules", []):
         subject = _entity(rule.get("subject"))
         matched = by_subject.get(subject, [])
-        numeric = rule.get("min_distance_m")
-        if numeric is None:
-            numeric = rule.get("recommended_distance_m")
+        numeric = required_distance(rule)
 
         for item in matched:
             check = {
@@ -228,18 +379,50 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
             object_name = _entity(rule.get("object"))
             if relation in {"to_wall", "against"}:
                 measured = item_wall_distance
+            elif object_name == "wall":
+                direction = str(rule.get("direction", "around"))
+                front = world_front(item)
+                lateral = (-front[1], front[0])
+                if direction == "front":
+                    measured = room_gap_in_direction(poly, front)
+                elif direction == "side":
+                    measured = min(
+                        room_gap_in_direction(poly, lateral),
+                        room_gap_in_direction(poly, (-lateral[0], -lateral[1])),
+                    )
+                else:
+                    measured = open_side_gap(item, [], walls_only=True)
+            elif str(rule.get("direction", "around")) == "around" and object_name == "room":
+                measured = open_side_gap(item, relevant_targets(item, object_name))
             else:
-                # An ``around`` rule describes usable space around the item;
-                # a wall-contact side is intentionally not treated as a
-                # failed passage. This matters for beds placed lengthwise
-                # against a wall.
-                measured = float("inf") if relation == "around" and object_name == "room" else wall_distance(poly)
-                for other in items:
-                    if other is item:
-                        continue
-                    measured = min(measured, polygon_gap(poly, item_corners[id(other)]))
-                if not math.isfinite(measured):
-                    measured = item_wall_distance
+                direction = str(rule.get("direction", "around"))
+                targets = relevant_targets(item, object_name)
+                gaps = directional_gaps(item, targets, direction)
+
+                if object_name == "room" and direction == "front":
+                    gaps.append(room_gap_in_direction(poly, world_front(item)))
+                elif object_name == "room" and direction == "side":
+                    front = world_front(item)
+                    lateral = (-front[1], front[0])
+                    gaps.extend(
+                        [
+                            room_gap_in_direction(poly, lateral),
+                            room_gap_in_direction(poly, (-lateral[0], -lateral[1])),
+                        ]
+                    )
+
+                if not gaps:
+                    if object_name == "room":
+                        check["measured_distance_m"] = None
+                        check["status"] = "pass"
+                        check["reason"] = "no_obstacle_in_direction"
+                    else:
+                        check["measured_distance_m"] = None
+                        check["status"] = "not_applicable"
+                        check["reason"] = "no_matching_target_in_direction"
+                    checks.append(check)
+                    continue
+                measured = min(gaps)
 
             check["measured_distance_m"] = round(max(0.0, measured), 4)
             check["status"] = "pass" if measured + 1e-3 >= float(numeric) else "fail"
@@ -250,6 +433,7 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
         "pass": sum(c["status"] == "pass" for c in checks),
         "fail": sum(c["status"] == "fail" for c in checks),
         "qualitative_only": sum(c["status"] == "qualitative_only" for c in checks),
+        "not_applicable": sum(c["status"] == "not_applicable" for c in checks),
     }
     optimized["neufert_validation"] = {"summary": summary, "checks": checks}
     return optimized
