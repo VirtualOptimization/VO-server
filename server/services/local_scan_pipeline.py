@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from server.core.config import settings
@@ -128,8 +129,8 @@ def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, A
         .filter(
             Version.room_id == room_id,
             Version.version_type == "OPTIMIZED",
-            Version.version_no == 1,
         )
+        .order_by(Version.version_no)
         .first()
     )
     if optimized:
@@ -138,11 +139,18 @@ def _upsert_pipeline_versions(db: Session, event: dict[str, Any]) -> dict[str, A
         optimized.converted_glb_url = glb_s3_url
         optimized.json_data = optimized_json_data
     else:
+        # A user edit saved before the first optimization already holds
+        # version_no 1, so take the next free number instead of assuming it.
+        next_version_no = (
+            db.query(func.coalesce(func.max(Version.version_no), 0) + 1)
+            .filter(Version.room_id == room_id)
+            .scalar()
+        )
         optimized = Version(
             room_id=room_id,
             parent_version_id=original.id,
             version_type="OPTIMIZED",
-            version_no=1,
+            version_no=next_version_no,
             s3_json_url=roomplan_optimized_s3_url,
             converted_glb_url=glb_s3_url,
             json_data=optimized_json_data,
