@@ -120,6 +120,48 @@ def _placement_rules(item_type: str) -> dict[str, Any]:
     return by_type.get(item_type, common)
 
 
+SEAT_WIDTH_M = 0.6
+
+
+def _seat_capacity(support: dict[str, Any]) -> int:
+    """Chairs a support can seat: every side of a table, only the front of a desk."""
+    long_side, short_side = sorted((float(v) for v in support["extent"][:2]), reverse=True)
+    if support["type"] == "desk":
+        return max(1, int(long_side // SEAT_WIDTH_M))
+    return max(1, 2 * int(long_side // SEAT_WIDTH_M) + 2 * int(short_side // SEAT_WIDTH_M))
+
+
+def _assign_free_chairs(movable_items: list[dict[str, Any]], support_by_id: dict[str, dict[str, Any]]) -> None:
+    """Seat chairs scanned far from any table at the nearest table with room left.
+
+    An unpaired chair is optimized as a standalone item, so it gets pushed into
+    whatever gap leaves the most open floor and ends up stranded around the room
+    (a 16-chair room had 4 of them scattered this way). Chairs only stay free
+    when every table is already full.
+    """
+    seated = {support_id: 0 for support_id in support_by_id}
+    for item in movable_items:
+        if item.get("pair_with") in seated:
+            seated[item["pair_with"]] += 1
+
+    free_chairs = [item for item in movable_items if item["type"] == "chair" and not item.get("pair_with")]
+    for chair in free_chairs:
+        open_supports = [
+            support_id
+            for support_id, count in seated.items()
+            if count < _seat_capacity(support_by_id[support_id])
+        ]
+        if not open_supports:
+            return
+        support_id = min(open_supports, key=lambda sid: _distance(chair["pos"], support_by_id[sid]["pos"]))
+        relationship = _classify_chair_relationship(chair, support_by_id[support_id])
+        relationship["strength"] = "weak"
+        relationship["assigned_by"] = "seat_capacity"
+        chair["relationship"] = relationship
+        chair["pair_with"] = support_id
+        seated[support_id] += 1
+
+
 def build_layout_problem(normalized_scan: dict[str, Any]) -> dict[str, Any]:
     """Build a layout optimization problem without dropping scanned furniture."""
     scanned_objects = _copy(normalized_scan.get("scanned_objects", []))
@@ -151,6 +193,7 @@ def build_layout_problem(normalized_scan: dict[str, Any]) -> dict[str, Any]:
         item["relationship"] = relationship
         if relationship["strength"] != "free":
             item["pair_with"] = nearest_support_id
+    _assign_free_chairs(movable_items, support_by_id)
 
     constraints = {
         "min_walkway": 0.425,
