@@ -87,7 +87,7 @@ def build_optimizer_metadata(category: str) -> dict[str, Any]:
             "wall_cling_required": True,
             "back_to_wall": category in {"closet", "television"},
         }
-    elif category == "shelf":
+    elif category in {"shelf", "refrigerator"}:
         metadata["anchor_preferences"] = {
             "wall_cling_required": True,
             "back_to_wall": True,

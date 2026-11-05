@@ -68,3 +68,13 @@ def test_two_chairs_at_the_same_table_still_collide():
     coords = _scanned(optimizer)
     coords[1:, 0] += 0.5  # moved, so the scan exemption does not apply
     assert optimizer._collision_penetration(coords) > 0.1
+
+
+def test_shelf_standing_in_the_room_counts_as_off_wall():
+    shelf = {**_box("s", (2.0, 1.5), (0.8, 0.4)), "front_vector_2d": [0.0, -1.0],
+             "anchor_preferences": {"back_to_wall": True}}
+    optimizer = CanonicalLayoutOptimizer(_room([shelf]))
+    coords = _scanned(optimizer)
+    assert optimizer._off_wall_count(coords) == 1
+    coords[0, 1] = 3.0 - 0.2  # back (north side) flush with the north wall
+    assert optimizer._off_wall_count(coords) == 0

@@ -906,6 +906,20 @@ class CanonicalLayoutOptimizer:
         loss = max(0.0, self.WALKABLE_KEEP_SHARE * scanned_usable - self._usable_open_area(coords))
         return math.ceil(loss / self.WALKABLE_LOSS_BAND_M2 - 1e-9) * self.WALKABLE_LOSS_BAND_M2
 
+    def _off_wall_count(self, coords: np.ndarray) -> int:
+        """Pieces meant to stand with their back to a wall (shelves, a fridge, a
+        wardrobe) that are not against one."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        count = 0
+        for c, furniture in zip(coords, self.furnitures):
+            if furniture.get("pinned") or furniture.get("wall_mounted"):
+                continue
+            if not (furniture.get("anchor_preferences") or {}).get("back_to_wall") or furniture.get("type") == "bed":
+                continue
+            if lh.back_wall(furniture, float(c[0]), float(c[1]), float(c[3]), self.room_width, self.room_depth) is None:
+                count += 1
+        return count
+
     def _unusable_count(self, coords: np.ndarray) -> int:
         """Pieces the layout leaves with almost no room on the side they are used
         from, not counting pieces that were already like that in the scan: the
@@ -933,7 +947,7 @@ class CanonicalLayoutOptimizer:
         """Pieces shifted or turned noticeably away from their scanned pose."""
         return int((~self._in_scanned_pose(coords)).sum())
 
-    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, int, float, float, float, int, float]:
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, int, int, float, float, float, int, float]:
         """Tiered comparison key for finished layouts; lower is better.
 
         Each tier is compared only when every tier before it ties, so nothing
@@ -943,13 +957,14 @@ class CanonicalLayoutOptimizer:
         violations, 3. broken `must` principles, 4. pieces made unusable
         (almost no room on the side they are used from, e.g. a shelf with a
         desk 20 cm in front of it, and usable in the scan), 5. walkable floor lost beyond 10 %
-        of the scanned room's (in bands), 6. broken `prefer` principles,
-        7. metres short of the Neufert clearances (in bands), 8. the largest
-        clear rectangle of floor (in bands), 9. usable open floor (LH passage
-        width, in bands), 10. how many pieces were moved, so that between
-        equally good layouts the one that changes less wins, and 11. the
-        weighted objective, which still holds the older unsourced clearance
-        rules.
+        of the scanned room's (in bands), 6. wall-standing pieces (shelves,
+        a fridge, a wardrobe) not against a wall, 7. broken `prefer`
+        principles, 8. metres short of the Neufert clearances (in bands),
+        9. the largest clear rectangle of floor (in bands), 10. usable open
+        floor (LH passage width, in bands), 11. how many pieces were moved,
+        so that between equally good layouts the one that changes less wins,
+        and 12. the weighted objective, which still holds the older unsourced
+        clearance rules.
 
         Tier 5 keeps the room walkable: without it any clearance gain beat
         open floor, and a room could end up split by rows of chairs.
@@ -983,6 +998,7 @@ class CanonicalLayoutOptimizer:
             self._must_violations(coords),
             self._unusable_count(coords),
             round(self._walkable_loss(coords), 2),
+            self._off_wall_count(coords),
             prefer,
             round(neufert_band * self.NEUFERT_SHORTFALL_BAND_M, 2),
             rect_band,
