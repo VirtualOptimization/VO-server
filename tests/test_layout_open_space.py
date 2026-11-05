@@ -56,3 +56,15 @@ def test_moved_count_counts_only_noticeable_moves():
     assert optimizer._moved_count(coords) == 0
     coords[1, 0] -= 0.5
     assert optimizer._moved_count(coords) == 1
+
+
+def test_two_chairs_at_the_same_table_still_collide():
+    table = _box("t", (2.0, 1.5), (1.2, 0.8), "table")
+    chairs = [
+        {**_box(f"c{k}", (1.8 + 0.3 * k, 0.8), (0.5, 0.5), "chair"), "pair_with": "t"}
+        for k in range(2)
+    ]
+    optimizer = CanonicalLayoutOptimizer(_room([table, *chairs]))
+    coords = _scanned(optimizer)
+    coords[1:, 0] += 0.5  # moved, so the scan exemption does not apply
+    assert optimizer._collision_penetration(coords) > 0.1

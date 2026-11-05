@@ -861,7 +861,7 @@ class CanonicalLayoutOptimizer:
         )
 
     # Neufert shortfall is compared in steps this size (metres).
-    NEUFERT_SHORTFALL_BAND_M = 0.05
+    NEUFERT_SHORTFALL_BAND_M = 0.25
 
     def _neufert_shortfall(self, coords: np.ndarray) -> float:
         """Total metres by which the layout misses the Neufert clearances."""
@@ -901,16 +901,19 @@ class CanonicalLayoutOptimizer:
         1. furniture overlap (a chair tucked into its own desk within the
            allowance is fine), 2. door-clearance / wall / out-of-room
         violations, 3. broken `must` principles, 4. broken `prefer`
-        principles, 5. the largest clear rectangle of floor (in bands),
-        6. usable open floor (LH passage width, in bands), 7. metres short of
-        the Neufert clearances (in bands), 8. how many pieces were moved, so
+        principles, 5. metres short of the Neufert clearances (in bands),
+        6. the largest clear rectangle of floor (in bands), 7. usable open
+        floor (LH passage width, in bands), 8. how many pieces were moved, so
         that between equally good layouts the one that changes less wins,
         and 9. the weighted objective, which still holds the older unsourced
         clearance rules.
 
-        The clear rectangle comes before the usable-floor total because a
-        room reads as roomy when one block of floor is free: the same free
-        area split into strips looks more crowded, not less.
+        Room to use each piece (Neufert) comes before open floor: emptying the
+        middle by pushing a table into a corner where its chairs cannot be
+        pulled out makes the room look bigger and live worse. Among layouts
+        that are equally usable, the clear rectangle comes before the
+        usable-floor total because a room reads as roomy when one block of
+        floor is free.
         """
         coords = np.asarray(coords, dtype=float).reshape(-1, 4)
         obbs = [
@@ -924,12 +927,15 @@ class CanonicalLayoutOptimizer:
             self._outside_room_penalty(obb) for obb, in_place in zip(obbs, self._in_scanned_pose(coords)) if not in_place
         )
         neufert_band = math.floor(self._neufert_shortfall(coords) / self.NEUFERT_SHORTFALL_BAND_M)
+        prefer, rect_band, usable_band = self._soft_rank(coords)
         return (
             round(penetration, 3) if penetration > 1e-3 else 0.0,
             round(fixed / self.weights.critical, 2),
             self._must_violations(coords),
-            *self._soft_rank(coords),
+            prefer,
             round(neufert_band * self.NEUFERT_SHORTFALL_BAND_M, 2),
+            rect_band,
+            usable_band,
             self._moved_count(coords),
             float(self._objective(coords.reshape(-1))),
         )
@@ -1453,6 +1459,13 @@ class CanonicalLayoutOptimizer:
 
         return adjusted
 
+    def _is_chair_at_its_support(self, i: int, j: int, ids: dict[str, int]) -> bool:
+        """One of the two is a chair and the other is the desk/table it is paired with."""
+        fi, fj = self.furnitures[i], self.furnitures[j]
+        return (fi["type"] == "chair" and ids.get(fi.get("pair_with")) == j) or (
+            fj["type"] == "chair" and ids.get(fj.get("pair_with")) == i
+        )
+
     def _is_paired_relationship(self, i: int, j: int, ids: dict[str, int]) -> bool:
         # A chair and its own desk/table (or two chairs sharing one) are
         # meant to sit close together -- the minimum-passage pass below
@@ -1547,7 +1560,8 @@ class CanonicalLayoutOptimizer:
     def _max_furniture_penetration(
         self, coords: np.ndarray, *, include_paired: bool = True, skip_in_place: np.ndarray | None = None
     ) -> float:
-        """Worst pairwise overlap. include_paired=False ignores chairs tucked into their own desk/table;
+        """Worst pairwise overlap. include_paired=False ignores chairs tucked into their own desk/table
+        (two chairs at the same table still collide);
         skip_in_place (a per-piece mask) ignores pairs where both pieces are flagged."""
         max_penetration = 0.0
         ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
@@ -1557,7 +1571,7 @@ class CanonicalLayoutOptimizer:
         ]
         for i in range(self.num_f):
             for j in range(i + 1, self.num_f):
-                if self._vertically_apart(i, j) or (not include_paired and self._is_paired_relationship(i, j, ids)):
+                if self._vertically_apart(i, j) or (not include_paired and self._is_chair_at_its_support(i, j, ids)):
                     continue
                 if skip_in_place is not None and skip_in_place[i] and skip_in_place[j]:
                     continue
