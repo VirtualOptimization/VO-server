@@ -78,3 +78,13 @@ def test_shelf_standing_in_the_room_counts_as_off_wall():
     assert optimizer._off_wall_count(coords) == 1
     coords[0, 1] = 3.0 - 0.2  # back (north side) flush with the north wall
     assert optimizer._off_wall_count(coords) == 0
+
+
+def test_piece_just_past_the_door_swing_blocks_the_entry():
+    room = _room([_box("s", (0.9, 1.3), (0.5, 0.5))])
+    room["fixed_elements"].append({"id": "door", "type": "door", "wall": "west", "span": {"start": 1.0, "end": 1.8}, "clearance_depth": 0.8})
+    optimizer = CanonicalLayoutOptimizer(room)
+    coords = _scanned(optimizer)
+    assert optimizer._entry_blocked_count(coords) == 1  # 0.65-1.15 m from the wall: past the 0.8 m swing
+    coords[0, 0] = 2.5
+    assert optimizer._entry_blocked_count(coords) == 0

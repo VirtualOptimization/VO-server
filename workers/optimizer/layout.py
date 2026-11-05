@@ -906,6 +906,34 @@ class CanonicalLayoutOptimizer:
         loss = max(0.0, self.WALKABLE_KEEP_SHARE * scanned_usable - self._usable_open_area(coords))
         return math.ceil(loss / self.WALKABLE_LOSS_BAND_M2 - 1e-9) * self.WALKABLE_LOSS_BAND_M2
 
+    def _door_entry_zone(self, door: dict[str, Any]) -> np.ndarray:
+        """Floor in front of a door that someone walking in steps through: the
+        door's swing plus one LH passage width (0.8 m) beyond it."""
+        wall = door["wall"]
+        start, end = float(door["span"]["start"]), float(door["span"]["end"])
+        depth = float(door.get("clearance_depth", 0.9)) + self.body.furniture_passage_recommended
+        w, d = self.room_width, self.room_depth
+        return {
+            "west": np.array([[0.0, start], [depth, start], [depth, end], [0.0, end]]),
+            "east": np.array([[w, start], [w - depth, start], [w - depth, end], [w, end]]),
+            "south": np.array([[start, 0.0], [end, 0.0], [end, depth], [start, depth]]),
+        }.get(wall, np.array([[start, d], [end, d], [end, d - depth], [start, d - depth]]))
+
+    def _entry_blocked_count(self, coords: np.ndarray) -> int:
+        """Floor pieces standing in a door's entry zone (see _door_entry_zone)."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        zones = [self._door_entry_zone(f) for f in self.fixed_elements if f.get("type") == "door" and f.get("wall") in self.WALL_INDEX]
+        if not zones:
+            return 0
+        count = 0
+        for c, furniture in zip(coords, self.furnitures):
+            if furniture.get("wall_mounted"):
+                continue
+            obb = self._obb_corners(c[0], c[1], float(furniture["extent"][0]), float(furniture["extent"][1]), c[3])
+            if any(self._sat_penetration(zone, obb) > 0.02 for zone in zones):
+                count += 1
+        return count
+
     def _off_wall_count(self, coords: np.ndarray) -> int:
         """Pieces meant to stand with their back to a wall (shelves, a fridge, a
         wardrobe) that are not against one."""
@@ -947,14 +975,17 @@ class CanonicalLayoutOptimizer:
         """Pieces shifted or turned noticeably away from their scanned pose."""
         return int((~self._in_scanned_pose(coords)).sum())
 
-    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, int, int, float, float, float, int, float]:
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, int, float, int, int, float, float, float, int, float]:
         """Tiered comparison key for finished layouts; lower is better.
 
         Each tier is compared only when every tier before it ties, so nothing
         below can buy its way past a tier above with a large weight:
         1. furniture overlap (a chair tucked into its own desk within the
            allowance is fine), 2. door-clearance / wall / out-of-room
-        violations, 3. broken `must` principles, 4. pieces made unusable
+        violations, 3. broken `must` principles, 3b. pieces standing where
+        someone walking in through a door steps (swing plus one passage
+        width; after `must` so tiers 2 and 3 keep their positions for
+        hard_violations), 4. pieces made unusable
         (almost no room on the side they are used from, e.g. a shelf with a
         desk 20 cm in front of it, and usable in the scan), 5. walkable floor lost beyond 10 %
         of the scanned room's (in bands), 6. wall-standing pieces (shelves,
@@ -996,6 +1027,7 @@ class CanonicalLayoutOptimizer:
             round(penetration, 3) if penetration > 1e-3 else 0.0,
             round(fixed / self.weights.critical, 2),
             self._must_violations(coords),
+            self._entry_blocked_count(coords),
             self._unusable_count(coords),
             round(self._walkable_loss(coords), 2),
             self._off_wall_count(coords),
