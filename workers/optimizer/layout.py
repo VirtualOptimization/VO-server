@@ -15,6 +15,7 @@ from scipy.optimize import differential_evolution, minimize
 
 from workers.optimizer import lh_principles as lh
 from workers.optimizer.bounds import center_axis_bounds
+from workers.optimizer.neufert_rules import validate_neufert_rules
 
 # Same order as CanonicalLayoutOptimizer._wall_outward_normals / _distance_to_walls.
 ABSOLUTE_WALL_NAMES = ("west", "east", "south", "north")
@@ -802,13 +803,18 @@ class CanonicalLayoutOptimizer:
 
         A chair tucked under its own desk/table is not a collision as long as it
         stays within _allowed_chair_support_penetration; only the excess counts.
+        Two pieces that both still stand where they were scanned are not a
+        collision either: the room is really arranged that way.
         """
         coords = np.asarray(coords, dtype=float).reshape(-1, 4)
-        penetration = self._max_furniture_penetration(coords, include_paired=False)
+        in_place = self._in_scanned_pose(coords)
+        penetration = self._max_furniture_penetration(coords, include_paired=False, skip_in_place=in_place)
         ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
         for chair_idx, chair in enumerate(self.furnitures):
             support_idx = ids.get(chair.get("pair_with"))
             if chair["type"] != "chair" or support_idx is None or self.furnitures[support_idx]["type"] not in {"desk", "table"}:
+                continue
+            if in_place[chair_idx] and in_place[support_idx]:
                 continue
             support = self.furnitures[support_idx]
             chair_obb = self._obb_corners(coords[chair_idx, 0], coords[chair_idx, 1], float(chair["extent"][0]), float(chair["extent"][1]), coords[chair_idx, 3])
@@ -840,22 +846,169 @@ class CanonicalLayoutOptimizer:
     # Minimum width of floor counted as usable; None uses the LH passage width.
     USABLE_OPEN_WIDTH_M: float | None = None
 
-    def _soft_rank(self, coords: np.ndarray) -> tuple[int, float]:
-        """Sourced soft criteria, best first: prefer principles, then usable open floor."""
-        band = math.floor(self._usable_open_area(coords) / self.USABLE_AREA_BAND_M2)
-        return self._prefer_violations(coords), -band * self.USABLE_AREA_BAND_M2
+    # The largest clear rectangle is compared in bands this wide.
+    OPEN_RECT_BAND_M2 = 0.5
 
-    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, float]:
+    def _soft_rank(self, coords: np.ndarray) -> tuple[int, float, float]:
+        """Sourced soft criteria, best first: prefer principles, the largest clear
+        rectangle of floor, then usable open floor."""
+        rect_band = math.floor(self._largest_open_rect(coords) / self.OPEN_RECT_BAND_M2)
+        band = math.floor(self._usable_open_area(coords) / self.USABLE_AREA_BAND_M2)
+        return (
+            self._prefer_violations(coords),
+            -rect_band * self.OPEN_RECT_BAND_M2,
+            -band * self.USABLE_AREA_BAND_M2,
+        )
+
+    # Neufert shortfall is compared in steps this size (metres).
+    NEUFERT_SHORTFALL_BAND_M = 0.25
+
+    def _neufert_summary(self, coords: np.ndarray) -> dict[str, Any]:
+        """Neufert validation summary for a layout (cached per pose array)."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        key = coords.round(4).tobytes()
+        cache = self.__dict__.setdefault("_neufert_cache", {})
+        if key in cache:
+            return cache[key]
+        if not self.payload.get("neufert_rules"):
+            summary: dict[str, Any] = {"shortfall_m": 0.0, "unusable_items": []}
+        else:
+            items = [
+                {
+                    **furniture,
+                    "optimized_pos": [float(c[0]), float(c[1]), float(c[2])],
+                    "optimized_rotation_y_deg": math.degrees(float(c[3])),
+                }
+                for c, furniture in zip(coords, self.furnitures)
+            ]
+            summary = validate_neufert_rules(self.payload, {"movable_items": items})["neufert_validation"]["summary"]
+        if len(cache) > 4096:
+            cache.clear()
+        cache[key] = summary
+        return summary
+
+    def _neufert_shortfall(self, coords: np.ndarray) -> float:
+        """Total metres by which the layout misses the Neufert clearances."""
+        return float(self._neufert_summary(coords)["shortfall_m"])
+
+    # Walkable floor may shrink by at most this share of the scanned room's
+    # before it counts against a layout; the shortfall is compared in bands.
+    WALKABLE_KEEP_SHARE = 0.9
+    WALKABLE_LOSS_BAND_M2 = 0.5
+
+    def _walkable_loss(self, coords: np.ndarray) -> float:
+        """Walkable floor lost beyond WALKABLE_KEEP_SHARE of the scanned layout's, in bands."""
+        scanned_usable = self.__dict__.get("_scanned_usable")
+        if scanned_usable is None:
+            self._in_scanned_pose(coords)  # fills _scanned_coords
+            scanned_usable = self._usable_open_area(self.__dict__["_scanned_coords"])
+            self.__dict__["_scanned_usable"] = scanned_usable
+        loss = max(0.0, self.WALKABLE_KEEP_SHARE * scanned_usable - self._usable_open_area(coords))
+        return math.ceil(loss / self.WALKABLE_LOSS_BAND_M2 - 1e-9) * self.WALKABLE_LOSS_BAND_M2
+
+    def _door_entry_zone(self, door: dict[str, Any]) -> np.ndarray:
+        """Floor in front of a door that someone walking in steps through: the
+        door's swing plus one LH passage width (0.8 m) beyond it."""
+        wall = door["wall"]
+        start, end = float(door["span"]["start"]), float(door["span"]["end"])
+        depth = float(door.get("clearance_depth", 0.9)) + self.body.furniture_passage_recommended
+        w, d = self.room_width, self.room_depth
+        return {
+            "west": np.array([[0.0, start], [depth, start], [depth, end], [0.0, end]]),
+            "east": np.array([[w, start], [w - depth, start], [w - depth, end], [w, end]]),
+            "south": np.array([[start, 0.0], [end, 0.0], [end, depth], [start, depth]]),
+        }.get(wall, np.array([[start, d], [end, d], [end, d - depth], [start, d - depth]]))
+
+    def _entry_blocked_count(self, coords: np.ndarray) -> int:
+        """Floor pieces standing in a door's entry zone (see _door_entry_zone)."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        zones = [self._door_entry_zone(f) for f in self.fixed_elements if f.get("type") == "door" and f.get("wall") in self.WALL_INDEX]
+        if not zones:
+            return 0
+        count = 0
+        for c, furniture in zip(coords, self.furnitures):
+            if furniture.get("wall_mounted"):
+                continue
+            obb = self._obb_corners(c[0], c[1], float(furniture["extent"][0]), float(furniture["extent"][1]), c[3])
+            if any(self._sat_penetration(zone, obb) > 0.02 for zone in zones):
+                count += 1
+        return count
+
+    def _off_wall_count(self, coords: np.ndarray) -> int:
+        """Pieces meant to stand with their back to a wall (shelves, a fridge, a
+        wardrobe) that are not against one."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        count = 0
+        for c, furniture in zip(coords, self.furnitures):
+            if furniture.get("pinned") or furniture.get("wall_mounted"):
+                continue
+            if not (furniture.get("anchor_preferences") or {}).get("back_to_wall") or furniture.get("type") == "bed":
+                continue
+            if lh.back_wall(furniture, float(c[0]), float(c[1]), float(c[3]), self.room_width, self.room_depth) is None:
+                count += 1
+        return count
+
+    def _unusable_count(self, coords: np.ndarray) -> int:
+        """Pieces the layout leaves with almost no room on the side they are used
+        from, not counting pieces that were already like that in the scan: the
+        room was really used that way, and fixing them is credited through the
+        Neufert shortfall instead."""
+        scanned_unusable = self.__dict__.get("_scanned_unusable")
+        if scanned_unusable is None:
+            self._in_scanned_pose(coords)  # fills _scanned_coords
+            scanned_unusable = set(self._neufert_summary(self.__dict__["_scanned_coords"])["unusable_items"])
+            self.__dict__["_scanned_unusable"] = scanned_unusable
+        return len(set(self._neufert_summary(coords)["unusable_items"]) - scanned_unusable)
+
+    def _in_scanned_pose(self, coords: np.ndarray) -> np.ndarray:
+        """Per piece: still where it was scanned (no noticeable shift or turn)."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        scanned = self.__dict__.get("_scanned_coords")
+        if scanned is None:
+            scanned = np.array([self._coords_from_furniture(f) for f in self.furnitures]).reshape(-1, 4)
+            self.__dict__["_scanned_coords"] = scanned
+        shift = np.hypot(coords[:, 0] - scanned[:, 0], coords[:, 1] - scanned[:, 1])
+        turn = np.abs(np.arctan2(np.sin(coords[:, 3] - scanned[:, 3]), np.cos(coords[:, 3] - scanned[:, 3])))
+        return (shift <= self.KEEP_IN_PLACE_MIN_SHIFT_M) & (turn <= self.KEEP_IN_PLACE_MIN_TURN_RAD)
+
+    def _moved_count(self, coords: np.ndarray) -> int:
+        """Pieces shifted or turned noticeably away from their scanned pose."""
+        return int((~self._in_scanned_pose(coords)).sum())
+
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, int, float, int, int, float, float, float, int, float]:
         """Tiered comparison key for finished layouts; lower is better.
 
         Each tier is compared only when every tier before it ties, so nothing
         below can buy its way past a tier above with a large weight:
         1. furniture overlap (a chair tucked into its own desk within the
            allowance is fine), 2. door-clearance / wall / out-of-room
-        violations, 3. broken `must` principles, 4. broken `prefer`
-        principles, 5. usable open floor (LH passage width, in bands), and
-        6. the weighted objective, which still holds the older unsourced
+        violations, 3. broken `must` principles, 3b. pieces standing where
+        someone walking in through a door steps (swing plus one passage
+        width; after `must` so tiers 2 and 3 keep their positions for
+        hard_violations), 4. pieces made unusable
+        (almost no room on the side they are used from, e.g. a shelf with a
+        desk 20 cm in front of it, and usable in the scan), 5. walkable floor lost beyond 10 %
+        of the scanned room's (in bands), 6. wall-standing pieces (shelves,
+        a fridge, a wardrobe) not against a wall, 7. broken `prefer`
+        principles, 8. metres short of the Neufert clearances (in bands),
+        9. the largest clear rectangle of floor (in bands), 10. usable open
+        floor (LH passage width, in bands), 11. how many pieces were moved,
+        so that between equally good layouts the one that changes less wins,
+        and 12. the weighted objective, which still holds the older unsourced
         clearance rules.
+
+        Tier 5 keeps the room walkable: without it any clearance gain beat
+        open floor, and a room could end up split by rows of chairs.
+
+        Unusable pieces are counted on their own because a total shortfall
+        lets one piece be boxed in as long as others gain room.
+
+        Room to use each piece (Neufert) comes before open floor: emptying the
+        middle by pushing a table into a corner where its chairs cannot be
+        pulled out makes the room look bigger and live worse. Among layouts
+        that are equally usable, the clear rectangle comes before the
+        usable-floor total because a room reads as roomy when one block of
+        floor is free.
         """
         coords = np.asarray(coords, dtype=float).reshape(-1, 4)
         obbs = [
@@ -863,14 +1016,115 @@ class CanonicalLayoutOptimizer:
             for c, f in zip(coords, self.furnitures)
         ]
         penetration = self._collision_penetration(coords)
-        fixed = self._fixed_element_penalty(obbs, coords) + sum(self._outside_room_penalty(obb) for obb in obbs)
+        # A piece still where it was scanned really stands there; touching the
+        # wall is scan noise, not a placement fault.
+        fixed = self._fixed_element_penalty(obbs, coords, wall_exempt=self._in_scanned_pose(coords)) + sum(
+            self._outside_room_penalty(obb) for obb, in_place in zip(obbs, self._in_scanned_pose(coords)) if not in_place
+        )
+        neufert_band = math.floor(self._neufert_shortfall(coords) / self.NEUFERT_SHORTFALL_BAND_M)
+        prefer, rect_band, usable_band = self._soft_rank(coords)
         return (
             round(penetration, 3) if penetration > 1e-3 else 0.0,
             round(fixed / self.weights.critical, 2),
             self._must_violations(coords),
-            *self._soft_rank(coords),
+            self._entry_blocked_count(coords),
+            self._unusable_count(coords),
+            round(self._walkable_loss(coords), 2),
+            self._off_wall_count(coords),
+            prefer,
+            round(neufert_band * self.NEUFERT_SHORTFALL_BAND_M, 2),
+            rect_band,
+            usable_band,
+            self._moved_count(coords),
             float(self._objective(coords.reshape(-1))),
         )
+
+    # A piece counts as moved when it shifts or turns more than this.
+    KEEP_IN_PLACE_MIN_SHIFT_M = 0.15
+    KEEP_IN_PLACE_MIN_TURN_RAD = math.radians(5.0)
+
+    MINIMAL_EDIT_MAX_MOVES = 20
+
+    def _minimal_edit_layout(self, scanned: np.ndarray, target: np.ndarray) -> np.ndarray:
+        """Improve the scanned layout one purposeful move at a time.
+
+        Starting from the room as it is, each step tries every piece at its
+        pose in `target` -- the full search's answer -- on its own, and for a
+        table with its chairs carried along or set at their own target poses,
+        and against each wall, and keeps the single move that ranks
+        best, as long as it beats the layout without it. Every move it makes
+        therefore buys something the ranking can name, and pieces whose move
+        in `target` bought nothing stay where they were.
+        """
+        current = np.asarray(scanned, dtype=float).reshape(-1, 4).copy()
+        target = np.asarray(target, dtype=float).reshape(-1, 4)
+        movable = [i for i, f in enumerate(self.furnitures) if not f.get("pinned")]
+        best_rank = self._layout_rank(current)[:-1]
+        for _ in range(self.MINIMAL_EDIT_MAX_MOVES):
+            best_trial = None
+            for i in movable:
+                alone = current.copy()
+                alone[i] = target[i]
+                trials = [alone]
+                if self.furnitures[i].get("type") != "chair":
+                    trials.append(self._move_with_paired_chairs(current, i, target[i, 0], target[i, 1], target[i, 3]))
+                    group = [i] + [j for j, f in enumerate(self.furnitures) if f.get("pair_with") == self.furnitures[i].get("id")]
+                    if len(group) > 1:
+                        together = current.copy()
+                        together[group] = target[group]
+                        trials.append(together)
+                    trials += self._against_wall_candidates(current, i, list(self.WALL_INDEX))
+                for trial in trials:
+                    rank = self._layout_rank(trial)[:-1]
+                    if rank < best_rank:
+                        best_rank, best_trial = rank, trial
+            if best_trial is None:
+                break
+            current = best_trial
+        return current
+
+    def _keep_unneeded_moves_in_place(self, coords: np.ndarray, scanned: np.ndarray) -> np.ndarray:
+        """Put back every piece whose move does not help the layout.
+
+        The search moves everything at once, so pieces it merely shuffled end
+        up displaced too, and a result with every piece moved for a small gain
+        looks like change for its own sake. Each moved piece (with the chairs
+        paired to it) is tried back at its scanned pose and stays there when
+        no ranked criterion gets worse; the weighted objective is left out of
+        the comparison because it is what moved the piece in the first place.
+        """
+        current = np.asarray(coords, dtype=float).reshape(-1, 4).copy()
+
+        def criteria(c: np.ndarray) -> tuple:
+            return self._layout_rank(c)[:-1]
+
+        def moved(i: int, c: np.ndarray) -> bool:
+            shift = math.hypot(c[i, 0] - scanned[i, 0], c[i, 1] - scanned[i, 1])
+            turn = abs(math.atan2(math.sin(c[i, 3] - scanned[i, 3]), math.cos(c[i, 3] - scanned[i, 3])))
+            return shift > self.KEEP_IN_PLACE_MIN_SHIFT_M or turn > self.KEEP_IN_PLACE_MIN_TURN_RAD
+
+        ids = {f.get("id") for f in self.furnitures}
+        order = sorted(
+            range(self.num_f),
+            key=lambda i: -float(self.furnitures[i]["extent"][0]) * float(self.furnitures[i]["extent"][1]),
+        )
+        best = criteria(current)
+        for _ in range(2):
+            changed = False
+            for i in order:
+                furniture = self.furnitures[i]
+                if furniture.get("pinned") or not moved(i, current):
+                    continue
+                # Chairs at a table travel with it.
+                if furniture.get("type") == "chair" and furniture.get("pair_with") in ids:
+                    continue
+                trial = self._move_with_paired_chairs(current, i, scanned[i, 0], scanned[i, 1], scanned[i, 3])
+                score = criteria(trial)
+                if score <= best:
+                    current, best, changed = trial, score, True
+            if not changed:
+                break
+        return current
 
     def _enforce_lh_principles(self, coords: np.ndarray) -> tuple[np.ndarray, list[dict[str, Any]]]:
         """Repair violations of the sourced placement principles (see lh_principles.py).
@@ -1051,6 +1305,8 @@ class CanonicalLayoutOptimizer:
         # Keyed by id(), which does not survive pickling into DE workers.
         state = self.__dict__.copy()
         state.pop("_wall_poly_cache", None)
+        # Only the final ranking reads this; no need to ship it to every worker.
+        state.pop("_neufert_cache", None)
         return state
 
     def _wall_obstacle_polygon(self, wall: dict[str, Any], *, buffer: float = 0.0) -> np.ndarray:
@@ -1304,6 +1560,13 @@ class CanonicalLayoutOptimizer:
 
         return adjusted
 
+    def _is_chair_at_its_support(self, i: int, j: int, ids: dict[str, int]) -> bool:
+        """One of the two is a chair and the other is the desk/table it is paired with."""
+        fi, fj = self.furnitures[i], self.furnitures[j]
+        return (fi["type"] == "chair" and ids.get(fi.get("pair_with")) == j) or (
+            fj["type"] == "chair" and ids.get(fj.get("pair_with")) == i
+        )
+
     def _is_paired_relationship(self, i: int, j: int, ids: dict[str, int]) -> bool:
         # A chair and its own desk/table (or two chairs sharing one) are
         # meant to sit close together -- the minimum-passage pass below
@@ -1395,8 +1658,12 @@ class CanonicalLayoutOptimizer:
 
         return adjusted
 
-    def _max_furniture_penetration(self, coords: np.ndarray, *, include_paired: bool = True) -> float:
-        """Worst pairwise overlap. include_paired=False ignores chairs tucked into their own desk/table."""
+    def _max_furniture_penetration(
+        self, coords: np.ndarray, *, include_paired: bool = True, skip_in_place: np.ndarray | None = None
+    ) -> float:
+        """Worst pairwise overlap. include_paired=False ignores chairs tucked into their own desk/table
+        (two chairs at the same table still collide);
+        skip_in_place (a per-piece mask) ignores pairs where both pieces are flagged."""
         max_penetration = 0.0
         ids = {f["id"]: idx for idx, f in enumerate(self.furnitures)}
         obbs = [
@@ -1405,7 +1672,9 @@ class CanonicalLayoutOptimizer:
         ]
         for i in range(self.num_f):
             for j in range(i + 1, self.num_f):
-                if self._vertically_apart(i, j) or (not include_paired and self._is_paired_relationship(i, j, ids)):
+                if self._vertically_apart(i, j) or (not include_paired and self._is_chair_at_its_support(i, j, ids)):
+                    continue
+                if skip_in_place is not None and skip_in_place[i] and skip_in_place[j]:
                     continue
                 max_penetration = max(max_penetration, self._sat_penetration(obbs[i], obbs[j]))
         return float(max_penetration)
@@ -1727,7 +1996,11 @@ class CanonicalLayoutOptimizer:
                 total += self.weights.critical + overlap * vertical_ratio * self.weights.high
         return total
 
-    def _fixed_element_penalty(self, all_obbs: list[np.ndarray], all_coords: np.ndarray) -> float:
+    def _fixed_element_penalty(
+        self, all_obbs: list[np.ndarray], all_coords: np.ndarray, *, wall_exempt: np.ndarray | None = None
+    ) -> float:
+        """Door-clearance and wall violations. wall_exempt (a per-piece mask) skips
+        the wall check for those pieces; door clearance is always checked."""
         total = 0.0
         for fixed in self.fixed_elements:
             fixed_type = fixed.get("type")
@@ -1737,7 +2010,9 @@ class CanonicalLayoutOptimizer:
                 clearance = self._wall_obstacle_polygon(fixed, buffer=0.02)
             else:
                 continue
-            for obb in all_obbs:
+            for index, obb in enumerate(all_obbs):
+                if fixed_type == "wall" and wall_exempt is not None and wall_exempt[index]:
+                    continue
                 overlap = (
                     self._sat_penetration(clearance, obb)
                     if fixed_type == "wall"
@@ -2793,7 +3068,24 @@ class CanonicalLayoutOptimizer:
             "open_floor_ratio": round(total_open / room_area, 4) if room_area > 0 else 0.0,
             "largest_open_region_m2": round(largest_open, 3),
             "usable_open_area_m2": round(self._usable_open_area(coords), 3),
+            "largest_open_rect_m2": round(self._largest_open_rect(coords), 3),
         }
+
+    def _largest_open_rect(self, coords: np.ndarray, cell_size: float = 0.1) -> float:
+        """Area of the largest wall-aligned rectangle of floor with no furniture on it."""
+        occupied, cell_area = self._floor_occupancy_mask(np.asarray(coords, dtype=float).reshape(-1, 4), cell_size)
+        heights = np.zeros(occupied.shape[1] + 1, dtype=int)
+        best = 0
+        for row in ~occupied:
+            heights[:-1] = np.where(row, heights[:-1] + 1, 0)
+            stack: list[int] = []
+            for col, height in enumerate(heights.tolist()):
+                while stack and heights[stack[-1]] >= height:
+                    top = stack.pop()
+                    left = stack[-1] + 1 if stack else 0
+                    best = max(best, int(heights[top]) * (col - left))
+                stack.append(col)
+        return best * cell_area
 
     def _objective(self, x: np.ndarray) -> float:
         coords = x.reshape(-1, 4)
@@ -2973,7 +3265,7 @@ class CanonicalLayoutOptimizer:
                 {
                     "stage": name,
                     "max_penetration_m": round(float(self._max_furniture_penetration(coords)), 4),
-                    "rank": [*rank[:5], round(rank[5], 1)],
+                    "rank": [*rank[:-1], round(rank[-1], 1)],
                 }
             )
 
@@ -3085,6 +3377,19 @@ class CanonicalLayoutOptimizer:
             optimized = widened
         _record_stage("minimum_passage_widening", widened)
 
+        kept = self._keep_unneeded_moves_in_place(optimized, original_initial.reshape(-1, 4))
+        if not np.allclose(kept, optimized):
+            selected_stage += "+kept_in_place"
+            optimized = kept
+        _record_stage("kept_in_place", optimized)
+
+        minimal = self._minimal_edit_layout(original_initial.reshape(-1, 4), optimized)
+        print(f"optimizer: minimal edit done moved={self._moved_count(minimal)}", flush=True)
+        _record_stage("minimal_edit", minimal)
+        if self._layout_rank(minimal) < self._layout_rank(optimized):
+            optimized = minimal
+            selected_stage = "minimal_edit"
+
         # Every scanned room is, by construction, a real arrangement that
         # already exists without furniture colliding (at worst it has the
         # same measurement-noise-level contact the scan itself shows, e.g. a
@@ -3125,6 +3430,29 @@ class CanonicalLayoutOptimizer:
                 "arm_reach": self.body.arm_reach,
             },
             "floor_efficiency": self._open_floor_report(optimized),
+            "neufert_shortfall_m": {
+                "scanned": round(self._neufert_shortfall(original_coords), 3),
+                "optimized": round(self._neufert_shortfall(optimized), 3),
+            },
+            # Before/after figures a viewer can check against the floor plan.
+            "scan_comparison": {
+                "largest_open_rect_m2": {
+                    "scanned": round(self._largest_open_rect(original_coords), 3),
+                    "optimized": round(self._largest_open_rect(optimized), 3),
+                },
+                "usable_open_area_m2": {
+                    "scanned": round(self._usable_open_area(original_coords), 3),
+                    "optimized": round(self._usable_open_area(optimized), 3),
+                },
+                "moved_items": sum(
+                    1
+                    for i in range(self.num_f)
+                    if math.hypot(optimized[i, 0] - original_coords[i, 0], optimized[i, 1] - original_coords[i, 1])
+                    > self.KEEP_IN_PLACE_MIN_SHIFT_M
+                    or abs(math.atan2(math.sin(optimized[i, 3] - original_coords[i, 3]), math.cos(optimized[i, 3] - original_coords[i, 3])))
+                    > self.KEEP_IN_PLACE_MIN_TURN_RAD
+                ),
+            },
             "stage_trace": stage_trace,
             "selected_stage": "scanned_layout" if fallback_to_scan else selected_stage,
             "fallback_to_scanned_layout": fallback_to_scan,
