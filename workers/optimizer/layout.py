@@ -907,8 +907,16 @@ class CanonicalLayoutOptimizer:
         return math.ceil(loss / self.WALKABLE_LOSS_BAND_M2 - 1e-9) * self.WALKABLE_LOSS_BAND_M2
 
     def _unusable_count(self, coords: np.ndarray) -> int:
-        """Pieces with almost no room on the side they are used from."""
-        return len(self._neufert_summary(coords)["unusable_items"])
+        """Pieces the layout leaves with almost no room on the side they are used
+        from, not counting pieces that were already like that in the scan: the
+        room was really used that way, and fixing them is credited through the
+        Neufert shortfall instead."""
+        scanned_unusable = self.__dict__.get("_scanned_unusable")
+        if scanned_unusable is None:
+            self._in_scanned_pose(coords)  # fills _scanned_coords
+            scanned_unusable = set(self._neufert_summary(self.__dict__["_scanned_coords"])["unusable_items"])
+            self.__dict__["_scanned_unusable"] = scanned_unusable
+        return len(set(self._neufert_summary(coords)["unusable_items"]) - scanned_unusable)
 
     def _in_scanned_pose(self, coords: np.ndarray) -> np.ndarray:
         """Per piece: still where it was scanned (no noticeable shift or turn)."""
@@ -932,9 +940,9 @@ class CanonicalLayoutOptimizer:
         below can buy its way past a tier above with a large weight:
         1. furniture overlap (a chair tucked into its own desk within the
            allowance is fine), 2. door-clearance / wall / out-of-room
-        violations, 3. broken `must` principles, 4. pieces that cannot be
-        used (almost no room on the side they are used from, e.g. a shelf
-        with a desk 20 cm in front of it), 5. walkable floor lost beyond 10 %
+        violations, 3. broken `must` principles, 4. pieces made unusable
+        (almost no room on the side they are used from, e.g. a shelf with a
+        desk 20 cm in front of it, and usable in the scan), 5. walkable floor lost beyond 10 %
         of the scanned room's (in bands), 6. broken `prefer` principles,
         7. metres short of the Neufert clearances (in bands), 8. the largest
         clear rectangle of floor (in bands), 9. usable open floor (LH passage
