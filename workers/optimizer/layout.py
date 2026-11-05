@@ -863,20 +863,37 @@ class CanonicalLayoutOptimizer:
     # Neufert shortfall is compared in steps this size (metres).
     NEUFERT_SHORTFALL_BAND_M = 0.25
 
+    def _neufert_summary(self, coords: np.ndarray) -> dict[str, Any]:
+        """Neufert validation summary for a layout (cached per pose array)."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        key = coords.round(4).tobytes()
+        cache = self.__dict__.setdefault("_neufert_cache", {})
+        if key in cache:
+            return cache[key]
+        if not self.payload.get("neufert_rules"):
+            summary: dict[str, Any] = {"shortfall_m": 0.0, "unusable_items": []}
+        else:
+            items = [
+                {
+                    **furniture,
+                    "optimized_pos": [float(c[0]), float(c[1]), float(c[2])],
+                    "optimized_rotation_y_deg": math.degrees(float(c[3])),
+                }
+                for c, furniture in zip(coords, self.furnitures)
+            ]
+            summary = validate_neufert_rules(self.payload, {"movable_items": items})["neufert_validation"]["summary"]
+        if len(cache) > 4096:
+            cache.clear()
+        cache[key] = summary
+        return summary
+
     def _neufert_shortfall(self, coords: np.ndarray) -> float:
         """Total metres by which the layout misses the Neufert clearances."""
-        if not self.payload.get("neufert_rules"):
-            return 0.0
-        items = [
-            {
-                **furniture,
-                "optimized_pos": [float(c[0]), float(c[1]), float(c[2])],
-                "optimized_rotation_y_deg": math.degrees(float(c[3])),
-            }
-            for c, furniture in zip(np.asarray(coords, dtype=float).reshape(-1, 4), self.furnitures)
-        ]
-        report = validate_neufert_rules(self.payload, {"movable_items": items})
-        return float(report["neufert_validation"]["summary"]["shortfall_m"])
+        return float(self._neufert_summary(coords)["shortfall_m"])
+
+    def _unusable_count(self, coords: np.ndarray) -> int:
+        """Pieces with almost no room on the side they are used from."""
+        return len(self._neufert_summary(coords)["unusable_items"])
 
     def _in_scanned_pose(self, coords: np.ndarray) -> np.ndarray:
         """Per piece: still where it was scanned (no noticeable shift or turn)."""
@@ -893,20 +910,25 @@ class CanonicalLayoutOptimizer:
         """Pieces shifted or turned noticeably away from their scanned pose."""
         return int((~self._in_scanned_pose(coords)).sum())
 
-    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, float, float, int, float]:
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, int, float, float, float, int, float]:
         """Tiered comparison key for finished layouts; lower is better.
 
         Each tier is compared only when every tier before it ties, so nothing
         below can buy its way past a tier above with a large weight:
         1. furniture overlap (a chair tucked into its own desk within the
            allowance is fine), 2. door-clearance / wall / out-of-room
-        violations, 3. broken `must` principles, 4. broken `prefer`
-        principles, 5. metres short of the Neufert clearances (in bands),
-        6. the largest clear rectangle of floor (in bands), 7. usable open
-        floor (LH passage width, in bands), 8. how many pieces were moved, so
-        that between equally good layouts the one that changes less wins,
-        and 9. the weighted objective, which still holds the older unsourced
-        clearance rules.
+        violations, 3. broken `must` principles, 4. pieces that cannot be
+        used (almost no room on the side they are used from, e.g. a shelf
+        with a desk 20 cm in front of it), 5. broken `prefer` principles,
+        6. metres short of the Neufert clearances (in bands), 7. the largest
+        clear rectangle of floor (in bands), 8. usable open floor (LH passage
+        width, in bands), 9. how many pieces were moved, so that between
+        equally good layouts the one that changes less wins, and 10. the
+        weighted objective, which still holds the older unsourced clearance
+        rules.
+
+        Unusable pieces are counted on their own because a total shortfall
+        lets one piece be boxed in as long as others gain room.
 
         Room to use each piece (Neufert) comes before open floor: emptying the
         middle by pushing a table into a corner where its chairs cannot be
@@ -932,6 +954,7 @@ class CanonicalLayoutOptimizer:
             round(penetration, 3) if penetration > 1e-3 else 0.0,
             round(fixed / self.weights.critical, 2),
             self._must_violations(coords),
+            self._unusable_count(coords),
             prefer,
             round(neufert_band * self.NEUFERT_SHORTFALL_BAND_M, 2),
             rect_band,
@@ -1206,6 +1229,8 @@ class CanonicalLayoutOptimizer:
         # Keyed by id(), which does not survive pickling into DE workers.
         state = self.__dict__.copy()
         state.pop("_wall_poly_cache", None)
+        # Only the final ranking reads this; no need to ship it to every worker.
+        state.pop("_neufert_cache", None)
         return state
 
     def _wall_obstacle_polygon(self, wall: dict[str, Any], *, buffer: float = 0.0) -> np.ndarray:

@@ -149,6 +149,13 @@ def apply_neufert_rules(problem: dict[str, Any], path: str | Path | None) -> dic
 CLEARANCE_RELATIONS = {"around", "clearance", "passage"}
 # A piece whose back is this close to a wall is wall-standing furniture.
 BACKED_AGAINST_WALL_M = 0.15
+# Another piece counts as in front of / beside a piece only when they face each
+# other over at least this width; a corner that merely lines up is not in the way.
+MIN_FACING_OVERLAP_M = 0.05
+# A piece is unusable when the room on the side it is used from is under this
+# share of the rule's requirement (a shelf you cannot stand in front of).
+UNUSABLE_SHARE = 0.5
+USE_DIRECTIONS = {"front", "around"}
 
 
 def _rule_requirement(rule: dict[str, Any], relaxation_scale: float) -> float | None:
@@ -289,7 +296,7 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
         subject_cross = projection(subject_poly, lateral)
         target_cross = projection(target_poly, lateral)
         cross_overlap = min(subject_cross[1], target_cross[1]) - max(subject_cross[0], target_cross[0])
-        if cross_overlap <= 1e-6:
+        if cross_overlap <= MIN_FACING_OVERLAP_M:
             return None
 
         subject_forward = projection(subject_poly, forward)
@@ -488,6 +495,16 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
         "qualitative_only": sum(c["status"] == "qualitative_only" for c in checks),
         "not_applicable": sum(c["status"] == "not_applicable" for c in checks),
         "shortfall_m": round(sum(c.get("shortfall_m", 0.0) for c in checks), 3),
+        "unusable_items": sorted(
+            {
+                str(c["item_id"])
+                for c in checks
+                if c["status"] == "fail"
+                and _entity(c.get("object")) == "room"
+                and str(c.get("direction")) in USE_DIRECTIONS
+                and float(c.get("measured_distance_m") or 0.0) < UNUSABLE_SHARE * float(c["required_distance_m"])
+            }
+        ),
     }
     optimized["neufert_validation"] = {"summary": summary, "checks": checks}
     return optimized
