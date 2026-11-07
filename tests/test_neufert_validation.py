@@ -84,3 +84,27 @@ def test_passing_layout_has_no_shortfall():
     bed = _item("bed", "bed", (1.0, 2.0), (0.5, 1.0), [1.0, 0.0])
     report = _summary([_rule("bed", "around", "around", 0.6)], [bed])
     assert report["summary"]["shortfall_m"] == 0.0
+
+
+def test_blocked_shelf_counts_as_unusable():
+    shelf = _item("shelf", "shelf", (0.8, 0.4), (2.0, 0.2), [0.0, 1.0])
+    desk = _item("desk", "table", (1.2, 0.6), (2.0, 0.7), [0.0, -1.0])
+    report = _summary([_rule("shelf", "clearance", "front", 0.9)], [shelf, desk])
+    assert report["summary"]["unusable_items"] == ["shelf"]
+
+
+def test_corner_that_only_lines_up_is_not_in_front():
+    shelf = _item("shelf", "shelf", (0.8, 0.4), (1.0, 0.2), [0.0, 1.0])
+    # Starts exactly where the shelf ends sideways, 0.1 m in front of it.
+    other = _item("bed", "bed", (1.0, 1.0), (1.9 + 0.001, 0.9), [0.0, 1.0])
+    (check,) = _check([_rule("shelf", "clearance", "front", 0.9)], [shelf, other])
+    assert check["status"] == "pass"
+
+
+def test_nightstand_is_not_a_table_to_keep_clear_of_the_bed():
+    bed = _item("bed", "bed", (1.0, 2.0), (1.0, 2.0), [0.0, -1.0])
+    nightstand = _item("n", "table", (0.5, 0.5), (1.75, 2.75), [0.0, -1.0])
+    desk = _item("d", "table", (1.4, 0.6), (2.4, 2.0), [0.0, -1.0])
+    rule = _rule("bed", "clearance", "side", 1.1, obj="table")
+    assert _check([rule], [bed, nightstand])[0]["status"] == "not_applicable"
+    assert _check([rule], [bed, desk])[0]["status"] == "fail"

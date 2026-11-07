@@ -54,6 +54,7 @@ def main() -> None:
         maybe_apply_ai_constraints,
         merge_ai_retry_output,
         optimizer_needs_recovery,
+        plan_room_intent,
         prepare_ai_retry_problem,
     )
     print("pipeline: ai constraints imported", flush=True)
@@ -84,6 +85,7 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    problem = plan_room_intent(problem)
     optimizer = CanonicalLayoutOptimizer(problem)
     print("pipeline: optimizer created", flush=True)
     optimized = optimizer.optimize(

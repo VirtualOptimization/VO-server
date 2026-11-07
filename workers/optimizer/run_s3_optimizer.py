@@ -22,6 +22,7 @@ from workers.optimizer.ai_constraints import (
     maybe_apply_ai_constraints,
     merge_ai_retry_output,
     optimizer_needs_recovery,
+    plan_room_intent,
     prepare_ai_retry_problem,
 )
 from workers.optimizer.neufert_rules import validate_neufert_rules
@@ -104,6 +105,7 @@ def main() -> int:
         normalized = convert_roomplan_to_optimizer_payload(raw_payload)
         problem = build_layout_problem(normalized)
 
+        problem = plan_room_intent(problem)
         optimizer = CanonicalLayoutOptimizer(problem)
         optimized = optimizer.optimize(
             global_maxiter=global_maxiter,

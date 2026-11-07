@@ -37,15 +37,23 @@ def _normalize_vector_2d(x: float, y: float, fallback: list[float]) -> list[floa
 
 
 def _extract_usage_front_2d(obj: dict[str, Any], floor_theta: float, fallback: list[float]) -> list[float]:
-    front = obj.get("frontVector")
-    if front and len(front) >= 3:
-        fx, fy = _rotate_vector(front[0], front[2], floor_theta)
-        return _normalize_vector_2d(fx, fy, fallback)
+    """Direction of the side a person uses the piece from.
 
+    The app's frontVector is the object's local -Z axis, but a scanned piece is
+    used from its +Z side: every shelf, desk and fridge standing at a wall in the
+    scans has frontVector pointing into that wall, and every chair at a table
+    has it pointing away from the table. So the usage front is backVector
+    (+Z), the same axis the transform fallback below already reads.
+    """
     back = obj.get("backVector")
     if back and len(back) >= 3:
         bx, by = _rotate_vector(back[0], back[2], floor_theta)
-        return _normalize_vector_2d(-bx, -by, fallback)
+        return _normalize_vector_2d(bx, by, fallback)
+
+    front = obj.get("frontVector")
+    if front and len(front) >= 3:
+        fx, fy = _rotate_vector(front[0], front[2], floor_theta)
+        return _normalize_vector_2d(-fx, -fy, fallback)
 
     transform = obj.get("transform")
     if transform:
@@ -174,9 +182,8 @@ def convert_roomplan_to_optimizer_payload(
         }
         item.update(build_optimizer_metadata(category))
         item["front_vector_2d"] = _extract_usage_front_2d(obj, floor_theta, item["front_vector_2d"])
-        if obj.get("backVector"):
-            bx, by = _rotate_vector(obj["backVector"][0], obj["backVector"][2], floor_theta)
-            item["back_vector_2d"] = _normalize_vector_2d(bx, by, [-item["front_vector_2d"][0], -item["front_vector_2d"][1]])
+        if obj.get("backVector") or obj.get("frontVector"):
+            item["back_vector_2d"] = [-item["front_vector_2d"][0], -item["front_vector_2d"][1]]
         if "modelFileName" in obj:
             item["source_model_file"] = obj["modelFileName"]
             model_key = infer_catalog_model_key(obj["category"], obj["modelFileName"])

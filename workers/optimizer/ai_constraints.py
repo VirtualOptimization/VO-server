@@ -236,7 +236,8 @@ def _call_claude_once(prompt: str, *, api_key: str, model: str, max_tokens: int,
         text = _extract_candidate_text(payload)
         return _loads_json_object(text)
     except (RuntimeError, json.JSONDecodeError) as exc:
-        raise _UnusableClaudeResponseError(str(exc)) from exc
+        blocks = [block.get("type") for block in payload.get("content") or []]
+        raise _UnusableClaudeResponseError(f"{exc} (stop_reason={payload.get('stop_reason')}, blocks={blocks})") from exc
 
 
 def generate_claude_constraints(
@@ -277,6 +278,117 @@ def generate_claude_constraints(
         raise last_error
 
     return _validate_constraints(raw_constraints, problem)
+
+
+PLAN_ROLES = {"sleeping", "work_surface", "dining_surface", "nightstand", "side_table", "seating", "storage", "appliance", "unknown"}
+PLAN_ZONES = {"any", "bed_head"}
+MAX_PLAN_RELATIONS = 12
+
+
+def _build_plan_prompt(summary: dict[str, Any]) -> str:
+    schema = {
+        "furniture_roles": [{"object_id": "furniture object id", "role": " | ".join(sorted(PLAN_ROLES)), "reason": "short reason"}],
+        "relations": [
+            {
+                "object_id": "furniture object id",
+                "near_object_id": "furniture object id it belongs next to",
+                "zone": " | ".join(sorted(PLAN_ZONES)),
+                "reason": "short reason",
+            }
+        ],
+        "rationale": "short explanation",
+    }
+    return (
+        "You are an interior planner reading a scanned room before a deterministic optimizer rearranges it. "
+        "Return ONLY valid JSON, no markdown. Do not give coordinates; the optimizer places everything and "
+        "checks collisions, doors and clearances itself. Use object ids exactly as given.\n\n"
+        "Decide what each piece is for from its type, size and surroundings, then list only the relations a "
+        "person living here would actually want: pieces that are used together and should end up next to each "
+        "other. Leave out anything you are unsure of, and do not relate pieces just because they are close now. "
+        "Use zone bed_head only when the near object is a bed and the piece is used from the bed while lying down. "
+        "Chairs at tables are already handled; do not list them.\n\n"
+        f"Output schema example:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
+        f"Room:\n{json.dumps(summary, ensure_ascii=False)}"
+    )
+
+
+def _resolve_id(value: Any, ids: Any) -> Any:
+    """The id Claude meant: exact, or a shortened UUID that fits exactly one id."""
+    if value in ids:
+        return value
+    if not isinstance(value, str) or len(value) < 6:
+        return None
+    matches = [i for i in ids if isinstance(i, str) and i.lower().startswith(value.lower())]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _validate_plan(payload: dict[str, Any], problem: dict[str, Any]) -> dict[str, Any]:
+    items = {item.get("id"): item for item in problem.get("movable_items", [])}
+    payload = {
+        **payload,
+        "furniture_roles": [
+            {**row, "object_id": _resolve_id(row.get("object_id"), items)}
+            for row in payload.get("furniture_roles", []) if isinstance(row, dict)
+        ],
+        "relations": [
+            {**row, "object_id": _resolve_id(row.get("object_id"), items), "near_object_id": _resolve_id(row.get("near_object_id"), items)}
+            for row in payload.get("relations", []) if isinstance(row, dict)
+        ],
+    }
+    roles = [
+        {"object_id": row["object_id"], "role": row["role"], "reason": str(row.get("reason", ""))[:200]}
+        for row in payload.get("furniture_roles", [])
+        if isinstance(row, dict) and row.get("object_id") in items and row.get("role") in PLAN_ROLES
+    ]
+    relations = []
+    for row in payload.get("relations", []):
+        if not isinstance(row, dict):
+            continue
+        first, second = row.get("object_id"), row.get("near_object_id")
+        zone = row.get("zone", "any")
+        if first not in items or second not in items or first == second or zone not in PLAN_ZONES:
+            continue
+        if items[first].get("wall_mounted") or items[first].get("pinned"):
+            continue
+        if zone == "bed_head" and items[second].get("type") != "bed":
+            continue
+        relations.append({"object_id": first, "near_object_id": second, "zone": zone, "reason": str(row.get("reason", ""))[:200]})
+    return {"furniture_roles": roles, "relations": relations[:MAX_PLAN_RELATIONS], "rationale": str(payload.get("rationale", ""))[:500]}
+
+
+def plan_room_intent(problem: dict[str, Any]) -> dict[str, Any]:
+    """Ask Claude what the pieces are for, before the first optimizer pass.
+
+    Claude gives no coordinates, and its relations only steer one extra search for
+    candidates (CanonicalLayoutOptimizer._intent_unmet_count); the winner is still
+    chosen by measured criteria. Any failure leaves the problem as it was, so the
+    optimizer still runs without a plan.
+    """
+    problem.pop("ai_plan_relations", None)
+    if not env_bool("AI_LAYOUT_ENABLED"):
+        return problem
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY is required when AI_LAYOUT_ENABLED=true")
+        model = os.getenv("ASSISTANT_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+        raw = _call_claude_once(
+            _build_plan_prompt(_summarize_problem(problem)),
+            api_key=api_key,
+            model=model,
+            max_tokens=int(os.getenv("AI_LAYOUT_MAX_TOKENS", str(DEFAULT_MAX_TOKENS))),
+            timeout=float(os.getenv("AI_LAYOUT_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))),
+        )
+        plan = _validate_plan(raw, problem)
+    except Exception as exc:  # The optimizer must still work when Claude is unavailable.
+        problem["ai_plan_error"] = f"{exc.__class__.__name__}: {exc}"
+        return problem
+    items = {item.get("id"): item for item in problem.get("movable_items", [])}
+    for row in plan["furniture_roles"]:
+        items[row["object_id"]]["semantic_role"] = row["role"]
+    problem["ai_plan_relations"] = plan["relations"]
+    problem["ai_plan"] = plan
+    return problem
 
 
 def apply_ai_constraints(problem: dict[str, Any], constraints: dict[str, Any]) -> None:
