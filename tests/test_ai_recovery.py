@@ -1,6 +1,10 @@
 import pytest
 
-from workers.optimizer.ai_constraints import merge_ai_retry_output, prepare_ai_retry_problem
+from workers.optimizer.ai_constraints import (
+    merge_ai_retry_output,
+    optimizer_needs_recovery,
+    prepare_ai_retry_problem,
+)
 
 
 def _item(item_id, pos, rotation, optimized_pos=None, optimized_rotation=None):
@@ -81,3 +85,21 @@ def test_retry_with_fewer_failures_is_accepted():
 
     assert merged["optimization"]["recovery_rejected"] is False
     assert merged["movable_items"][0]["optimized_pos"] == [2.0, 2.0, 0.4]
+
+
+def _first_pass(*, penetration=0.0, door_wall=0.0, must=0, neufert_fails=0):
+    output = _output([], fails=neufert_fails, usable=5.0, penetration=penetration)
+    output["optimization"]["hard_violations"] = {"door_wall_or_outside": door_wall, "must_principles": must}
+    return output
+
+
+def test_neufert_failures_alone_do_not_trigger_recovery():
+    assert optimizer_needs_recovery(_first_pass(neufert_fails=77)) is False
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"penetration": 0.05}, {"door_wall": 0.5}, {"must": 1}],
+)
+def test_hard_violations_trigger_recovery(kwargs):
+    assert optimizer_needs_recovery(_first_pass(**kwargs)) is True
