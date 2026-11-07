@@ -56,3 +56,31 @@ def test_front_rule_fails_when_something_blocks_the_front():
     checks = _check([_rule("shelf", "clearance", "front", 0.9)], [shelf, bed])
     assert checks[0]["status"] == "fail"
     assert checks[0]["measured_distance_m"] < 0.1
+
+
+def _summary(rules, items):
+    problem = {"room_metadata": {"dimensions": {"width": 4.0, "depth": 4.0}}, "neufert_rules": rules}
+    return validate_neufert_rules(problem, {"movable_items": items})["neufert_validation"]
+
+
+def test_duplicate_rules_are_checked_once_at_the_smallest_figure():
+    shelf = _item("shelf", "shelf", (0.8, 0.4), (2.0, 0.2), [0.0, 1.0])
+    bed = _item("bed", "bed", (2.0, 1.0), (2.0, 1.35), [0.0, 1.0])
+    rules = [_rule("shelf", "clearance", "front", 1.0), _rule("shelf", "clearance", "front", 0.9)]
+    report = _summary(rules, [shelf, bed])
+    (check,) = report["checks"]
+    assert check["required_distance_m"] == 0.9
+    assert check["status"] == "fail"
+    assert report["summary"]["shortfall_m"] == 0.45  # 0.45 m gap to the bed
+
+
+def test_side_to_wall_rule_skips_pieces_backed_against_a_wall():
+    shelf = _item("shelf", "shelf", (0.8, 0.4), (0.4, 0.2), [0.0, 1.0])
+    (check,) = _check([_rule("shelf", "clearance", "side", 0.7, obj="wall")], [shelf])
+    assert check["status"] == "not_applicable"
+
+
+def test_passing_layout_has_no_shortfall():
+    bed = _item("bed", "bed", (1.0, 2.0), (0.5, 1.0), [1.0, 0.0])
+    report = _summary([_rule("bed", "around", "around", 0.6)], [bed])
+    assert report["summary"]["shortfall_m"] == 0.0

@@ -146,8 +146,56 @@ def apply_neufert_rules(problem: dict[str, Any], path: str | Path | None) -> dic
     return problem
 
 
+CLEARANCE_RELATIONS = {"around", "clearance", "passage"}
+# A piece whose back is this close to a wall is wall-standing furniture.
+BACKED_AGAINST_WALL_M = 0.15
+
+
+def _rule_requirement(rule: dict[str, Any], relaxation_scale: float) -> float | None:
+    minimum = rule.get("min_distance_m")
+    if minimum is not None:
+        return float(minimum)
+    recommended = rule.get("recommended_distance_m")
+    if recommended is None:
+        return None
+    return float(recommended) * relaxation_scale
+
+
+def dedupe_validation_rules(rules: list[dict[str, Any]], relaxation_scale: float = 1.0) -> list[dict[str, Any]]:
+    """Keep one clearance rule per subject, object and direction.
+
+    The handbook states the same clearance on several pages with slightly
+    different figures (shelf front 0.9 and 1.0 m, bed beside a shelf 0.75, 0.9
+    and 1.0 m). Checking each copy counts one tight spot several times, so only
+    the smallest figure -- the handbook's actual minimum -- is kept.
+    """
+    kept: dict[tuple[str, ...], dict[str, Any]] = {}
+    order: list[tuple[str, ...]] = []
+    for index, rule in enumerate(rules):
+        relation = str(rule.get("relation", ""))
+        required = _rule_requirement(rule, relaxation_scale)
+        if relation not in CLEARANCE_RELATIONS or required is None:
+            key: tuple[str, ...] = ("unique", str(index))
+        else:
+            key = (_entity(rule.get("subject")), _entity(rule.get("object")), str(rule.get("direction", "around")))
+        if key not in kept:
+            order.append(key)
+            kept[key] = rule
+            continue
+        current = _rule_requirement(kept[key], relaxation_scale)
+        merged = rule if required < float(current) else kept[key]
+        pages = sorted({*kept[key].get("merged_pages", [kept[key].get("page_number")]), rule.get("page_number")} - {None})
+        kept[key] = {**merged, "merged_pages": pages}
+    return [kept[key] for key in order]
+
+
 def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -> dict[str, Any]:
-    """Report directional rule checks against the final 2-D placement."""
+    """Report directional rule checks against the final 2-D placement.
+
+    Each failed check also records how far short it falls, and the summary sums
+    those shortfalls: a furnished room can rarely meet every clearance, so the
+    useful question is how much is missing, not how many checks miss.
+    """
     room = problem.get("room_metadata", {}).get("dimensions", {})
     room_width = float(room.get("width", 0.0))
     room_depth = float(room.get("depth", 0.0))
@@ -340,22 +388,13 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
                     gaps.append(gap)
         return gaps
 
-    def required_distance(rule: dict[str, Any]) -> float | None:
-        minimum = rule.get("min_distance_m")
-        if minimum is not None:
-            return float(minimum)
-        recommended = rule.get("recommended_distance_m")
-        if recommended is None:
-            return None
-        scale = float(problem.get("small_room_relaxation_scale", 1.0))
-        return float(recommended) * scale
-
+    relaxation_scale = float(problem.get("small_room_relaxation_scale", 1.0))
     item_corners = {id(item): corners(item) for item in items}
     checks: list[dict[str, Any]] = []
-    for rule in problem.get("neufert_rules", []):
+    for rule in dedupe_validation_rules(problem.get("neufert_rules", []), relaxation_scale):
         subject = _entity(rule.get("subject"))
         matched = by_subject.get(subject, [])
-        numeric = required_distance(rule)
+        numeric = _rule_requirement(rule, relaxation_scale)
 
         for item in matched:
             check = {
@@ -368,6 +407,8 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
                 "required_distance_m": numeric,
                 "evidence": rule.get("evidence"),
             }
+            if rule.get("merged_pages"):
+                check["merged_pages"] = rule["merged_pages"]
             if numeric is None:
                 check["status"] = "qualitative_only"
                 checks.append(check)
@@ -383,6 +424,14 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
                 direction = str(rule.get("direction", "around"))
                 front = world_front(item)
                 lateral = (-front[1], front[0])
+                if direction == "side" and room_gap_in_direction(poly, (-front[0], -front[1])) <= BACKED_AGAINST_WALL_M:
+                    # A shelf or desk standing with its back to a wall is meant to
+                    # sit along it; a gap to the next wall beside it is not needed.
+                    check["measured_distance_m"] = None
+                    check["status"] = "not_applicable"
+                    check["reason"] = "backed_against_wall"
+                    checks.append(check)
+                    continue
                 if direction == "front":
                     measured = room_gap_in_direction(poly, front)
                 elif direction == "side":
@@ -424,8 +473,12 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
                     continue
                 measured = min(gaps)
 
-            check["measured_distance_m"] = round(max(0.0, measured), 4)
-            check["status"] = "pass" if measured + 1e-3 >= float(numeric) else "fail"
+            measured = max(0.0, measured)
+            check["measured_distance_m"] = round(measured, 4)
+            passed = measured + 1e-3 >= float(numeric)
+            check["status"] = "pass" if passed else "fail"
+            if not passed:
+                check["shortfall_m"] = round(float(numeric) - measured, 4)
             checks.append(check)
 
     summary = {
@@ -434,6 +487,7 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
         "fail": sum(c["status"] == "fail" for c in checks),
         "qualitative_only": sum(c["status"] == "qualitative_only" for c in checks),
         "not_applicable": sum(c["status"] == "not_applicable" for c in checks),
+        "shortfall_m": round(sum(c.get("shortfall_m", 0.0) for c in checks), 3),
     }
     optimized["neufert_validation"] = {"summary": summary, "checks": checks}
     return optimized

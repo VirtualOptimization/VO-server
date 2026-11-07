@@ -15,6 +15,7 @@ from scipy.optimize import differential_evolution, minimize
 
 from workers.optimizer import lh_principles as lh
 from workers.optimizer.bounds import center_axis_bounds
+from workers.optimizer.neufert_rules import validate_neufert_rules
 
 # Same order as CanonicalLayoutOptimizer._wall_outward_normals / _distance_to_walls.
 ABSOLUTE_WALL_NAMES = ("west", "east", "south", "north")
@@ -884,7 +885,25 @@ class CanonicalLayoutOptimizer:
         band = math.floor(self._usable_open_area(coords) / self.USABLE_AREA_BAND_M2)
         return self._prefer_violations(coords), -band * self.USABLE_AREA_BAND_M2
 
-    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, float]:
+    # Neufert shortfall is compared in steps this size (metres).
+    NEUFERT_SHORTFALL_BAND_M = 0.05
+
+    def _neufert_shortfall(self, coords: np.ndarray) -> float:
+        """Total metres by which the layout misses the Neufert clearances."""
+        if not self.payload.get("neufert_rules"):
+            return 0.0
+        items = [
+            {
+                **furniture,
+                "optimized_pos": [float(c[0]), float(c[1]), float(c[2])],
+                "optimized_rotation_y_deg": math.degrees(float(c[3])),
+            }
+            for c, furniture in zip(np.asarray(coords, dtype=float).reshape(-1, 4), self.furnitures)
+        ]
+        report = validate_neufert_rules(self.payload, {"movable_items": items})
+        return float(report["neufert_validation"]["summary"]["shortfall_m"])
+
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, float, float, float]:
         """Tiered comparison key for finished layouts; lower is better.
 
         Each tier is compared only when every tier before it ties, so nothing
@@ -892,9 +911,10 @@ class CanonicalLayoutOptimizer:
         1. furniture overlap (a chair tucked into its own desk within the
            allowance is fine), 2. door-clearance / wall / out-of-room
         violations, 3. broken `must` principles, 4. broken `prefer`
-        principles, 5. usable open floor (LH passage width, in bands), and
-        6. the weighted objective, which still holds the older unsourced
-        clearance rules.
+        principles, 5. usable open floor (LH passage width, in bands),
+        6. metres short of the Neufert clearances (in bands), and 7. the
+        weighted objective, which still holds the older unsourced clearance
+        rules.
         """
         coords = np.asarray(coords, dtype=float).reshape(-1, 4)
         obbs = [
@@ -903,11 +923,13 @@ class CanonicalLayoutOptimizer:
         ]
         penetration = self._collision_penetration(coords)
         fixed = self._fixed_element_penalty(obbs, coords) + sum(self._outside_room_penalty(obb) for obb in obbs)
+        neufert_band = math.floor(self._neufert_shortfall(coords) / self.NEUFERT_SHORTFALL_BAND_M)
         return (
             round(penetration, 3) if penetration > 1e-3 else 0.0,
             round(fixed / self.weights.critical, 2),
             self._must_violations(coords),
             *self._soft_rank(coords),
+            round(neufert_band * self.NEUFERT_SHORTFALL_BAND_M, 2),
             float(self._objective(coords.reshape(-1))),
         )
 
@@ -3020,7 +3042,7 @@ class CanonicalLayoutOptimizer:
                 {
                     "stage": name,
                     "max_penetration_m": round(float(self._max_furniture_penetration(coords)), 4),
-                    "rank": [*rank[:5], round(rank[5], 1)],
+                    "rank": [*rank[:6], round(rank[6], 1)],
                 }
             )
 
@@ -3178,6 +3200,10 @@ class CanonicalLayoutOptimizer:
                 "arm_reach": self.body.arm_reach,
             },
             "floor_efficiency": self._open_floor_report(optimized),
+            "neufert_shortfall_m": {
+                "scanned": round(self._neufert_shortfall(original_coords), 3),
+                "optimized": round(self._neufert_shortfall(optimized), 3),
+            },
             "stage_trace": stage_trace,
             "selected_stage": "scanned_layout" if fallback_to_scan else selected_stage,
             "fallback_to_scanned_layout": fallback_to_scan,
