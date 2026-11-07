@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -440,6 +441,36 @@ class CanonicalLayoutOptimizer:
             for wall in walls
             for x, y, theta in self._wall_poses(index, wall, coords[index])
         ]
+
+    def _snug_wall_candidates(self, coords: np.ndarray, index: int) -> list[np.ndarray]:
+        """Layouts with one item against a wall, right beside a piece already on that
+        wall: how people actually line furniture up (a side table next to the bed)."""
+        furniture = self.furnitures[index]
+        candidates: list[np.ndarray] = []
+        for wall in self.WALL_INDEX:
+            poses = self._wall_poses(index, wall, corners_only=True)
+            if not poses:
+                continue
+            vertical = wall in {"west", "east"}
+            axis, across = (1, 0) if vertical else (0, 1)
+            fixed_coord = poses[0][across]
+            theta = poses[0][2]
+            low, high = sorted((poses[0][axis], poses[-1][axis]))
+            obb = self._obb_corners(0.0, 0.0, float(furniture["extent"][0]), float(furniture["extent"][1]), theta)
+            half = float(obb[:, axis].max() - obb[:, axis].min()) / 2.0
+            half_across = float(obb[:, across].max() - obb[:, across].min()) / 2.0
+            for j, other in enumerate(self.furnitures):
+                if j == index or self._vertically_apart(index, j):
+                    continue
+                corners = self._obb_corners(coords[j, 0], coords[j, 1], float(other["extent"][0]), float(other["extent"][1]), coords[j, 3])
+                # Only neighbours in the strip this item would occupy along the wall.
+                if corners[:, across].max() < fixed_coord - half_across or corners[:, across].min() > fixed_coord + half_across:
+                    continue
+                for spot in (corners[:, axis].min() - half - 0.01, corners[:, axis].max() + half + 0.01):
+                    if low <= spot <= high:
+                        x, y = (fixed_coord, spot) if vertical else (spot, fixed_coord)
+                        candidates.append(self._move_with_paired_chairs(coords, index, x, y, theta))
+        return candidates
 
     PRINCIPLE_SEEDS = 2
     SETTLED_REPAIRS = 3
@@ -930,8 +961,64 @@ class CanonicalLayoutOptimizer:
             if furniture.get("wall_mounted"):
                 continue
             obb = self._obb_corners(c[0], c[1], float(furniture["extent"][0]), float(furniture["extent"][1]), c[3])
-            if any(self._sat_penetration(zone, obb) > 0.02 for zone in zones):
+            if any(self._sat_penetration(zone, obb) > 0.1 for zone in zones):
                 count += 1
+        return count
+
+    # A planned relation holds when the two pieces are at most this far apart.
+    INTENT_NEAR_M = 0.3
+
+    def _intent_unmet_count(self, coords: np.ndarray) -> int:
+        """Relations from the AI room plan (see plan_room_intent) the layout does not keep.
+
+        A guess about how the room is used, so it steers one search but is not part of
+        _layout_rank: which layout wins is decided by measured criteria only.
+        """
+        relations = self.payload.get("ai_plan_relations") or []
+        if not relations:
+            return 0
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        ids = {f["id"]: i for i, f in enumerate(self.furnitures)}
+        unmet = 0
+        for relation in relations:
+            i, j = ids.get(relation["object_id"]), ids.get(relation["near_object_id"])
+            if i is None or j is None:
+                continue
+            first, second = self.furnitures[i], self.furnitures[j]
+            a = self._obb_corners(coords[i, 0], coords[i, 1], float(first["extent"][0]), float(first["extent"][1]), coords[i, 3])
+            b = self._obb_corners(coords[j, 0], coords[j, 1], float(second["extent"][0]), float(second["extent"][1]), coords[j, 3])
+            near = self._sat_penetration(a, b) > 0 or float(np.linalg.norm(self._sat_gap_vector(a, b))) <= self.INTENT_NEAR_M
+            if near and relation.get("zone") == "bed_head":
+                head = lh.world_back(second, float(coords[j, 3]))
+                near = float(np.dot(coords[i, :2] - coords[j, :2], head)) > 0.0
+            unmet += not near
+        return unmet
+
+    # Floor in front of a window that must stay clear of anything taller than the sill.
+    WINDOW_VIEW_DEPTH_M = 0.6
+
+    def _window_blocked_count(self, coords: np.ndarray) -> int:
+        """Floor pieces taller than the sill standing right in front of a window."""
+        coords = np.asarray(coords, dtype=float).reshape(-1, 4)
+        w, d, depth = self.room_width, self.room_depth, self.WINDOW_VIEW_DEPTH_M
+        count = 0
+        for window in self.fixed_elements:
+            if window.get("type") != "window" or window.get("wall") not in self.WALL_INDEX:
+                continue
+            start, end = float(window["span"]["start"]), float(window["span"]["end"])
+            zone = {
+                "west": np.array([[0.0, start], [depth, start], [depth, end], [0.0, end]]),
+                "east": np.array([[w, start], [w - depth, start], [w - depth, end], [w, end]]),
+                "south": np.array([[start, 0.0], [end, 0.0], [end, depth], [start, depth]]),
+                "north": np.array([[start, d], [end, d], [end, d - depth], [start, d - depth]]),
+            }[window["wall"]]
+            sill = float(window.get("sill_height") or 0.0)
+            for c, furniture in zip(coords, self.furnitures):
+                if furniture.get("wall_mounted") or self._top_height(furniture) <= sill:
+                    continue
+                obb = self._obb_corners(c[0], c[1], float(furniture["extent"][0]), float(furniture["extent"][1]), c[3])
+                if self._sat_penetration(zone, obb) > 0.02:
+                    count += 1
         return count
 
     def _off_wall_count(self, coords: np.ndarray) -> int:
@@ -975,7 +1062,7 @@ class CanonicalLayoutOptimizer:
         """Pieces shifted or turned noticeably away from their scanned pose."""
         return int((~self._in_scanned_pose(coords)).sum())
 
-    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, int, float, int, int, float, float, float, int, float]:
+    def _layout_rank(self, coords: np.ndarray) -> tuple[float, float, int, int, int, float, int, int, int, int, float, float, float, int, float]:
         """Tiered comparison key for finished layouts; lower is better.
 
         Each tier is compared only when every tier before it ties, so nothing
@@ -988,8 +1075,10 @@ class CanonicalLayoutOptimizer:
         hard_violations), 4. pieces made unusable
         (almost no room on the side they are used from, e.g. a shelf with a
         desk 20 cm in front of it, and usable in the scan), 5. walkable floor lost beyond 10 %
-        of the scanned room's (in bands), 6. wall-standing pieces (shelves,
-        a fridge, a wardrobe) not against a wall, 7. broken `prefer`
+        of the scanned room's (in bands), 5b. pieces taller than the sill
+        standing in front of a window, 6. wall-standing pieces (shelves,
+        a fridge, a wardrobe) not against a wall, 6b. all pieces that cannot be
+        used, including those already so in the scan, 7. broken `prefer`
         principles, 8. metres short of the Neufert clearances (in bands),
         9. the largest clear rectangle of floor (in bands), 10. usable open
         floor (LH passage width, in bands), 11. how many pieces were moved,
@@ -1030,7 +1119,9 @@ class CanonicalLayoutOptimizer:
             self._entry_blocked_count(coords),
             self._unusable_count(coords),
             round(self._walkable_loss(coords), 2),
+            self._window_blocked_count(coords),
             self._off_wall_count(coords),
+            len(self._neufert_summary(coords)["unusable_items"]),
             prefer,
             round(neufert_band * self.NEUFERT_SHORTFALL_BAND_M, 2),
             rect_band,
@@ -1043,45 +1134,80 @@ class CanonicalLayoutOptimizer:
     KEEP_IN_PLACE_MIN_SHIFT_M = 0.15
     KEEP_IN_PLACE_MIN_TURN_RAD = math.radians(5.0)
 
-    MINIMAL_EDIT_MAX_MOVES = 20
+    MINIMAL_EDIT_MAX_MOVES = 12
+    # Layouts carried to the next move, and moves tried past the last improvement:
+    # clearing a spot often only pays off once something else moves into it.
+    MINIMAL_EDIT_BEAM = 5
+    MINIMAL_EDIT_PATIENCE = 2
+    MINIMAL_EDIT_TIME_LIMIT_S = 30.0
 
-    def _minimal_edit_layout(self, scanned: np.ndarray, target: np.ndarray) -> np.ndarray:
-        """Improve the scanned layout one purposeful move at a time.
+    def _edit_trials(self, current: np.ndarray, index: int, target: np.ndarray) -> list[np.ndarray]:
+        """Layouts with one piece (and, for a table, its chairs) moved."""
+        alone = current.copy()
+        alone[index] = target[index]
+        trials = [alone]
+        furniture = self.furnitures[index]
+        if furniture.get("type") != "chair":
+            trials.append(self._move_with_paired_chairs(current, index, target[index, 0], target[index, 1], target[index, 3]))
+            group = [index] + [j for j, f in enumerate(self.furnitures) if f.get("pair_with") == furniture.get("id")]
+            if len(group) > 1:
+                together = current.copy()
+                together[group] = target[group]
+                trials.append(together)
+            trials += self._against_wall_candidates(current, index, list(self.WALL_INDEX))
+            trials += self._snug_wall_candidates(current, index)
+        return trials
 
-        Starting from the room as it is, each step tries every piece at its
-        pose in `target` -- the full search's answer -- on its own, and for a
-        table with its chairs carried along or set at their own target poses,
-        and against each wall, and keeps the single move that ranks
-        best, as long as it beats the layout without it. Every move it makes
-        therefore buys something the ranking can name, and pieces whose move
-        in `target` bought nothing stay where they were.
+    def _minimal_edit_layout(self, start: np.ndarray, target: np.ndarray, *, guided: bool = False) -> np.ndarray:
+        """Improve a layout by a few purposeful moves.
+
+        A beam search: each round tries every piece at its pose in `target`, against
+        each wall and beside its neighbours, keeps the best layout per moved piece and
+        carries the top few forward, even when they do not rank better yet. Every move
+        in the returned layout still has to pay off, because the ranking counts moves.
+
+        With guided=True the search chases the AI plan's relations first. That only
+        decides where it looks: the caller still compares the result by _layout_rank,
+        so a wrong guess about the room cannot beat a better layout.
         """
-        current = np.asarray(scanned, dtype=float).reshape(-1, 4).copy()
+
+        def key(coords: np.ndarray) -> tuple:
+            rank = self._layout_rank(coords)[:-1]
+            return (*rank[:6], self._intent_unmet_count(coords), *rank[6:]) if guided else rank
+
+        current = np.asarray(start, dtype=float).reshape(-1, 4).copy()
         target = np.asarray(target, dtype=float).reshape(-1, 4)
         movable = [i for i, f in enumerate(self.furnitures) if not f.get("pinned")]
-        best_rank = self._layout_rank(current)[:-1]
+        best, best_rank = current, key(current)
+        beam = [current]
+        deadline = time.perf_counter() + self.MINIMAL_EDIT_TIME_LIMIT_S
+        stale = 0
         for _ in range(self.MINIMAL_EDIT_MAX_MOVES):
-            best_trial = None
-            for i in movable:
-                alone = current.copy()
-                alone[i] = target[i]
-                trials = [alone]
-                if self.furnitures[i].get("type") != "chair":
-                    trials.append(self._move_with_paired_chairs(current, i, target[i, 0], target[i, 1], target[i, 3]))
-                    group = [i] + [j for j, f in enumerate(self.furnitures) if f.get("pair_with") == self.furnitures[i].get("id")]
-                    if len(group) > 1:
-                        together = current.copy()
-                        together[group] = target[group]
-                        trials.append(together)
-                    trials += self._against_wall_candidates(current, i, list(self.WALL_INDEX))
-                for trial in trials:
-                    rank = self._layout_rank(trial)[:-1]
-                    if rank < best_rank:
-                        best_rank, best_trial = rank, trial
-            if best_trial is None:
+            per_piece: dict[int, tuple[tuple, np.ndarray]] = {}
+            for layout in beam:
+                allowed = max(self._collision_penetration(layout), 1e-3)
+                for i in movable:
+                    if time.perf_counter() > deadline:
+                        break
+                    for trial in self._edit_trials(layout, i, target):
+                        # Most trials land on something; skip the costly tiers for those.
+                        if self._collision_penetration(trial) > allowed:
+                            continue
+                        rank = key(trial)
+                        if i not in per_piece or rank < per_piece[i][0]:
+                            per_piece[i] = (rank, trial)
+            if not per_piece:
                 break
-            current = best_trial
-        return current
+            ordered = sorted(per_piece.values(), key=lambda item: item[0])[: self.MINIMAL_EDIT_BEAM]
+            if ordered[0][0] < best_rank:
+                best_rank, best = ordered[0]
+                stale = 0
+            else:
+                stale += 1
+            if stale > self.MINIMAL_EDIT_PATIENCE or time.perf_counter() > deadline:
+                break
+            beam = [layout for _, layout in ordered]
+        return best
 
     def _keep_unneeded_moves_in_place(self, coords: np.ndarray, scanned: np.ndarray) -> np.ndarray:
         """Put back every piece whose move does not help the layout.
@@ -3222,7 +3348,9 @@ class CanonicalLayoutOptimizer:
                 updating="deferred",
             )
             print("optimizer: differential evolution done", flush=True)
-            candidates = list(seeds)
+            # Not the scan itself: it is usually unbeatable on "moved least", which
+            # would throw the search away. The repair pass below still starts from it.
+            candidates = list(seeds[1:])
             if np.isfinite(result_global.fun):
                 candidates.append(result_global.x)
             print(
@@ -3232,7 +3360,7 @@ class CanonicalLayoutOptimizer:
             )
             initial_guess = min(candidates, key=self._layout_rank)
         else:
-            initial_guess = min(seeds, key=self._layout_rank)
+            initial_guess = min(seeds[1:], key=self._layout_rank)
 
         print("optimizer: initial candidate selected", flush=True)
         result_local = minimize(
@@ -3383,12 +3511,17 @@ class CanonicalLayoutOptimizer:
             optimized = kept
         _record_stage("kept_in_place", optimized)
 
-        minimal = self._minimal_edit_layout(original_initial.reshape(-1, 4), optimized)
-        print(f"optimizer: minimal edit done moved={self._moved_count(minimal)}", flush=True)
-        _record_stage("minimal_edit", minimal)
-        if self._layout_rank(minimal) < self._layout_rank(optimized):
-            optimized = minimal
-            selected_stage = "minimal_edit"
+        scanned = original_initial.reshape(-1, 4)
+        searches = [("minimal_edit_from_scan", scanned, False), ("minimal_edit_from_search", optimized, False)]
+        if self.payload.get("ai_plan_relations"):
+            searches.append(("minimal_edit_guided_by_plan", scanned, True))
+        for name, origin, guided in searches:
+            edited = self._minimal_edit_layout(origin, optimized, guided=guided)
+            print(f"optimizer: {name} done moved={self._moved_count(edited)}", flush=True)
+            _record_stage(name, edited)
+            if self._layout_rank(edited) < self._layout_rank(optimized):
+                optimized = edited
+                selected_stage = name
 
         # Every scanned room is, by construction, a real arrangement that
         # already exists without furniture colliding (at worst it has the

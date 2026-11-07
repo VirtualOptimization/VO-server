@@ -99,3 +99,12 @@ def test_corner_that_only_lines_up_is_not_in_front():
     other = _item("bed", "bed", (1.0, 1.0), (1.9 + 0.001, 0.9), [0.0, 1.0])
     (check,) = _check([_rule("shelf", "clearance", "front", 0.9)], [shelf, other])
     assert check["status"] == "pass"
+
+
+def test_nightstand_is_not_a_table_to_keep_clear_of_the_bed():
+    bed = _item("bed", "bed", (1.0, 2.0), (1.0, 2.0), [0.0, -1.0])
+    nightstand = _item("n", "table", (0.5, 0.5), (1.75, 2.75), [0.0, -1.0])
+    desk = _item("d", "table", (1.4, 0.6), (2.4, 2.0), [0.0, -1.0])
+    rule = _rule("bed", "clearance", "side", 1.1, obj="table")
+    assert _check([rule], [bed, nightstand])[0]["status"] == "not_applicable"
+    assert _check([rule], [bed, desk])[0]["status"] == "fail"

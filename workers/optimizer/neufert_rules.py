@@ -156,6 +156,8 @@ MIN_FACING_OVERLAP_M = 0.05
 # share of the rule's requirement (a shelf you cannot stand in front of).
 UNUSABLE_SHARE = 0.5
 USE_DIRECTIONS = {"front", "around"}
+# A table this small next to a bed is a nightstand, not a table to keep clear of.
+BEDSIDE_TABLE_MAX_SIDE_M = 0.8
 
 
 def _rule_requirement(rule: dict[str, Any], relaxation_scale: float) -> float | None:
@@ -347,7 +349,13 @@ def validate_neufert_rules(problem: dict[str, Any], optimized: dict[str, Any]) -
         return [
             other
             for other in by_subject.get(object_name, [])
-            if other is not item and not is_functional_pair(item, other)
+            if other is not item
+            and not is_functional_pair(item, other)
+            and not (
+                _entity(item.get("type")) == "bed"
+                and object_name == "table"
+                and max(float(v) for v in (other.get("extent") or [0.0, 0.0])[:2]) <= BEDSIDE_TABLE_MAX_SIDE_M
+            )
         ]
 
     def open_side_gap(item: dict[str, Any], targets: list[dict[str, Any]], *, walls_only: bool = False) -> float:

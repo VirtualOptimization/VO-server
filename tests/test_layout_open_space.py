@@ -88,3 +88,36 @@ def test_piece_just_past_the_door_swing_blocks_the_entry():
     assert optimizer._entry_blocked_count(coords) == 1  # 0.65-1.15 m from the wall: past the 0.8 m swing
     coords[0, 0] = 2.5
     assert optimizer._entry_blocked_count(coords) == 0
+
+
+def test_planned_relation_to_the_bed_head_counts_until_kept():
+    bed = {**_box("bed", (0.6, 1.9), (1.1, 2.0), "bed"), "front_vector_2d": [0.0, -1.0]}
+    room = _room([bed, _box("n", (3.0, 0.5), (0.5, 0.5), "table")])
+    room["ai_plan_relations"] = [{"object_id": "n", "near_object_id": "bed", "zone": "bed_head"}]
+    optimizer = CanonicalLayoutOptimizer(room)
+    coords = _scanned(optimizer)
+    assert optimizer._intent_unmet_count(coords) == 1
+    coords[1, :2] = [1.45, 2.6]  # beside the bed, at its head end
+    assert optimizer._intent_unmet_count(coords) == 0
+    coords[1, :2] = [1.45, 1.2]  # beside the bed, at its foot end
+    assert optimizer._intent_unmet_count(coords) == 1
+
+
+def test_tall_piece_in_front_of_a_window_blocks_it_but_a_low_one_does_not():
+    room = _room([{**_box("tall", (1.0, 2.7), (0.8, 0.4)), "extent": [0.8, 0.4, 1.2], "pos": [1.0, 2.7, 1.2]},
+                  {**_box("low", (3.0, 2.7), (0.8, 0.4)), "extent": [0.8, 0.4, 0.7], "pos": [3.0, 2.7, 0.7]}])
+    room["fixed_elements"].append({"id": "w", "type": "window", "wall": "north", "span": {"start": 0.5, "end": 3.5}, "sill_height": 0.9})
+    optimizer = CanonicalLayoutOptimizer(room)
+    coords = _scanned(optimizer)
+    assert optimizer._window_blocked_count(coords) == 1
+    coords[0, 1] = 1.0
+    assert optimizer._window_blocked_count(coords) == 0
+
+
+def test_planned_relation_does_not_change_the_rank():
+    bed = {**_box("bed", (0.6, 1.9), (1.1, 2.0), "bed"), "front_vector_2d": [0.0, -1.0]}
+    room = _room([bed, _box("n", (3.0, 0.5), (0.5, 0.5), "table")])
+    plain = CanonicalLayoutOptimizer(copy.deepcopy(room))
+    room["ai_plan_relations"] = [{"object_id": "n", "near_object_id": "bed", "zone": "bed_head"}]
+    planned = CanonicalLayoutOptimizer(room)
+    assert plain._layout_rank(_scanned(plain)) == planned._layout_rank(_scanned(planned))
