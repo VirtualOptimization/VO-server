@@ -78,6 +78,13 @@ def _event_or_404(db, event_id: int) -> Event:
     return event
 
 
+def _deactivate_others(db, keep_id: int) -> None:
+    """Only one exhibition runs at a time: turning an event on turns every other one off."""
+    db.query(Event).filter(Event.id != keep_id, Event.is_active.is_(True)).update(
+        {Event.is_active: False}, synchronize_session=False
+    )
+
+
 def _current_event_or_404(db) -> Event:
     event = db.query(Event).filter(Event.is_active.is_(True)).order_by(Event.id.desc()).first()
     if event is None:
@@ -200,6 +207,9 @@ async def create_event(payload: EventCreateRequest, current_user: User = Depends
             ai_record=ai_record,
         )
         db.add(event)
+        if event.is_active:
+            db.flush()
+            _deactivate_others(db, event.id)
         db.commit()
         db.refresh(event)
         return _admin_response(event)
@@ -229,6 +239,8 @@ async def update_event(event_id: int, payload: EventUpdateRequest, current_user:
             event.max_attempts = payload.max_attempts
         if payload.is_active is not None:
             event.is_active = payload.is_active
+            if payload.is_active:
+                _deactivate_others(db, event.id)
         db.commit()
         db.refresh(event)
         return _admin_response(event)

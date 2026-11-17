@@ -83,6 +83,27 @@ def test_current_event_and_leaderboard_use_the_same_latest_active_event(challeng
     assert client.get("/api/events/current").status_code == 404
 
 
+def test_turning_an_event_on_turns_the_others_off_and_can_switch_back(challenge):
+    client, factory = challenge
+    client.app.dependency_overrides[events.get_current_user] = lambda: User(id=1, login_id="owner", password_hash="x")
+    with factory() as db:
+        db.add_all([Event(id=i, owner_user_id=1, room_id=1, start_version_id=1, target_version_id=2,
+                          name=f"Event {i}", is_active=False, max_attempts=1) for i in (2, 3)])
+        db.commit()
+
+    def switch_to(event_id):
+        assert client.patch(f"/api/events/{event_id}", json={"is_active": True}).status_code == 200
+        return client.get("/api/events/current").json()["event_id"]
+
+    assert switch_to(2) == 2
+    assert switch_to(3) == 3
+    assert switch_to(1) == 1
+    with factory() as db:
+        assert [e.id for e in db.query(Event).filter(Event.is_active.is_(True))] == [1]
+    # Switching away never deletes anything: each event keeps its own ranking.
+    assert client.get("/api/events/3/leaderboard").status_code == 200
+
+
 def test_registration_privacy_duplicate_and_session_auth(challenge):
     client, _ = challenge
     assert client.post("/api/events/1/participants",json={"name":"x","phone":"01012345678","privacy_consent":False}).status_code == 400
